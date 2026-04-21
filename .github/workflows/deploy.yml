@@ -14,8 +14,12 @@ on:
   workflow_dispatch:
 
 env:
-  SERVICE_NAME: payment-service
-  KUSTOMIZE_IMAGE_KEY: ghcr.io/cybe-asia/payment-service
+  SERVICE_NAME: payment-services
+  # Published by this workflow to ghcr under the repo owner namespace
+  # (ariefnugrahaaa). The other Cybe-Asia services publish under
+  # ghcr.io/cybe-asia/*; this one is under the personal owner until
+  # the repo is transferred.
+  KUSTOMIZE_IMAGE_KEY: ghcr.io/ariefnugrahaaa/payment-services
 
 jobs:
   build-scan-push:

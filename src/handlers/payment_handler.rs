@@ -72,7 +72,7 @@ pub async fn get_payment_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    match payment_service::fetch_payment(&graph, &payment_id).await {
+    match payment_service::fetch_payment_refreshed(&graph, &state.xendit, &payment_id).await {
         Ok(Some(p)) => (StatusCode::OK, Json(serde_json::to_value(ApiResponse::success(p)).unwrap())),
         Ok(None) => fail(StatusCode::NOT_FOUND, "Payment not found"),
         Err(e) => {

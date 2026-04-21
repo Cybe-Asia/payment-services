@@ -121,6 +121,75 @@ pub async fn fetch_payment(graph: &Graph, payment_id: &str) -> Result<Option<Pay
         .map_err(|e| format!("payment fetch failed: {e}"))
 }
 
+/// Refresh a pending payment by asking Xendit for the authoritative status.
+///
+/// Why: In dev/test/staging our webhook URL isn't publicly reachable, so
+/// Xendit can't call us when the invoice is paid. The frontend polls this
+/// endpoint instead; on each poll we ask Xendit for the truth and persist.
+///
+/// No-op when the local status is already terminal (paid/expired/failed) or
+/// when we have no Xendit invoice id to query.
+pub async fn fetch_payment_refreshed(
+    graph: &Graph,
+    xendit: &XenditClient,
+    payment_id: &str,
+) -> Result<Option<Payment>, String> {
+    let Some(current) = fetch_payment(graph, payment_id).await? else {
+        return Ok(None);
+    };
+
+    if current.status != "pending" {
+        return Ok(Some(current));
+    }
+    let Some(invoice_id) = current.invoice_ref.clone() else {
+        return Ok(Some(current));
+    };
+    if invoice_id.is_empty() {
+        return Ok(Some(current));
+    }
+
+    match xendit.get_invoice(&invoice_id).await {
+        Ok(fresh) => {
+            let upstream = fresh.status.to_uppercase();
+            match upstream.as_str() {
+                "PAID" | "SETTLED" => {
+                    if let Err(e) = payment_repository::mark_paid(
+                        graph,
+                        payment_id,
+                        fresh.payment_method.as_deref().or(fresh.payment_channel.as_deref()),
+                        fresh.payment_id.as_deref().or(Some(&fresh.id)),
+                    )
+                    .await
+                    {
+                        warn!(error=%e, "xendit refresh: mark_paid failed");
+                    } else {
+                        // Best-effort settle the linked FeeObligation.
+                        let _ = settle_obligation_for_payment(graph, payment_id).await;
+                        info!(payment_id=%payment_id, "xendit refresh: marked paid");
+                    }
+                }
+                "EXPIRED" => {
+                    if let Err(e) = payment_repository::mark_status(graph, payment_id, "expired").await {
+                        warn!(error=%e, "xendit refresh: mark_status expired failed");
+                    } else {
+                        info!(payment_id=%payment_id, "xendit refresh: marked expired");
+                    }
+                }
+                "PENDING" => { /* no change */ }
+                other => {
+                    warn!(status=%other, payment_id=%payment_id, "xendit refresh: unknown status");
+                }
+            }
+        }
+        Err(e) => {
+            // Don't fail the whole request; return the stale local view.
+            warn!(error=%e, payment_id=%payment_id, "xendit refresh failed, returning local state");
+        }
+    }
+
+    fetch_payment(graph, payment_id).await
+}
+
 pub async fn handle_webhook(
     graph: &Graph,
     payment_id: &str,

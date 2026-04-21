@@ -65,6 +65,34 @@ impl XenditClient {
         info!(invoice_id=%parsed.id, status=%parsed.status, "xendit invoice created");
         Ok(parsed)
     }
+
+    /// Fetch a Xendit invoice by its Xendit-assigned invoice id.
+    /// Used for status polling when we haven't received a webhook
+    /// (the webhook URL isn't publicly reachable in dev/test/staging).
+    /// Docs: https://api.xendit.co/v2/invoices/{id}
+    pub async fn get_invoice(&self, invoice_id: &str) -> Result<GetInvoiceResponse, String> {
+        if self.api_key.is_empty() {
+            return Err("XENDIT_API_KEY not configured".into());
+        }
+        let auth = format!("Basic {}", B64.encode(format!("{}:", self.api_key)));
+        let res = self
+            .http
+            .get(format!("{}/v2/invoices/{}", self.api_url, invoice_id))
+            .header("Authorization", auth)
+            .send()
+            .await
+            .map_err(|e| format!("xendit get_invoice failed: {e}"))?;
+
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            warn!(%status, "xendit get_invoice error body={}", text);
+            return Err(format!("xendit get_invoice error {status}: {text}"));
+        }
+        let parsed: GetInvoiceResponse = serde_json::from_str(&text)
+            .map_err(|e| format!("xendit get_invoice parse error: {e} / body={text}"))?;
+        Ok(parsed)
+    }
 }
 
 pub struct CreateInvoiceRequest<'a> {
@@ -85,6 +113,24 @@ pub struct CreateInvoiceResponse {
     pub invoice_url: String,
     #[serde(default)]
     pub expiry_date: Option<String>,
+}
+
+/// Shape of Xendit's GET /v2/invoices/{id} response — we only deserialize
+/// the fields we actually act on.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetInvoiceResponse {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub payment_method: Option<String>,
+    #[serde(default)]
+    pub payment_channel: Option<String>,
+    #[serde(default)]
+    pub paid_at: Option<String>,
+    #[serde(default)]
+    pub payment_id: Option<String>,
 }
 
 /// Verify that a webhook request is authentic.

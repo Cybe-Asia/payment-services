@@ -54,7 +54,10 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          # Personal repo: GITHUB_TOKEN is sufficient (permissions: packages: write above).
+          # The Cybe-Asia-owned services use a scoped GHCR_TOKEN because the
+          # shared cross-repo CI template came first. Both work.
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image
         run: docker build -t "${{ steps.vars.outputs.image_ref }}" .
@@ -73,16 +76,20 @@ jobs:
         run: docker push "${{ steps.vars.outputs.image_ref }}"
 
       - name: Setup kustomize
-        if: steps.vars.outputs.overlay_path != ''
+        if: steps.vars.outputs.overlay_path != '' && env.GITOPS_TOKEN != ''
         uses: imranismail/setup-kustomize@v2
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
 
       - name: Auto-bump gitops overlay
-        if: steps.vars.outputs.overlay_path != ''
+        if: steps.vars.outputs.overlay_path != '' && env.GITOPS_TOKEN != ''
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
         run: |
           set -e
           git config --global user.email "ci-bot@cybe-asia.github"
           git config --global user.name "CI Bot"
-          git clone --branch main --depth 1 "https://x-access-token:${{ secrets.GITOPS_TOKEN }}@github.com/Cybe-Asia/digital-school-gitops.git" gitops-repo
+          git clone --branch main --depth 1 "https://x-access-token:${GITOPS_TOKEN}@github.com/Cybe-Asia/digital-school-gitops.git" gitops-repo
           cd gitops-repo
           cd "${{ steps.vars.outputs.overlay_path }}"
           kustomize edit set image "${{ env.KUSTOMIZE_IMAGE_KEY }}=${{ steps.vars.outputs.image_ref }}"

@@ -1,21 +1,42 @@
 use neo4rs::{Graph, Query};
+use std::time::Duration;
+use tokio::time::sleep;
 use tracing::{info, warn};
 
 /// Seed Tenant + Schools + initial FeeStructure nodes. Idempotent: uses MERGE
 /// so re-running the service does not duplicate or clobber amounts once an
 /// admin has edited them via the admin endpoint.
+///
+/// Retries on transient connection errors — neo4rs lazy-initialises the
+/// connection pool, so the very first query during pod startup can race
+/// with the neo4j service DNS/endpoints becoming ready.
 pub async fn seed_fees(graph: &Graph, tenant_id: &str) -> Result<(), String> {
-    // 1) Tenant
-    let q = Query::new(
-        "MERGE (t:Tenant {tenant_id: $tid}) \
-         ON CREATE SET t.tenant_code = 'cybe-asia', \
-                       t.tenant_name = 'Cybe Asia', \
-                       t.status = 'active', \
-                       t.created_at = datetime() \
-         RETURN t".to_string(),
-    )
-    .param("tid", tenant_id.to_string());
-    graph.run(q).await.map_err(|e| format!("seed Tenant failed: {e}"))?;
+    // 1) Tenant (with retry — this is the first query; absorbs startup race)
+    let tenant_q = || {
+        Query::new(
+            "MERGE (t:Tenant {tenant_id: $tid}) \
+             ON CREATE SET t.tenant_code = 'cybe-asia', \
+                           t.tenant_name = 'Cybe Asia', \
+                           t.status = 'active', \
+                           t.created_at = datetime() \
+             RETURN t".to_string(),
+        )
+        .param("tid", tenant_id.to_string())
+    };
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=8 {
+        match graph.run(tenant_q()).await {
+            Ok(_) => { last_err = None; break; }
+            Err(e) => {
+                last_err = Some(format!("attempt {attempt}: {e}"));
+                warn!("seed Tenant retry {attempt}: {e}");
+                sleep(Duration::from_millis(1500)).await;
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(format!("seed Tenant failed after retries: {e}"));
+    }
 
     // 2) Schools
     for (code, name) in [

@@ -1,9 +1,9 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use utoipa::ToSchema;
 
@@ -54,6 +54,50 @@ pub async fn create_invoice_handler(
         }
         Err(e) => {
             error!("create_invoice failed: {e}");
+            let status = if e.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if e.contains("no students registered") {
+                // Caller should have students attached before they can pay.
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            fail(status, &e)
+        }
+    }
+}
+
+/// Query params for the invoice preview endpoint.
+#[derive(Deserialize)]
+pub struct PreviewQuery {
+    #[serde(rename = "admissionId")]
+    pub admission_id: String,
+    #[serde(rename = "paymentType", default = "default_payment_type")]
+    pub payment_type: String,
+}
+
+fn default_payment_type() -> String {
+    "application_fee".to_string()
+}
+
+/// GET /api/v1/payments/preview?admissionId=X&paymentType=application_fee
+///
+/// Returns the exact amount this Lead would be charged right now — the
+/// per-student fee × the number of students registered under the Lead.
+/// The frontend uses this to render the "Rp 1.000.000 × 2 students =
+/// Rp 2.000.000" breakdown before the parent clicks "Pay".
+#[utoipa::path(get, path = "/api/v1/payments/preview")]
+pub async fn preview_invoice_handler(
+    State(state): State<AppState>,
+    Query(q): Query<PreviewQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    match payment_service::preview_invoice(&graph, &state.tenant_id, &q.admission_id, &q.payment_type).await {
+        Ok(preview) => (StatusCode::OK, Json(serde_json::to_value(ApiResponse::success(preview)).unwrap())),
+        Err(e) => {
+            error!("preview_invoice failed: {e}");
             let status = if e.contains("not found") {
                 StatusCode::NOT_FOUND
             } else {

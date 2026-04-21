@@ -45,13 +45,22 @@ pub async fn create_invoice(
     .map_err(|e| format!("school lookup failed: {e}"))?
     .ok_or_else(|| format!("school not found for code {}", lead.target_school_preference))?;
 
-    // 3) Look up active FeeStructure to get the amount.
+    // 3) Look up active FeeStructure to get the *per-student* amount.
     let fs = fee_structure_repository::find_active(&ctx.graph, ctx.tenant_id, &school_id, payment_type)
         .await
         .map_err(|e| format!("fee structure lookup failed: {e}"))?
         .ok_or_else(|| format!("no active FeeStructure for {} / {}", school_id, payment_type))?;
 
-    // 4) Create (or reuse pending) FeeObligation.
+    // 3b) Count students on this Lead. Fee is per-student, so 2 kids = 2×.
+    //     Reject with a clear error if there are no students — otherwise we'd
+    //     create a Rp 0 invoice which Xendit would reject anyway.
+    let student_count = count_students_for_lead(&ctx.graph, admission_id).await?;
+    if student_count == 0 {
+        return Err("no students registered for this application — add at least one student before paying".to_string());
+    }
+    let total_amount = fs.amount * student_count;
+
+    // 4) Create (or reuse pending) FeeObligation with the *scaled* total.
     let due_at = Utc::now() + Duration::hours(ctx.default_due_hours);
     let obligation_id = format!("FEEOBL-{}", Uuid::new_v4());
     let obligation = fee_obligation_repository::upsert_for_lead(
@@ -59,7 +68,7 @@ pub async fn create_invoice(
         ctx.tenant_id,
         admission_id,
         payment_type,
-        fs.amount,
+        total_amount,
         &fs.currency,
         &due_at.to_rfc3339(),
         &obligation_id,
@@ -69,11 +78,17 @@ pub async fn create_invoice(
 
     let payment_id = format!("PAY-{}", Uuid::new_v4());
 
-    // 5) Create Xendit invoice.
-    let description = format!("{} — {}", pretty_payment_type(payment_type), fs.school_code);
+    // 5) Create Xendit invoice with the scaled total.
+    let description = format!(
+        "{} — {} × {} student{}",
+        pretty_payment_type(payment_type),
+        fs.school_code,
+        student_count,
+        if student_count == 1 { "" } else { "s" },
+    );
     let xendit_req = XenditInvoiceReq {
         external_id: &payment_id,
-        amount: fs.amount,
+        amount: total_amount,
         currency: &fs.currency,
         description: &description,
         payer_email: &lead.email,
@@ -89,7 +104,7 @@ pub async fn create_invoice(
         &payment_id,
         ctx.tenant_id,
         payment_type,
-        fs.amount,
+        total_amount,
         &fs.currency,
         &invoice.id,
         &invoice.id,
@@ -102,17 +117,90 @@ pub async fn create_invoice(
     .map_err(|e| format!("payment persist failed: {e}"))?;
 
     info!(
-        payment_id=%payment_id, admission_id=%admission_id, amount=fs.amount, currency=%fs.currency,
+        payment_id=%payment_id,
+        admission_id=%admission_id,
+        unit_amount=fs.amount,
+        student_count=student_count,
+        total_amount=total_amount,
+        currency=%fs.currency,
         "created pending payment + xendit invoice"
     );
 
     Ok(CreateInvoiceOutcome {
         payment_id,
         hosted_invoice_url: invoice.invoice_url,
-        amount: fs.amount,
+        amount: total_amount,
         currency: fs.currency,
         expires_at: invoice.expiry_date.unwrap_or_else(|| due_at.to_rfc3339()),
     })
+}
+
+/// Preview what this Lead would be charged without actually creating an
+/// invoice. Powers the frontend's payment page breakdown:
+/// "Rp 1.000.000 × 2 students = Rp 2.000.000".
+pub async fn preview_invoice(
+    graph: &Graph,
+    tenant_id: &str,
+    admission_id: &str,
+    payment_type: &str,
+) -> Result<InvoicePreview, String> {
+    let lead = fetch_lead(graph, admission_id).await?
+        .ok_or_else(|| "Lead not found".to_string())?;
+
+    let school_id = crate::repositories::school_repository::find_school_id_by_code(
+        graph,
+        tenant_id,
+        &lead.target_school_preference,
+    )
+    .await
+    .map_err(|e| format!("school lookup failed: {e}"))?
+    .ok_or_else(|| format!("school not found for code {}", lead.target_school_preference))?;
+
+    let fs = fee_structure_repository::find_active(graph, tenant_id, &school_id, payment_type)
+        .await
+        .map_err(|e| format!("fee structure lookup failed: {e}"))?
+        .ok_or_else(|| format!("no active FeeStructure for {} / {}", school_id, payment_type))?;
+
+    let student_count = count_students_for_lead(graph, admission_id).await?;
+    let total = fs.amount * student_count;
+
+    Ok(InvoicePreview {
+        school_code: fs.school_code,
+        payment_type: payment_type.to_string(),
+        unit_amount: fs.amount,
+        currency: fs.currency,
+        student_count,
+        total,
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct InvoicePreview {
+    #[serde(rename = "schoolCode")]
+    pub school_code: String,
+    #[serde(rename = "paymentType")]
+    pub payment_type: String,
+    /// Fee per student, as published by the school's FeeStructure.
+    #[serde(rename = "unitAmount")]
+    pub unit_amount: i64,
+    pub currency: String,
+    #[serde(rename = "studentCount")]
+    pub student_count: i64,
+    /// unit_amount × student_count. What the parent will actually be charged.
+    pub total: i64,
+}
+
+async fn count_students_for_lead(graph: &Graph, admission_id: &str) -> Result<i64, String> {
+    let q = Query::new(
+        "MATCH (l:Lead {lead_id:$id})-[:HAS_STUDENT]->(s:Student) RETURN count(s) AS n".to_string(),
+    )
+    .param("id", admission_id.to_string());
+    let mut result = graph.execute(q).await.map_err(|e| format!("student count: {e}"))?;
+    if let Some(row) = result.next().await.map_err(|e| format!("student count row: {e}"))? {
+        Ok(row.get::<i64>("n").unwrap_or(0))
+    } else {
+        Ok(0)
+    }
 }
 
 pub async fn fetch_payment(graph: &Graph, payment_id: &str) -> Result<Option<Payment>, String> {

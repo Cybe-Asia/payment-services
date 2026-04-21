@@ -1,8 +1,11 @@
-FROM rust:latest as builder
+FROM rust:1.88 as builder
 WORKDIR /app
 COPY Cargo.toml .
-RUN mkdir src && echo "fn main() {println!(\"build\");}" > src/main.rs
+RUN mkdir src && echo "fn main() { println!(\"dummy\"); }" > src/main.rs
 RUN cargo build --release || true
+# Remove dummy build artifacts so the second build actually picks up the real source.
+RUN rm -rf src target/release/deps/payment_service* target/release/payment-service* target/release/.fingerprint/payment_service* || true
+
 COPY . .
 RUN cargo build --release
 

@@ -14,8 +14,8 @@ on:
   workflow_dispatch:
 
 env:
-  SERVICE_NAME: payment-services
-  KUSTOMIZE_IMAGE_KEY: ghcr.io/cybe-asia/payment-services
+  SERVICE_NAME: payment-service
+  KUSTOMIZE_IMAGE_KEY: ghcr.io/cybe-asia/payment-service
 
 jobs:
   build-scan-push:

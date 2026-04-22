@@ -116,6 +116,13 @@ pub async fn create_invoice(
     .await
     .map_err(|e| format!("payment persist failed: {e}"))?;
 
+    // 7) Advance the Application lifecycle `submitted → payment_pending`
+    //    (best-effort — the Application node is owned by admission-service
+    //    but we share the neo4j, so a direct cypher is simpler than an
+    //    HTTP hop. If the Application doesn't exist yet, the UPDATE just
+    //    matches zero rows.)
+    set_application_status_for_lead(&ctx.graph, admission_id, "submitted", "payment_pending").await;
+
     info!(
         payment_id=%payment_id,
         admission_id=%admission_id,
@@ -190,6 +197,43 @@ pub struct InvoicePreview {
     pub total: i64,
 }
 
+/// Conditionally advance `Application.status` for the Application bound
+/// to this Lead. Matches only if the current status is `from_status`
+/// (idempotent — a double-fire from Xendit webhook + poll doesn't
+/// re-transition). Best-effort: if there's no Application yet (first
+/// invoice created before students were submitted, or non-standard
+/// flow) the query just matches zero rows and we move on.
+///
+/// Owned by admission-service, but we do this via direct cypher since
+/// the graph is shared and it avoids a synchronous HTTP dependency.
+async fn set_application_status_for_lead(
+    graph: &Graph,
+    lead_id: &str,
+    from_status: &str,
+    to_status: &str,
+) {
+    let q = Query::new(
+        "MATCH (l:Lead {lead_id:$lead_id})-[:CONVERTED_TO]->(a:Application) \
+         WHERE a.status = $from \
+         SET a.status = $to, a.updated_at = datetime() \
+         RETURN a.application_id AS id".to_string(),
+    )
+    .param("lead_id", lead_id.to_string())
+    .param("from", from_status.to_string())
+    .param("to", to_status.to_string());
+
+    match graph.execute(q).await {
+        Ok(mut res) => {
+            // Drain so the transaction commits. Don't care about the row.
+            let _ = res.next().await;
+            info!(lead_id=%lead_id, from=%from_status, to=%to_status, "application status advanced (best-effort)");
+        }
+        Err(e) => {
+            warn!(lead_id=%lead_id, error=%e, "failed to advance application status; payment flow continues");
+        }
+    }
+}
+
 async fn count_students_for_lead(graph: &Graph, admission_id: &str) -> Result<i64, String> {
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$id})-[:HAS_STUDENT]->(s:Student) RETURN count(s) AS n".to_string(),
@@ -253,6 +297,11 @@ pub async fn fetch_payment_refreshed(
                     } else {
                         // Best-effort settle the linked FeeObligation.
                         let _ = settle_obligation_for_payment(graph, payment_id).await;
+                        // Advance Application: any pre-paid status → application_fee_paid.
+                        if let Some(lead_id) = current.lead_id.as_deref() {
+                            set_application_status_for_lead(graph, lead_id, "submitted", "application_fee_paid").await;
+                            set_application_status_for_lead(graph, lead_id, "payment_pending", "application_fee_paid").await;
+                        }
                         info!(payment_id=%payment_id, "xendit refresh: marked paid");
                     }
                 }
@@ -299,6 +348,11 @@ pub async fn handle_webhook(
                 .map_err(|e| format!("mark_paid failed: {e}"))?;
             // Also settle any FeeObligation linked via SETTLED_BY relationship
             settle_obligation_for_payment(graph, payment_id).await?;
+            // And advance the Application lifecycle for the parent Lead.
+            if let Some(lead_id) = payment.lead_id.as_deref() {
+                set_application_status_for_lead(graph, lead_id, "submitted", "application_fee_paid").await;
+                set_application_status_for_lead(graph, lead_id, "payment_pending", "application_fee_paid").await;
+            }
         }
         "EXPIRED" => {
             payment_repository::mark_status(graph, payment_id, "expired")

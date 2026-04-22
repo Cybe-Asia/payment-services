@@ -51,10 +51,19 @@ pub async fn create_invoice(
         .map_err(|e| format!("fee structure lookup failed: {e}"))?
         .ok_or_else(|| format!("no active FeeStructure for {} / {}", school_id, payment_type))?;
 
-    // 3b) Count students on this Lead. Fee is per-student, so 2 kids = 2×.
-    //     Reject with a clear error if there are no students — otherwise we'd
-    //     create a Rp 0 invoice which Xendit would reject anyway.
-    let student_count = count_students_for_lead(&ctx.graph, admission_id).await?;
+    // 3b) Count students.
+    //     application_fee: charged per-child for the *whole* application
+    //                      (2 kids in one Lead → 2 × fee).
+    //     enrolment_fee:   per-child (one offer → one invoice → one kid).
+    //                      admissionId here is the Student id itself.
+    //     Detect by prefix — STU- means we treat it as a single-student
+    //     invoice; anything else is the Lead-wide application fee.
+    let is_student_scoped = admission_id.starts_with("STU-") || payment_type == "enrolment_fee";
+    let student_count = if is_student_scoped {
+        1_i64
+    } else {
+        count_students_for_lead(&ctx.graph, admission_id).await?
+    };
     if student_count == 0 {
         return Err("no students registered for this application — add at least one student before paying".to_string());
     }
@@ -168,7 +177,14 @@ pub async fn preview_invoice(
         .map_err(|e| format!("fee structure lookup failed: {e}"))?
         .ok_or_else(|| format!("no active FeeStructure for {} / {}", school_id, payment_type))?;
 
-    let student_count = count_students_for_lead(graph, admission_id).await?;
+    // Same per-student-scope rule as create_invoice: Student id or
+    // enrolment_fee → always 1; Lead id + application_fee → count kids.
+    let is_student_scoped = admission_id.starts_with("STU-") || payment_type == "enrolment_fee";
+    let student_count = if is_student_scoped {
+        1_i64
+    } else {
+        count_students_for_lead(graph, admission_id).await?
+    };
     let total = fs.amount * student_count;
 
     Ok(InvoicePreview {
@@ -494,7 +510,13 @@ struct LeadSnapshot {
     target_school_preference: String,
 }
 
-async fn fetch_lead(graph: &Graph, lead_id: &str) -> Result<Option<LeadSnapshot>, String> {
+/// Resolve an `admissionId` to the owning Lead. Accepts either a
+/// `LEAD-xxx` id directly, or a `Student.studentId` — in which case
+/// we walk back through the `HAS_STUDENT` edge to the parent Lead.
+/// This lets the enrolment_fee flow (where the offer is per-student)
+/// reuse the same `/invoice` endpoint as the application_fee flow.
+async fn fetch_lead(graph: &Graph, admission_id: &str) -> Result<Option<LeadSnapshot>, String> {
+    // Try it as a Lead id first — the common case for application_fee.
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$id}) \
          RETURN l.parent_name AS parent_name, l.email AS email, \
@@ -502,9 +524,30 @@ async fn fetch_lead(graph: &Graph, lead_id: &str) -> Result<Option<LeadSnapshot>
                 l.target_school_preference AS school \
          LIMIT 1".to_string(),
     )
-    .param("id", lead_id.to_string());
+    .param("id", admission_id.to_string());
     let mut result = graph.execute(q).await.map_err(|e| format!("lead fetch: {e}"))?;
     if let Some(row) = result.next().await.map_err(|e| format!("lead fetch row: {e}"))? {
+        return Ok(Some(LeadSnapshot {
+            parent_name: row.get("parent_name").unwrap_or_default(),
+            email: row.get("email").unwrap_or_default(),
+            whatsapp: row.get("whatsapp").unwrap_or_default(),
+            target_school_preference: row.get("school").unwrap_or_default(),
+        }));
+    }
+
+    // Fall back: treat it as a Student id and walk back to the Lead.
+    // Enrolment-fee flow passes the student id because the Offer is
+    // per-kid, not per-application.
+    let q = Query::new(
+        "MATCH (l:Lead)-[:HAS_STUDENT]->(Student {studentId:$id}) \
+         RETURN l.parent_name AS parent_name, l.email AS email, \
+                coalesce(l.whatsapp, l.mobile, '') AS whatsapp, \
+                l.target_school_preference AS school \
+         LIMIT 1".to_string(),
+    )
+    .param("id", admission_id.to_string());
+    let mut result = graph.execute(q).await.map_err(|e| format!("lead fetch by student: {e}"))?;
+    if let Some(row) = result.next().await.map_err(|e| format!("lead fetch by student row: {e}"))? {
         Ok(Some(LeadSnapshot {
             parent_name: row.get("parent_name").unwrap_or_default(),
             email: row.get("email").unwrap_or_default(),

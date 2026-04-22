@@ -234,6 +234,26 @@ async fn set_application_status_for_lead(
     }
 }
 
+/// Cascade every ApplicantStudent under a Lead from `submitted` to
+/// `test_pending` once the application fee is paid. Per spec §4.4,
+/// passing the fee is what gates access to the entrance test.
+///
+/// The cypher is idempotent and no-op for students that are already
+/// past `submitted` (e.g. an admin-advanced student, or a re-payment).
+async fn cascade_students_to_test_pending(graph: &Graph, lead_id: &str) {
+    let q = Query::new(
+        "MATCH (:Lead {lead_id:$lead_id})-[:HAS_STUDENT]->(s:Student) \
+         WHERE coalesce(s.applicantStatus, 'submitted') = 'submitted' \
+         SET s.applicantStatus = 'test_pending', s.updatedAt = datetime()".to_string(),
+    )
+    .param("lead_id", lead_id.to_string());
+    if let Err(e) = graph.run(q).await {
+        warn!(lead_id=%lead_id, error=%e, "failed to cascade students to test_pending");
+    } else {
+        info!(lead_id=%lead_id, "students cascaded → test_pending");
+    }
+}
+
 async fn count_students_for_lead(graph: &Graph, admission_id: &str) -> Result<i64, String> {
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$id})-[:HAS_STUDENT]->(s:Student) RETURN count(s) AS n".to_string(),
@@ -298,9 +318,13 @@ pub async fn fetch_payment_refreshed(
                         // Best-effort settle the linked FeeObligation.
                         let _ = settle_obligation_for_payment(graph, payment_id).await;
                         // Advance Application: any pre-paid status → application_fee_paid.
+                        // Also cascade every ApplicantStudent → test_pending so
+                        // the per-child funnel markers stay in sync with the
+                        // application-level state.
                         if let Some(lead_id) = current.lead_id.as_deref() {
                             set_application_status_for_lead(graph, lead_id, "submitted", "application_fee_paid").await;
                             set_application_status_for_lead(graph, lead_id, "payment_pending", "application_fee_paid").await;
+                            cascade_students_to_test_pending(graph, lead_id).await;
                         }
                         info!(payment_id=%payment_id, "xendit refresh: marked paid");
                     }
@@ -349,9 +373,11 @@ pub async fn handle_webhook(
             // Also settle any FeeObligation linked via SETTLED_BY relationship
             settle_obligation_for_payment(graph, payment_id).await?;
             // And advance the Application lifecycle for the parent Lead.
+            // Plus the per-child ApplicantStudent status (submitted → test_pending).
             if let Some(lead_id) = payment.lead_id.as_deref() {
                 set_application_status_for_lead(graph, lead_id, "submitted", "application_fee_paid").await;
                 set_application_status_for_lead(graph, lead_id, "payment_pending", "application_fee_paid").await;
+                cascade_students_to_test_pending(graph, lead_id).await;
             }
         }
         "EXPIRED" => {

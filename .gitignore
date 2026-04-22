@@ -1,0 +1,8 @@
+/target
+**/target
+.env
+**/.env
+.DS_Store
+
+# Local working notes — personal scratchpad per engineer
+CLAUDE.md

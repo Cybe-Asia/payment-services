@@ -27,6 +27,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -72,19 +74,25 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
 
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0.17.4
+        with:
+          image: ${{ steps.vars.outputs.image_ref }}
+          format: spdx-json
+          artifact-name: ${{ env.SERVICE_NAME }}-sbom-${{ steps.vars.outputs.image_tag }}.spdx.json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+          upload-artifact-retention: 90
+
       - name: Push image
         run: docker push "${{ steps.vars.outputs.image_ref }}"
 
       - name: Setup kustomize
         if: steps.vars.outputs.overlay_path != '' && env.GITOPS_TOKEN != ''
         uses: imranismail/setup-kustomize@v2
-        env:
-          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
 
       - name: Auto-bump gitops overlay
         if: steps.vars.outputs.overlay_path != '' && env.GITOPS_TOKEN != ''
-        env:
-          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
         run: |
           set -e
           git config --global user.email "ci-bot@cybe-asia.github"

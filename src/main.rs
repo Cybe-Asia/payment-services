@@ -20,9 +20,11 @@ mod routes;
 mod services;
 mod utils;
 
+use clients::minio::MinioClient;
 use clients::xendit::XenditClient;
 use config::config::load;
 use database::neo4j::create_graph;
+use repositories::payment_settings_repository::PaymentSettingsSeed;
 use repositories::seed::seed_fees;
 
 #[derive(Clone)]
@@ -33,6 +35,9 @@ pub struct AppState {
     pub xendit_webhook_token: String,
     pub default_currency: String,
     pub default_due_hours: i64,
+    pub jwt_secret: String,
+    pub minio: Option<MinioClient>,
+    pub payment_settings_seed: PaymentSettingsSeed,
 }
 
 fn load_env() {
@@ -84,6 +89,35 @@ async fn main() {
         &cfg.xendit_failure_redirect_url,
     );
 
+    let minio = match (
+        cfg.minio_endpoint.as_str(),
+        cfg.minio_bucket.as_str(),
+        cfg.minio_access_key.as_str(),
+        cfg.minio_secret_key.as_str(),
+    ) {
+        (endpoint, bucket, access, secret)
+            if !endpoint.is_empty()
+                && !bucket.is_empty()
+                && !access.is_empty()
+                && !secret.is_empty() =>
+        {
+            info!(endpoint=%endpoint, bucket=%bucket, "minio client configured for payment proofs");
+            Some(MinioClient::new(endpoint, &cfg.minio_region, access, secret, bucket).await)
+        }
+        _ => {
+            info!("minio client NOT configured (manual proof upload returns 503)");
+            None
+        }
+    };
+
+    let payment_settings_seed = PaymentSettingsSeed {
+        tenant_id: cfg.tenant_id.clone(),
+        bank_name: cfg.manual_transfer_bank_name.clone(),
+        bank_account_name: cfg.manual_transfer_account_name.clone(),
+        bank_account_number: cfg.manual_transfer_account_number.clone(),
+        instructions: cfg.manual_transfer_instructions.clone(),
+    };
+
     let state = AppState {
         graph,
         xendit,
@@ -91,6 +125,9 @@ async fn main() {
         xendit_webhook_token: cfg.xendit_webhook_token.clone(),
         default_currency: cfg.default_fee_currency.clone(),
         default_due_hours: cfg.default_fee_due_hours,
+        jwt_secret: cfg.jwt_secret.clone(),
+        minio,
+        payment_settings_seed,
     };
 
     let app: Router = Router::new()

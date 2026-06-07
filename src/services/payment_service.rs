@@ -7,7 +7,17 @@ use uuid::Uuid;
 
 use crate::clients::xendit::{CreateInvoiceRequest as XenditInvoiceReq, XenditClient};
 use crate::models::payment::Payment;
-use crate::repositories::{fee_obligation_repository, fee_structure_repository, payment_repository};
+use crate::models::payment_proof::PaymentProof;
+use crate::repositories::payment_repository::{
+    CreateProofInput, ManualBankDetails, PaymentReviewDetail, PaymentReviewRow,
+};
+use crate::repositories::payment_settings_repository::{
+    PaymentSettings, PaymentSettingsSeed, UpdatePaymentSettings,
+};
+use crate::repositories::{
+    fee_obligation_repository, fee_structure_repository, payment_repository,
+    payment_settings_repository,
+};
 
 #[derive(Debug)]
 pub struct CreateInvoiceOutcome {
@@ -18,12 +28,34 @@ pub struct CreateInvoiceOutcome {
     pub expires_at: String,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct ManualPaymentOutcome {
+    pub payment: Payment,
+    pub settings: PaymentSettings,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct PaymentReviewList {
+    pub rows: Vec<PaymentReviewRow>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewManualPaymentRequest {
+    pub decision: String,
+    pub verified_amount: Option<i64>,
+    pub note: Option<String>,
+}
+
 pub struct PaymentContext<'a> {
     pub graph: Arc<Graph>,
     pub xendit: &'a XenditClient,
     pub tenant_id: &'a str,
-    pub default_currency: &'a str,
     pub default_due_hours: i64,
+    pub settings_seed: PaymentSettingsSeed,
 }
 
 pub async fn create_invoice(
@@ -31,8 +63,14 @@ pub async fn create_invoice(
     admission_id: &str,
     payment_type: &str,
 ) -> Result<CreateInvoiceOutcome, String> {
+    let settings = get_payment_settings(&ctx.graph, &ctx.settings_seed).await?;
+    if !settings.xendit_enabled {
+        return Err("xendit payment method is disabled".to_string());
+    }
+
     // 1) Look up the Lead (parent contact info + school selection).
-    let lead = fetch_lead(&ctx.graph, admission_id).await?
+    let lead = fetch_lead(&ctx.graph, admission_id)
+        .await?
         .ok_or_else(|| "Lead not found".to_string())?;
 
     // 2) Resolve school_id from the lead's target_school_preference (code).
@@ -43,13 +81,24 @@ pub async fn create_invoice(
     )
     .await
     .map_err(|e| format!("school lookup failed: {e}"))?
-    .ok_or_else(|| format!("school not found for code {}", lead.target_school_preference))?;
+    .ok_or_else(|| {
+        format!(
+            "school not found for code {}",
+            lead.target_school_preference
+        )
+    })?;
 
     // 3) Look up active FeeStructure to get the *per-student* amount.
-    let fs = fee_structure_repository::find_active(&ctx.graph, ctx.tenant_id, &school_id, payment_type)
-        .await
-        .map_err(|e| format!("fee structure lookup failed: {e}"))?
-        .ok_or_else(|| format!("no active FeeStructure for {} / {}", school_id, payment_type))?;
+    let fs =
+        fee_structure_repository::find_active(&ctx.graph, ctx.tenant_id, &school_id, payment_type)
+            .await
+            .map_err(|e| format!("fee structure lookup failed: {e}"))?
+            .ok_or_else(|| {
+                format!(
+                    "no active FeeStructure for {} / {}",
+                    school_id, payment_type
+                )
+            })?;
 
     // 3b) Count students.
     //     application_fee: charged per-child for the *whole* application
@@ -65,7 +114,10 @@ pub async fn create_invoice(
         count_students_for_lead(&ctx.graph, admission_id).await?
     };
     if student_count == 0 {
-        return Err("no students registered for this application — add at least one student before paying".to_string());
+        return Err(
+            "no students registered for this application — add at least one student before paying"
+                .to_string(),
+        );
     }
     let total_amount = fs.amount * student_count;
 
@@ -75,7 +127,7 @@ pub async fn create_invoice(
     let obligation = fee_obligation_repository::upsert_for_lead(
         &ctx.graph,
         ctx.tenant_id,
-        admission_id,
+        &lead.lead_id,
         payment_type,
         total_amount,
         &fs.currency,
@@ -118,9 +170,12 @@ pub async fn create_invoice(
         &invoice.id,
         &invoice.id,
         &invoice.invoice_url,
-        &invoice.expiry_date.clone().unwrap_or_else(|| due_at.to_rfc3339()),
+        &invoice
+            .expiry_date
+            .clone()
+            .unwrap_or_else(|| due_at.to_rfc3339()),
         &obligation.fee_obligation_id,
-        admission_id,
+        &lead.lead_id,
     )
     .await
     .map_err(|e| format!("payment persist failed: {e}"))?;
@@ -130,7 +185,8 @@ pub async fn create_invoice(
     //    but we share the neo4j, so a direct cypher is simpler than an
     //    HTTP hop. If the Application doesn't exist yet, the UPDATE just
     //    matches zero rows.)
-    set_application_status_for_lead(&ctx.graph, admission_id, "submitted", "payment_pending").await;
+    set_application_status_for_lead(&ctx.graph, &lead.lead_id, "submitted", "payment_pending")
+        .await;
 
     info!(
         payment_id=%payment_id,
@@ -151,6 +207,121 @@ pub async fn create_invoice(
     })
 }
 
+pub async fn create_manual_payment(
+    ctx: PaymentContext<'_>,
+    admission_id: &str,
+    payment_type: &str,
+) -> Result<ManualPaymentOutcome, String> {
+    let settings = get_payment_settings(&ctx.graph, &ctx.settings_seed).await?;
+    if !settings.manual_transfer_enabled {
+        return Err("manual transfer payment method is disabled".to_string());
+    }
+
+    let lead = fetch_lead(&ctx.graph, admission_id)
+        .await?
+        .ok_or_else(|| "Lead not found".to_string())?;
+
+    if let Some(existing) =
+        payment_repository::find_active_manual_for_lead(&ctx.graph, &lead.lead_id, payment_type)
+            .await
+            .map_err(|e| format!("manual payment lookup failed: {e}"))?
+    {
+        return Ok(ManualPaymentOutcome {
+            payment: existing,
+            settings,
+        });
+    }
+
+    let school_id = crate::repositories::school_repository::find_school_id_by_code(
+        &ctx.graph,
+        ctx.tenant_id,
+        &lead.target_school_preference,
+    )
+    .await
+    .map_err(|e| format!("school lookup failed: {e}"))?
+    .ok_or_else(|| {
+        format!(
+            "school not found for code {}",
+            lead.target_school_preference
+        )
+    })?;
+
+    let fs =
+        fee_structure_repository::find_active(&ctx.graph, ctx.tenant_id, &school_id, payment_type)
+            .await
+            .map_err(|e| format!("fee structure lookup failed: {e}"))?
+            .ok_or_else(|| {
+                format!(
+                    "no active FeeStructure for {} / {}",
+                    school_id, payment_type
+                )
+            })?;
+
+    let is_student_scoped = admission_id.starts_with("STU-") || payment_type == "enrolment_fee";
+    let student_count = if is_student_scoped {
+        1_i64
+    } else {
+        count_students_for_lead(&ctx.graph, &lead.lead_id).await?
+    };
+    if student_count == 0 {
+        return Err(
+            "no students registered for this application — add at least one student before paying"
+                .to_string(),
+        );
+    }
+    let total_amount = fs.amount * student_count;
+
+    let due_at = Utc::now() + Duration::hours(ctx.default_due_hours);
+    let obligation_id = format!("FEEOBL-{}", Uuid::new_v4());
+    let obligation = fee_obligation_repository::upsert_for_lead(
+        &ctx.graph,
+        ctx.tenant_id,
+        &lead.lead_id,
+        payment_type,
+        total_amount,
+        &fs.currency,
+        &due_at.to_rfc3339(),
+        &obligation_id,
+    )
+    .await
+    .map_err(|e| format!("fee obligation upsert failed: {e}"))?;
+
+    let payment_id = format!("PAY-{}", Uuid::new_v4());
+    let manual_reference = format!("TWSI-{}", &payment_id.trim_start_matches("PAY-")[..8]);
+    let bank = ManualBankDetails {
+        bank_name: settings.bank_name.clone(),
+        account_name: settings.bank_account_name.clone(),
+        account_number: settings.bank_account_number.clone(),
+        instructions: settings.instructions.clone(),
+    };
+
+    payment_repository::create_manual_pending(
+        &ctx.graph,
+        &payment_id,
+        ctx.tenant_id,
+        payment_type,
+        total_amount,
+        &fs.currency,
+        &due_at.to_rfc3339(),
+        &obligation.fee_obligation_id,
+        &lead.lead_id,
+        &manual_reference,
+        &bank,
+    )
+    .await
+    .map_err(|e| format!("manual payment persist failed: {e}"))?;
+
+    set_application_status_for_lead(&ctx.graph, &lead.lead_id, "submitted", "payment_pending")
+        .await;
+
+    let payment = payment_repository::find_by_id(&ctx.graph, &payment_id)
+        .await
+        .map_err(|e| format!("manual payment fetch failed: {e}"))?
+        .ok_or_else(|| "manual payment created but not found".to_string())?;
+
+    Ok(ManualPaymentOutcome { payment, settings })
+}
+
 /// Preview what this Lead would be charged without actually creating an
 /// invoice. Powers the frontend's payment page breakdown:
 /// "Rp 1.000.000 × 2 students = Rp 2.000.000".
@@ -160,7 +331,8 @@ pub async fn preview_invoice(
     admission_id: &str,
     payment_type: &str,
 ) -> Result<InvoicePreview, String> {
-    let lead = fetch_lead(graph, admission_id).await?
+    let lead = fetch_lead(graph, admission_id)
+        .await?
         .ok_or_else(|| "Lead not found".to_string())?;
 
     let school_id = crate::repositories::school_repository::find_school_id_by_code(
@@ -170,12 +342,22 @@ pub async fn preview_invoice(
     )
     .await
     .map_err(|e| format!("school lookup failed: {e}"))?
-    .ok_or_else(|| format!("school not found for code {}", lead.target_school_preference))?;
+    .ok_or_else(|| {
+        format!(
+            "school not found for code {}",
+            lead.target_school_preference
+        )
+    })?;
 
     let fs = fee_structure_repository::find_active(graph, tenant_id, &school_id, payment_type)
         .await
         .map_err(|e| format!("fee structure lookup failed: {e}"))?
-        .ok_or_else(|| format!("no active FeeStructure for {} / {}", school_id, payment_type))?;
+        .ok_or_else(|| {
+            format!(
+                "no active FeeStructure for {} / {}",
+                school_id, payment_type
+            )
+        })?;
 
     // Same per-student-scope rule as create_invoice: Student id or
     // enrolment_fee → always 1; Lead id + application_fee → count kids.
@@ -195,6 +377,209 @@ pub async fn preview_invoice(
         student_count,
         total,
     })
+}
+
+pub async fn get_payment_settings(
+    graph: &Graph,
+    seed: &PaymentSettingsSeed,
+) -> Result<PaymentSettings, String> {
+    payment_settings_repository::get_or_seed(graph, seed)
+        .await
+        .map_err(|e| format!("payment settings fetch failed: {e}"))
+}
+
+pub async fn update_payment_settings(
+    graph: &Graph,
+    seed: &PaymentSettingsSeed,
+    payload: UpdatePaymentSettings,
+    actor: &str,
+) -> Result<PaymentSettings, String> {
+    let current = get_payment_settings(graph, seed).await?;
+    let merged = UpdatePaymentSettings {
+        xendit_enabled: payload.xendit_enabled,
+        manual_transfer_enabled: payload.manual_transfer_enabled,
+        bank_name: Some(payload.bank_name.unwrap_or(current.bank_name)),
+        bank_account_name: Some(
+            payload
+                .bank_account_name
+                .unwrap_or(current.bank_account_name),
+        ),
+        bank_account_number: Some(
+            payload
+                .bank_account_number
+                .unwrap_or(current.bank_account_number),
+        ),
+        instructions: Some(payload.instructions.unwrap_or(current.instructions)),
+    };
+
+    payment_settings_repository::update(graph, &seed.tenant_id, merged, actor)
+        .await
+        .map_err(|e| format!("payment settings update failed: {e}"))
+}
+
+pub async fn record_manual_proof(
+    graph: &Graph,
+    input: CreateProofInput<'_>,
+) -> Result<PaymentProof, String> {
+    payment_repository::create_payment_proof(graph, input)
+        .await
+        .map_err(|e| format!("payment proof persist failed: {e}"))
+}
+
+pub async fn list_manual_review_rows(
+    graph: &Graph,
+    status: &str,
+    school: &str,
+    search: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<PaymentReviewList, String> {
+    let rows = payment_repository::list_review_rows(graph, status, school, search, limit, offset)
+        .await
+        .map_err(|e| format!("payment review queue failed: {e}"))?;
+    let total = payment_repository::count_review_rows(graph, status, school, search)
+        .await
+        .map_err(|e| format!("payment review count failed: {e}"))?;
+    Ok(PaymentReviewList {
+        rows,
+        total,
+        limit,
+        offset,
+    })
+}
+
+pub async fn get_manual_review_detail(
+    graph: &Graph,
+    payment_id: &str,
+) -> Result<Option<PaymentReviewDetail>, String> {
+    payment_repository::find_review_detail(graph, payment_id)
+        .await
+        .map_err(|e| format!("payment review detail failed: {e}"))
+}
+
+pub async fn review_manual_payment(
+    graph: &Graph,
+    payment_id: &str,
+    payload: ReviewManualPaymentRequest,
+    actor: &str,
+) -> Result<Payment, String> {
+    let payment = payment_repository::find_by_id(graph, payment_id)
+        .await
+        .map_err(|e| format!("payment fetch failed: {e}"))?
+        .ok_or_else(|| "Payment not found".to_string())?;
+
+    if payment.payment_method.as_deref() != Some("manual_transfer") {
+        return Err("payment is not a manual transfer".to_string());
+    }
+    if payment.status == "paid" {
+        return Err("payment is already paid".to_string());
+    }
+
+    let due = payment.amount.max(0);
+    let current_verified = payment.amount_verified.unwrap_or(0).max(0);
+    let submitted = payment.amount_submitted.unwrap_or(0).max(current_verified);
+    let note = payload.note.clone().unwrap_or_default();
+    let decision = payload.decision.to_lowercase();
+
+    let (payment_status, proof_status, verified, short, overpaid, rejection_reason, receipt_ref) =
+        match decision.as_str() {
+            "approve" => {
+                let verified = payload
+                    .verified_amount
+                    .unwrap_or(submitted)
+                    .max(current_verified);
+                if verified < due {
+                    return Err(
+                        "verified amount is lower than amount due; use underpaid".to_string()
+                    );
+                }
+                (
+                    "paid",
+                    "approved",
+                    verified,
+                    0,
+                    (verified - due).max(0),
+                    "",
+                    Some(payment_id),
+                )
+            }
+            "underpaid" => {
+                let verified = payload
+                    .verified_amount
+                    .ok_or_else(|| "verifiedAmount is required for underpaid review".to_string())?;
+                if verified <= 0 {
+                    return Err("verifiedAmount must be greater than zero".to_string());
+                }
+                if verified >= due {
+                    return Err("verifiedAmount covers the full amount; use approve".to_string());
+                }
+                (
+                    "underpaid",
+                    "approved",
+                    verified,
+                    due - verified,
+                    0,
+                    "",
+                    None,
+                )
+            }
+            "reject" => {
+                if note.trim().is_empty() {
+                    return Err("review note is required when rejecting proof".to_string());
+                }
+                let short = (due - current_verified).max(0);
+                let status = if current_verified > 0 {
+                    "underpaid"
+                } else {
+                    "proof_rejected"
+                };
+                (
+                    status,
+                    "rejected",
+                    current_verified,
+                    short,
+                    0,
+                    note.as_str(),
+                    None,
+                )
+            }
+            _ => return Err("decision must be approve, underpaid, or reject".to_string()),
+        };
+
+    payment_repository::review_manual_payment(
+        graph,
+        payment_id,
+        payment_status,
+        proof_status,
+        verified,
+        short,
+        overpaid,
+        if note.trim().is_empty() {
+            None
+        } else {
+            Some(note.as_str())
+        },
+        if rejection_reason.is_empty() {
+            None
+        } else {
+            Some(rejection_reason)
+        },
+        actor,
+        receipt_ref,
+    )
+    .await
+    .map_err(|e| format!("payment review persist failed: {e}"))?;
+
+    let reviewed = payment_repository::find_by_id(graph, payment_id)
+        .await
+        .map_err(|e| format!("payment fetch after review failed: {e}"))?
+        .ok_or_else(|| "Payment not found after review".to_string())?;
+
+    if reviewed.status == "paid" {
+        apply_paid_side_effects(graph, &reviewed).await?;
+    }
+
+    Ok(reviewed)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -232,7 +617,8 @@ async fn set_application_status_for_lead(
         "MATCH (l:Lead {lead_id:$lead_id})-[:CONVERTED_TO]->(a:Application) \
          WHERE a.status = $from \
          SET a.status = $to, a.updated_at = datetime() \
-         RETURN a.application_id AS id".to_string(),
+         RETURN a.application_id AS id"
+            .to_string(),
     )
     .param("lead_id", lead_id.to_string())
     .param("from", from_status.to_string())
@@ -305,7 +691,8 @@ async fn cascade_students_to_test_pending(graph: &Graph, lead_id: &str) {
     let q = Query::new(
         "MATCH (:Lead {lead_id:$lead_id})-[:HAS_STUDENT]->(s:Student) \
          WHERE coalesce(s.applicantStatus, 'submitted') = 'submitted' \
-         SET s.applicantStatus = 'test_pending', s.updatedAt = datetime()".to_string(),
+         SET s.applicantStatus = 'test_pending', s.updatedAt = datetime()"
+            .to_string(),
     )
     .param("lead_id", lead_id.to_string());
     if let Err(e) = graph.run(q).await {
@@ -320,8 +707,15 @@ async fn count_students_for_lead(graph: &Graph, admission_id: &str) -> Result<i6
         "MATCH (l:Lead {lead_id:$id})-[:HAS_STUDENT]->(s:Student) RETURN count(s) AS n".to_string(),
     )
     .param("id", admission_id.to_string());
-    let mut result = graph.execute(q).await.map_err(|e| format!("student count: {e}"))?;
-    if let Some(row) = result.next().await.map_err(|e| format!("student count row: {e}"))? {
+    let mut result = graph
+        .execute(q)
+        .await
+        .map_err(|e| format!("student count: {e}"))?;
+    if let Some(row) = result
+        .next()
+        .await
+        .map_err(|e| format!("student count row: {e}"))?
+    {
         Ok(row.get::<i64>("n").unwrap_or(0))
     } else {
         Ok(0)
@@ -369,7 +763,10 @@ pub async fn fetch_payment_refreshed(
                     if let Err(e) = payment_repository::mark_paid(
                         graph,
                         payment_id,
-                        fresh.payment_method.as_deref().or(fresh.payment_channel.as_deref()),
+                        fresh
+                            .payment_method
+                            .as_deref()
+                            .or(fresh.payment_channel.as_deref()),
                         fresh.payment_id.as_deref().or(Some(&fresh.id)),
                     )
                     .await
@@ -386,12 +783,30 @@ pub async fn fetch_payment_refreshed(
                         if let Some(lead_id) = current.lead_id.as_deref() {
                             match current.payment_type.as_str() {
                                 "application_fee" => {
-                                    set_application_status_for_lead(graph, lead_id, "submitted", "application_fee_paid").await;
-                                    set_application_status_for_lead(graph, lead_id, "payment_pending", "application_fee_paid").await;
+                                    set_application_status_for_lead(
+                                        graph,
+                                        lead_id,
+                                        "submitted",
+                                        "application_fee_paid",
+                                    )
+                                    .await;
+                                    set_application_status_for_lead(
+                                        graph,
+                                        lead_id,
+                                        "payment_pending",
+                                        "application_fee_paid",
+                                    )
+                                    .await;
                                     cascade_students_to_test_pending(graph, lead_id).await;
                                 }
                                 "enrolment_fee" => {
-                                    set_application_status_for_lead(graph, lead_id, "offer_stage", "completed").await;
+                                    set_application_status_for_lead(
+                                        graph,
+                                        lead_id,
+                                        "offer_stage",
+                                        "completed",
+                                    )
+                                    .await;
                                     cascade_students_on_enrolment_paid(graph, lead_id).await;
                                 }
                                 _ => {
@@ -404,7 +819,9 @@ pub async fn fetch_payment_refreshed(
                     }
                 }
                 "EXPIRED" => {
-                    if let Err(e) = payment_repository::mark_status(graph, payment_id, "expired").await {
+                    if let Err(e) =
+                        payment_repository::mark_status(graph, payment_id, "expired").await
+                    {
                         warn!(error=%e, "xendit refresh: mark_status expired failed");
                     } else {
                         info!(payment_id=%payment_id, "xendit refresh: marked expired");
@@ -451,12 +868,25 @@ pub async fn handle_webhook(
             if let Some(lead_id) = payment.lead_id.as_deref() {
                 match payment.payment_type.as_str() {
                     "application_fee" => {
-                        set_application_status_for_lead(graph, lead_id, "submitted", "application_fee_paid").await;
-                        set_application_status_for_lead(graph, lead_id, "payment_pending", "application_fee_paid").await;
+                        set_application_status_for_lead(
+                            graph,
+                            lead_id,
+                            "submitted",
+                            "application_fee_paid",
+                        )
+                        .await;
+                        set_application_status_for_lead(
+                            graph,
+                            lead_id,
+                            "payment_pending",
+                            "application_fee_paid",
+                        )
+                        .await;
                         cascade_students_to_test_pending(graph, lead_id).await;
                     }
                     "enrolment_fee" => {
-                        set_application_status_for_lead(graph, lead_id, "offer_stage", "completed").await;
+                        set_application_status_for_lead(graph, lead_id, "offer_stage", "completed")
+                            .await;
                         cascade_students_on_enrolment_paid(graph, lead_id).await;
                     }
                     _ => {}
@@ -479,14 +909,49 @@ pub async fn handle_webhook(
     Ok(())
 }
 
+async fn apply_paid_side_effects(graph: &Graph, payment: &Payment) -> Result<(), String> {
+    settle_obligation_for_payment(graph, &payment.payment_id).await?;
+    if let Some(lead_id) = payment.lead_id.as_deref() {
+        match payment.payment_type.as_str() {
+            "application_fee" => {
+                set_application_status_for_lead(
+                    graph,
+                    lead_id,
+                    "submitted",
+                    "application_fee_paid",
+                )
+                .await;
+                set_application_status_for_lead(
+                    graph,
+                    lead_id,
+                    "payment_pending",
+                    "application_fee_paid",
+                )
+                .await;
+                cascade_students_to_test_pending(graph, lead_id).await;
+            }
+            "enrolment_fee" => {
+                set_application_status_for_lead(graph, lead_id, "offer_stage", "completed").await;
+                cascade_students_on_enrolment_paid(graph, lead_id).await;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 async fn settle_obligation_for_payment(graph: &Graph, payment_id: &str) -> Result<(), String> {
     let q = Query::new(
         "MATCH (f:FeeObligation)-[:SETTLED_BY]->(p:Payment {payment_id:$pid}) \
          SET f.status = 'paid', f.paid_at = datetime() \
-         RETURN f.fee_obligation_id AS id".to_string(),
+         RETURN f.fee_obligation_id AS id"
+            .to_string(),
     )
     .param("pid", payment_id.to_string());
-    let mut res = graph.execute(q).await.map_err(|e| format!("settle failed: {e}"))?;
+    let mut res = graph
+        .execute(q)
+        .await
+        .map_err(|e| format!("settle failed: {e}"))?;
     let _ = res.next().await;
     Ok(())
 }
@@ -504,6 +969,7 @@ fn pretty_payment_type(ty: &str) -> &str {
 // ---- internal helpers ----
 
 struct LeadSnapshot {
+    lead_id: String,
     parent_name: String,
     email: String,
     whatsapp: String,
@@ -519,15 +985,24 @@ async fn fetch_lead(graph: &Graph, admission_id: &str) -> Result<Option<LeadSnap
     // Try it as a Lead id first — the common case for application_fee.
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$id}) \
-         RETURN l.parent_name AS parent_name, l.email AS email, \
+         RETURN l.lead_id AS lead_id, l.parent_name AS parent_name, l.email AS email, \
                 coalesce(l.whatsapp, l.mobile, '') AS whatsapp, \
                 l.target_school_preference AS school \
-         LIMIT 1".to_string(),
+         LIMIT 1"
+            .to_string(),
     )
     .param("id", admission_id.to_string());
-    let mut result = graph.execute(q).await.map_err(|e| format!("lead fetch: {e}"))?;
-    if let Some(row) = result.next().await.map_err(|e| format!("lead fetch row: {e}"))? {
+    let mut result = graph
+        .execute(q)
+        .await
+        .map_err(|e| format!("lead fetch: {e}"))?;
+    if let Some(row) = result
+        .next()
+        .await
+        .map_err(|e| format!("lead fetch row: {e}"))?
+    {
         return Ok(Some(LeadSnapshot {
+            lead_id: row.get("lead_id").unwrap_or_default(),
             parent_name: row.get("parent_name").unwrap_or_default(),
             email: row.get("email").unwrap_or_default(),
             whatsapp: row.get("whatsapp").unwrap_or_default(),
@@ -540,15 +1015,24 @@ async fn fetch_lead(graph: &Graph, admission_id: &str) -> Result<Option<LeadSnap
     // per-kid, not per-application.
     let q = Query::new(
         "MATCH (l:Lead)-[:HAS_STUDENT]->(Student {studentId:$id}) \
-         RETURN l.parent_name AS parent_name, l.email AS email, \
+         RETURN l.lead_id AS lead_id, l.parent_name AS parent_name, l.email AS email, \
                 coalesce(l.whatsapp, l.mobile, '') AS whatsapp, \
                 l.target_school_preference AS school \
-         LIMIT 1".to_string(),
+         LIMIT 1"
+            .to_string(),
     )
     .param("id", admission_id.to_string());
-    let mut result = graph.execute(q).await.map_err(|e| format!("lead fetch by student: {e}"))?;
-    if let Some(row) = result.next().await.map_err(|e| format!("lead fetch by student row: {e}"))? {
+    let mut result = graph
+        .execute(q)
+        .await
+        .map_err(|e| format!("lead fetch by student: {e}"))?;
+    if let Some(row) = result
+        .next()
+        .await
+        .map_err(|e| format!("lead fetch by student row: {e}"))?
+    {
         Ok(Some(LeadSnapshot {
+            lead_id: row.get("lead_id").unwrap_or_default(),
             parent_name: row.get("parent_name").unwrap_or_default(),
             email: row.get("email").unwrap_or_default(),
             whatsapp: row.get("whatsapp").unwrap_or_default(),

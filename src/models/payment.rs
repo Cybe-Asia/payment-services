@@ -39,6 +39,8 @@ pub struct Payment {
     pub short_amount: Option<i64>,
     #[serde(rename = "overpaidAmount")]
     pub overpaid_amount: Option<i64>,
+    #[serde(rename = "manualBankAccountId")]
+    pub manual_bank_account_id: Option<String>,
     #[serde(rename = "bankName")]
     pub bank_name: Option<String>,
     #[serde(rename = "bankAccountName")]

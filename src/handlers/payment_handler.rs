@@ -107,7 +107,10 @@ pub async fn create_manual_payment_handler(
         Err((status, msg)) => return fail(status, &msg),
     };
     if payload.admission_id.starts_with("LEAD-")
-        && !parent.lead_ids.iter().any(|lead_id| lead_id == &payload.admission_id)
+        && !parent
+            .lead_ids
+            .iter()
+            .any(|lead_id| lead_id == &payload.admission_id)
     {
         return fail(
             StatusCode::FORBIDDEN,
@@ -123,8 +126,13 @@ pub async fn create_manual_payment_handler(
         settings_seed: state.payment_settings_seed.clone(),
     };
 
-    match payment_service::create_manual_payment(ctx, &payload.admission_id, &payload.payment_type)
-        .await
+    match payment_service::create_manual_payment(
+        ctx,
+        &payload.admission_id,
+        &payload.payment_type,
+        payload.manual_bank_account_id.as_deref(),
+    )
+    .await
     {
         Ok(outcome) => {
             if !auth::owns_lead(&parent, outcome.payment.lead_id.as_deref()) {
@@ -146,7 +154,10 @@ pub async fn create_manual_payment_handler(
             error!("create_manual_payment failed: {e}");
             let status = if e.contains("not found") {
                 StatusCode::NOT_FOUND
-            } else if e.contains("disabled") || e.contains("no students registered") {
+            } else if e.contains("disabled")
+                || e.contains("no students registered")
+                || e.contains("bank account")
+            {
                 StatusCode::BAD_REQUEST
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR

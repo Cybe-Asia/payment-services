@@ -12,7 +12,7 @@ use crate::repositories::payment_repository::{
     CreateProofInput, ManualBankDetails, PaymentReviewDetail, PaymentReviewRow,
 };
 use crate::repositories::payment_settings_repository::{
-    PaymentSettings, PaymentSettingsSeed, UpdatePaymentSettings,
+    ManualBankAccount, PaymentSettings, PaymentSettingsSeed, UpdatePaymentSettings,
 };
 use crate::repositories::{
     fee_obligation_repository, fee_structure_repository, payment_repository,
@@ -211,6 +211,7 @@ pub async fn create_manual_payment(
     ctx: PaymentContext<'_>,
     admission_id: &str,
     payment_type: &str,
+    manual_bank_account_id: Option<&str>,
 ) -> Result<ManualPaymentOutcome, String> {
     let settings = get_payment_settings(&ctx.graph, &ctx.settings_seed).await?;
     if !settings.manual_transfer_enabled {
@@ -288,12 +289,7 @@ pub async fn create_manual_payment(
 
     let payment_id = format!("PAY-{}", Uuid::new_v4());
     let manual_reference = format!("TWSI-{}", &payment_id.trim_start_matches("PAY-")[..8]);
-    let bank = ManualBankDetails {
-        bank_name: settings.bank_name.clone(),
-        account_name: settings.bank_account_name.clone(),
-        account_number: settings.bank_account_number.clone(),
-        instructions: settings.instructions.clone(),
-    };
+    let bank = resolve_manual_bank_details(&settings, manual_bank_account_id)?;
 
     payment_repository::create_manual_pending(
         &ctx.graph,
@@ -410,11 +406,58 @@ pub async fn update_payment_settings(
                 .unwrap_or(current.bank_account_number),
         ),
         instructions: Some(payload.instructions.unwrap_or(current.instructions)),
+        manual_bank_accounts: Some(
+            payload
+                .manual_bank_accounts
+                .unwrap_or(current.manual_bank_accounts),
+        ),
     };
 
     payment_settings_repository::update(graph, &seed.tenant_id, merged, actor)
         .await
         .map_err(|e| format!("payment settings update failed: {e}"))
+}
+
+fn resolve_manual_bank_details(
+    settings: &PaymentSettings,
+    selected_id: Option<&str>,
+) -> Result<ManualBankDetails, String> {
+    let selected_id = selected_id.map(str::trim).filter(|id| !id.is_empty());
+    let enabled_accounts: Vec<&ManualBankAccount> = settings
+        .manual_bank_accounts
+        .iter()
+        .filter(|account| account.enabled)
+        .collect();
+
+    let account = if let Some(selected_id) = selected_id {
+        enabled_accounts
+            .iter()
+            .copied()
+            .find(|account| account.id == selected_id)
+            .ok_or_else(|| "selected manual bank account is not available".to_string())?
+    } else if let Some(account) = enabled_accounts.first().copied() {
+        account
+    } else {
+        return Ok(ManualBankDetails {
+            bank_account_id: String::new(),
+            bank_name: settings.bank_name.clone(),
+            account_name: settings.bank_account_name.clone(),
+            account_number: settings.bank_account_number.clone(),
+            instructions: settings.instructions.clone(),
+        });
+    };
+
+    Ok(ManualBankDetails {
+        bank_account_id: account.id.clone(),
+        bank_name: account.bank_name.clone(),
+        account_name: account.account_name.clone(),
+        account_number: account.account_number.clone(),
+        instructions: if account.instructions.is_empty() {
+            settings.instructions.clone()
+        } else {
+            account.instructions.clone()
+        },
+    })
 }
 
 pub async fn record_manual_proof(

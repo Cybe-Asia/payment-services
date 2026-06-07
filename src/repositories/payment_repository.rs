@@ -5,6 +5,7 @@ use crate::models::payment_proof::PaymentProof;
 
 #[derive(Clone, Debug)]
 pub struct ManualBankDetails {
+    pub bank_account_id: String,
     pub bank_name: String,
     pub account_name: String,
     pub account_number: String,
@@ -146,6 +147,7 @@ pub async fn create_manual_pending(
             payment_id:$payment_id, tenant_id:$tenant_id, payment_type:$payment_type, \
             status:'awaiting_proof', amount:$amount, currency:$currency, \
             payment_method:'manual_transfer', manual_reference:$manual_reference, \
+            manual_bank_account_id:$manual_bank_account_id, \
             bank_name:$bank_name, bank_account_name:$account_name, \
             bank_account_number:$account_number, manual_instructions:$instructions, \
             amount_submitted:0, amount_verified:0, short_amount:$amount, overpaid_amount:0, \
@@ -165,6 +167,7 @@ pub async fn create_manual_pending(
     .param("fid", fee_obligation_id.to_string())
     .param("lead_id", lead_id.to_string())
     .param("manual_reference", manual_reference.to_string())
+    .param("manual_bank_account_id", bank.bank_account_id.clone())
     .param("bank_name", bank.bank_name.clone())
     .param("account_name", bank.account_name.clone())
     .param("account_number", bank.account_number.clone())
@@ -193,6 +196,7 @@ pub async fn find_active_manual_for_lead(
                 p.receipt_ref AS receipt_ref, p.manual_reference AS manual_reference, \
                 p.amount_submitted AS amount_submitted, p.amount_verified AS amount_verified, \
                 p.short_amount AS short_amount, p.overpaid_amount AS overpaid_amount, \
+                p.manual_bank_account_id AS manual_bank_account_id, \
                 p.bank_name AS bank_name, p.bank_account_name AS bank_account_name, \
                 p.bank_account_number AS bank_account_number, p.review_note AS review_note, \
                 p.rejection_reason AS rejection_reason, p.reviewed_by AS reviewed_by, \
@@ -240,6 +244,7 @@ async fn find_by(
                 p.receipt_ref AS receipt_ref, p.manual_reference AS manual_reference, \
                 p.amount_submitted AS amount_submitted, p.amount_verified AS amount_verified, \
                 p.short_amount AS short_amount, p.overpaid_amount AS overpaid_amount, \
+                p.manual_bank_account_id AS manual_bank_account_id, \
                 p.bank_name AS bank_name, p.bank_account_name AS bank_account_name, \
                 p.bank_account_number AS bank_account_number, p.review_note AS review_note, \
                 p.rejection_reason AS rejection_reason, p.reviewed_by AS reviewed_by, \
@@ -278,6 +283,7 @@ fn payment_from_row(row: &Row) -> Payment {
         amount_verified: row.get("amount_verified"),
         short_amount: row.get("short_amount"),
         overpaid_amount: row.get("overpaid_amount"),
+        manual_bank_account_id: row.get("manual_bank_account_id"),
         bank_name: row.get("bank_name"),
         bank_account_name: row.get("bank_account_name"),
         bank_account_number: row.get("bank_account_number"),

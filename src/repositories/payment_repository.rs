@@ -178,6 +178,36 @@ pub async fn create_manual_pending(
     Ok(())
 }
 
+pub async fn update_manual_bank_details(
+    graph: &Graph,
+    payment_id: &str,
+    bank: &ManualBankDetails,
+) -> Result<(), neo4rs::Error> {
+    let q = Query::new(
+        "MATCH (p:Payment {payment_id:$payment_id}) \
+         WHERE p.payment_method = 'manual_transfer' \
+           AND coalesce(p.status, '') IN ['awaiting_proof', 'underpaid', 'proof_rejected'] \
+         SET p.manual_bank_account_id = $manual_bank_account_id, \
+             p.bank_name = $bank_name, \
+             p.bank_account_name = $account_name, \
+             p.bank_account_number = $account_number, \
+             p.manual_instructions = $instructions, \
+             p.updated_at = datetime() \
+         RETURN p"
+            .to_string(),
+    )
+    .param("payment_id", payment_id.to_string())
+    .param("manual_bank_account_id", bank.bank_account_id.clone())
+    .param("bank_name", bank.bank_name.clone())
+    .param("account_name", bank.account_name.clone())
+    .param("account_number", bank.account_number.clone())
+    .param("instructions", bank.instructions.clone());
+
+    let mut result = graph.execute(q).await?;
+    let _ = result.next().await?;
+    Ok(())
+}
+
 pub async fn find_active_manual_for_lead(
     graph: &Graph,
     lead_id: &str,

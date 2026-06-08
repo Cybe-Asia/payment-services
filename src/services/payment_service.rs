@@ -227,6 +227,31 @@ pub async fn create_manual_payment(
             .await
             .map_err(|e| format!("manual payment lookup failed: {e}"))?
     {
+        if let Some(selected_id) = manual_bank_account_id {
+            if can_update_manual_destination(&existing) {
+                let bank = resolve_manual_bank_details(&settings, Some(selected_id))?;
+                if should_update_manual_destination(&existing, &bank) {
+                    payment_repository::update_manual_bank_details(
+                        &ctx.graph,
+                        &existing.payment_id,
+                        &bank,
+                    )
+                    .await
+                    .map_err(|e| format!("manual payment bank update failed: {e}"))?;
+
+                    let updated = payment_repository::find_by_id(&ctx.graph, &existing.payment_id)
+                        .await
+                        .map_err(|e| format!("manual payment fetch failed: {e}"))?
+                        .ok_or_else(|| "manual payment updated but not found".to_string())?;
+
+                    return Ok(ManualPaymentOutcome {
+                        payment: updated,
+                        settings,
+                    });
+                }
+            }
+        }
+
         return Ok(ManualPaymentOutcome {
             payment: existing,
             settings,
@@ -438,6 +463,12 @@ fn resolve_manual_bank_details(
     } else if let Some(account) = enabled_accounts.first().copied() {
         account
     } else {
+        if settings.bank_name.trim().is_empty()
+            && settings.bank_account_name.trim().is_empty()
+            && settings.bank_account_number.trim().is_empty()
+        {
+            return Err("manual transfer destination bank account is not configured".to_string());
+        }
         return Ok(ManualBankDetails {
             bank_account_id: String::new(),
             bank_name: settings.bank_name.clone(),
@@ -458,6 +489,39 @@ fn resolve_manual_bank_details(
             account.instructions.clone()
         },
     })
+}
+
+fn can_update_manual_destination(payment: &Payment) -> bool {
+    matches!(
+        payment.status.as_str(),
+        "awaiting_proof" | "underpaid" | "proof_rejected"
+    )
+}
+
+fn should_update_manual_destination(payment: &Payment, bank: &ManualBankDetails) -> bool {
+    payment
+        .manual_bank_account_id
+        .as_deref()
+        .unwrap_or_default()
+        != bank.bank_account_id
+        || payment
+            .bank_name
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        || payment
+            .bank_account_name
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        || payment
+            .bank_account_number
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
 }
 
 pub async fn record_manual_proof(

@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde::Deserialize;
@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::dto::update_fee_request::UpdateFeeRequest;
 use crate::repositories::{fee_structure_repository, school_repository};
+use crate::utils::auth;
 use crate::utils::response::ApiResponse;
 use crate::AppState;
 
@@ -32,17 +33,30 @@ pub async fn get_fee_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    let school_id = match school_repository::find_school_id_by_code(&graph, &state.tenant_id, &school_code).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return fail(StatusCode::NOT_FOUND, "School not found"),
-        Err(e) => {
-            error!("school lookup: {e}");
-            return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
-        }
-    };
-    match fee_structure_repository::find_active(&graph, &state.tenant_id, &school_id, &q.payment_type).await {
+    let school_id =
+        match school_repository::find_school_id_by_code(&graph, &state.tenant_id, &school_code)
+            .await
+        {
+            Ok(Some(id)) => id,
+            Ok(None) => return fail(StatusCode::NOT_FOUND, "School not found"),
+            Err(e) => {
+                error!("school lookup: {e}");
+                return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+            }
+        };
+    match fee_structure_repository::find_active(
+        &graph,
+        &state.tenant_id,
+        &school_id,
+        &q.payment_type,
+    )
+    .await
+    {
         Ok(Some(fs)) => ok(fs),
-        Ok(None) => fail(StatusCode::NOT_FOUND, "No active fee structure for this school and payment type"),
+        Ok(None) => fail(
+            StatusCode::NOT_FOUND,
+            "No active fee structure for this school and payment type",
+        ),
         Err(e) => {
             error!("fee lookup: {e}");
             fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
@@ -54,12 +68,22 @@ pub async fn get_fee_handler(
 /// active FeeStructure version, supersedes the previous one (audit trail).
 pub async fn update_fee_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<UpdateFeeRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    let school_id = match school_repository::find_school_id_by_code(&graph, &state.tenant_id, &payload.school_code).await {
+    if let Err((status, msg)) = auth::require_admin(&graph, &headers, &state.jwt_secret).await {
+        return fail(status, &msg);
+    }
+    let school_id = match school_repository::find_school_id_by_code(
+        &graph,
+        &state.tenant_id,
+        &payload.school_code,
+    )
+    .await
+    {
         Ok(Some(id)) => id,
         Ok(None) => return fail(StatusCode::NOT_FOUND, "School not found"),
         Err(e) => {
@@ -67,7 +91,12 @@ pub async fn update_fee_handler(
             return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
         }
     };
-    let new_id = format!("FEE-{}-{}-{}", payload.school_code, payload.payment_type.to_uppercase(), Uuid::new_v4());
+    let new_id = format!(
+        "FEE-{}-{}-{}",
+        payload.school_code,
+        payload.payment_type.to_uppercase(),
+        Uuid::new_v4()
+    );
     match fee_structure_repository::supersede_amount(
         &graph,
         &state.tenant_id,

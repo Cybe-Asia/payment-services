@@ -58,6 +58,8 @@ pub struct PaymentContext<'a> {
     pub settings_seed: PaymentSettingsSeed,
 }
 
+const STATIC_QRIS_ACCOUNT_ID: &str = "__qris";
+
 pub async fn create_invoice(
     ctx: PaymentContext<'_>,
     admission_id: &str,
@@ -214,8 +216,8 @@ pub async fn create_manual_payment(
     manual_bank_account_id: Option<&str>,
 ) -> Result<ManualPaymentOutcome, String> {
     let settings = get_payment_settings(&ctx.graph, &ctx.settings_seed).await?;
-    if !settings.manual_transfer_enabled {
-        return Err("manual transfer payment method is disabled".to_string());
+    if !settings.manual_transfer_enabled && !settings.qris_enabled {
+        return Err("proof-based payment methods are disabled".to_string());
     }
 
     let lead = fetch_lead(&ctx.graph, admission_id)
@@ -419,6 +421,14 @@ pub async fn update_payment_settings(
     let merged = UpdatePaymentSettings {
         xendit_enabled: payload.xendit_enabled,
         manual_transfer_enabled: payload.manual_transfer_enabled,
+        qris_enabled: Some(payload.qris_enabled.unwrap_or(current.qris_enabled)),
+        qris_image_url: Some(payload.qris_image_url.unwrap_or(current.qris_image_url)),
+        qris_label: Some(payload.qris_label.unwrap_or(current.qris_label)),
+        qris_instructions: Some(
+            payload
+                .qris_instructions
+                .unwrap_or(current.qris_instructions),
+        ),
         bank_name: Some(payload.bank_name.unwrap_or(current.bank_name)),
         bank_account_name: Some(
             payload
@@ -448,11 +458,19 @@ fn resolve_manual_bank_details(
     selected_id: Option<&str>,
 ) -> Result<ManualBankDetails, String> {
     let selected_id = selected_id.map(str::trim).filter(|id| !id.is_empty());
-    let enabled_accounts: Vec<&ManualBankAccount> = settings
-        .manual_bank_accounts
-        .iter()
-        .filter(|account| account.enabled)
-        .collect();
+    if selected_id == Some(STATIC_QRIS_ACCOUNT_ID) {
+        return resolve_qris_details(settings);
+    }
+
+    let enabled_accounts: Vec<&ManualBankAccount> = if settings.manual_transfer_enabled {
+        settings
+            .manual_bank_accounts
+            .iter()
+            .filter(|account| account.enabled)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let account = if let Some(selected_id) = selected_id {
         enabled_accounts
@@ -462,7 +480,7 @@ fn resolve_manual_bank_details(
             .ok_or_else(|| "selected manual bank account is not available".to_string())?
     } else if let Some(account) = enabled_accounts.first().copied() {
         account
-    } else {
+    } else if settings.manual_transfer_enabled {
         if settings.bank_name.trim().is_empty()
             && settings.bank_account_name.trim().is_empty()
             && settings.bank_account_number.trim().is_empty()
@@ -476,6 +494,10 @@ fn resolve_manual_bank_details(
             account_number: settings.bank_account_number.clone(),
             instructions: settings.instructions.clone(),
         });
+    } else if settings.qris_enabled {
+        return resolve_qris_details(settings);
+    } else {
+        return Err("proof-based payment destination is not configured".to_string());
     };
 
     Ok(ManualBankDetails {
@@ -488,6 +510,24 @@ fn resolve_manual_bank_details(
         } else {
             account.instructions.clone()
         },
+    })
+}
+
+fn resolve_qris_details(settings: &PaymentSettings) -> Result<ManualBankDetails, String> {
+    if !settings.qris_enabled || settings.qris_image_url.trim().is_empty() {
+        return Err("QRIS payment method is not configured".to_string());
+    }
+
+    Ok(ManualBankDetails {
+        bank_account_id: STATIC_QRIS_ACCOUNT_ID.to_string(),
+        bank_name: if settings.qris_label.trim().is_empty() {
+            "QRIS".to_string()
+        } else {
+            settings.qris_label.clone()
+        },
+        account_name: "Static QRIS".to_string(),
+        account_number: String::new(),
+        instructions: settings.qris_instructions.clone(),
     })
 }
 

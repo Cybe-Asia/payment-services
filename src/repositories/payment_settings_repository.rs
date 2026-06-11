@@ -23,6 +23,14 @@ pub struct PaymentSettings {
     pub xendit_enabled: bool,
     #[serde(rename = "manualTransferEnabled")]
     pub manual_transfer_enabled: bool,
+    #[serde(rename = "qrisEnabled")]
+    pub qris_enabled: bool,
+    #[serde(rename = "qrisImageUrl")]
+    pub qris_image_url: String,
+    #[serde(rename = "qrisLabel")]
+    pub qris_label: String,
+    #[serde(rename = "qrisInstructions")]
+    pub qris_instructions: String,
     #[serde(rename = "bankName")]
     pub bank_name: String,
     #[serde(rename = "bankAccountName")]
@@ -52,6 +60,10 @@ pub struct PaymentSettingsSeed {
 pub struct UpdatePaymentSettings {
     pub xendit_enabled: bool,
     pub manual_transfer_enabled: bool,
+    pub qris_enabled: Option<bool>,
+    pub qris_image_url: Option<String>,
+    pub qris_label: Option<String>,
+    pub qris_instructions: Option<String>,
     pub bank_name: Option<String>,
     pub bank_account_name: Option<String>,
     pub bank_account_number: Option<String>,
@@ -75,6 +87,10 @@ pub async fn get_or_seed(
         "MERGE (s:PaymentSettings {tenant_id:$tenant_id}) \
          ON CREATE SET s.xendit_enabled = true, \
                        s.manual_transfer_enabled = true, \
+                       s.qris_enabled = false, \
+                       s.qris_image_url = '', \
+                       s.qris_label = 'QRIS', \
+                       s.qris_instructions = '', \
                        s.bank_name = $bank_name, \
                        s.bank_account_name = $bank_account_name, \
                        s.bank_account_number = $bank_account_number, \
@@ -84,6 +100,10 @@ pub async fn get_or_seed(
          RETURN s.tenant_id AS tenant_id, \
                 coalesce(s.xendit_enabled, true) AS xendit_enabled, \
                 coalesce(s.manual_transfer_enabled, true) AS manual_transfer_enabled, \
+                coalesce(s.qris_enabled, false) AS qris_enabled, \
+                coalesce(s.qris_image_url, '') AS qris_image_url, \
+                coalesce(s.qris_label, 'QRIS') AS qris_label, \
+                coalesce(s.qris_instructions, '') AS qris_instructions, \
                 coalesce(s.bank_name, '') AS bank_name, \
                 coalesce(s.bank_account_name, '') AS bank_account_name, \
                 coalesce(s.bank_account_number, '') AS bank_account_number, \
@@ -106,6 +126,10 @@ pub async fn get_or_seed(
                 .unwrap_or_else(|| seed.tenant_id.clone()),
             row.get("xendit_enabled").unwrap_or(true),
             row.get("manual_transfer_enabled").unwrap_or(true),
+            row.get("qris_enabled").unwrap_or(false),
+            row.get("qris_image_url").unwrap_or_default(),
+            row.get("qris_label").unwrap_or_else(|| "QRIS".to_string()),
+            row.get("qris_instructions").unwrap_or_default(),
             row.get("bank_name").unwrap_or_default(),
             row.get("bank_account_name").unwrap_or_default(),
             row.get("bank_account_number").unwrap_or_default(),
@@ -119,6 +143,10 @@ pub async fn get_or_seed(
             seed.tenant_id.clone(),
             true,
             true,
+            false,
+            String::new(),
+            "QRIS".to_string(),
+            String::new(),
             seed.bank_name.clone(),
             seed.bank_account_name.clone(),
             seed.bank_account_number.clone(),
@@ -144,6 +172,10 @@ pub async fn update(
         "MERGE (s:PaymentSettings {tenant_id:$tenant_id}) \
          SET s.xendit_enabled = $xendit_enabled, \
              s.manual_transfer_enabled = $manual_transfer_enabled, \
+             s.qris_enabled = $qris_enabled, \
+             s.qris_image_url = coalesce($qris_image_url, s.qris_image_url, ''), \
+             s.qris_label = coalesce($qris_label, s.qris_label, 'QRIS'), \
+             s.qris_instructions = coalesce($qris_instructions, s.qris_instructions, ''), \
              s.bank_name = coalesce($bank_name, s.bank_name, ''), \
              s.bank_account_name = coalesce($bank_account_name, s.bank_account_name, ''), \
              s.bank_account_number = coalesce($bank_account_number, s.bank_account_number, ''), \
@@ -153,6 +185,10 @@ pub async fn update(
          RETURN s.tenant_id AS tenant_id, \
                 coalesce(s.xendit_enabled, true) AS xendit_enabled, \
                 coalesce(s.manual_transfer_enabled, true) AS manual_transfer_enabled, \
+                coalesce(s.qris_enabled, false) AS qris_enabled, \
+                coalesce(s.qris_image_url, '') AS qris_image_url, \
+                coalesce(s.qris_label, 'QRIS') AS qris_label, \
+                coalesce(s.qris_instructions, '') AS qris_instructions, \
                 coalesce(s.bank_name, '') AS bank_name, \
                 coalesce(s.bank_account_name, '') AS bank_account_name, \
                 coalesce(s.bank_account_number, '') AS bank_account_number, \
@@ -165,6 +201,16 @@ pub async fn update(
     .param("tenant_id", tenant_id.to_string())
     .param("xendit_enabled", payload.xendit_enabled)
     .param("manual_transfer_enabled", payload.manual_transfer_enabled)
+    .param("qris_enabled", payload.qris_enabled.unwrap_or(false))
+    .param("qris_image_url", payload.qris_image_url.unwrap_or_default())
+    .param(
+        "qris_label",
+        payload.qris_label.unwrap_or_else(|| "QRIS".to_string()),
+    )
+    .param(
+        "qris_instructions",
+        payload.qris_instructions.unwrap_or_default(),
+    )
     .param("bank_name", payload.bank_name.unwrap_or_default())
     .param(
         "bank_account_name",
@@ -187,6 +233,10 @@ pub async fn update(
             .unwrap_or_else(|| tenant_id.to_string()),
         row.get("xendit_enabled").unwrap_or(true),
         row.get("manual_transfer_enabled").unwrap_or(true),
+        row.get("qris_enabled").unwrap_or(false),
+        row.get("qris_image_url").unwrap_or_default(),
+        row.get("qris_label").unwrap_or_else(|| "QRIS".to_string()),
+        row.get("qris_instructions").unwrap_or_default(),
         row.get("bank_name").unwrap_or_default(),
         row.get("bank_account_name").unwrap_or_default(),
         row.get("bank_account_number").unwrap_or_default(),
@@ -203,6 +253,10 @@ impl PaymentSettings {
         tenant_id: String,
         xendit_enabled: bool,
         manual_transfer_enabled: bool,
+        qris_enabled: bool,
+        qris_image_url: String,
+        qris_label: String,
+        qris_instructions: String,
         bank_name: String,
         bank_account_name: String,
         bank_account_number: String,
@@ -227,6 +281,10 @@ impl PaymentSettings {
             tenant_id,
             xendit_enabled,
             manual_transfer_enabled,
+            qris_enabled,
+            qris_image_url,
+            qris_label,
+            qris_instructions,
             bank_name,
             bank_account_name,
             bank_account_number,
@@ -333,6 +391,10 @@ mod tests {
             "TENANT-001".to_string(),
             false,
             true,
+            false,
+            String::new(),
+            "QRIS".to_string(),
+            String::new(),
             "BCA".to_string(),
             "PT TWSI Indonesia Jaya".to_string(),
             "1234567890".to_string(),

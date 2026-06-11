@@ -157,6 +157,7 @@ pub async fn create_manual_payment_handler(
             } else if e.contains("disabled")
                 || e.contains("no students registered")
                 || e.contains("bank account")
+                || e.contains("not configured")
             {
                 StatusCode::BAD_REQUEST
             } else {

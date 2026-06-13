@@ -23,6 +23,8 @@ pub struct Config {
     pub manual_transfer_account_name: String,
     pub manual_transfer_account_number: String,
     pub manual_transfer_instructions: String,
+    pub notification_service_url: String,
+    pub frontend_url: String,
 }
 
 pub fn load() -> Config {
@@ -63,6 +65,10 @@ pub fn load() -> Config {
     let manual_transfer_account_number =
         env::var("MANUAL_TRANSFER_ACCOUNT_NUMBER").unwrap_or_default();
     let manual_transfer_instructions = env::var("MANUAL_TRANSFER_INSTRUCTIONS").unwrap_or_default();
+    let notification_service_url = env::var("NOTIFICATION_SERVICE_URL")
+        .unwrap_or_else(|_| "http://notification-service".to_string());
+    let frontend_url =
+        env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
 
     Config {
         server_port,
@@ -87,5 +93,7 @@ pub fn load() -> Config {
         manual_transfer_account_name,
         manual_transfer_account_number,
         manual_transfer_instructions,
+        notification_service_url,
+        frontend_url,
     }
 }

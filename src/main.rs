@@ -31,11 +31,14 @@ use repositories::seed::seed_fees;
 pub struct AppState {
     pub graph: Option<Arc<Graph>>,
     pub xendit: XenditClient,
+    pub http_client: reqwest::Client,
     pub tenant_id: String,
     pub xendit_webhook_token: String,
     pub default_currency: String,
     pub default_due_hours: i64,
     pub jwt_secret: String,
+    pub notification_service_url: String,
+    pub frontend_url: String,
     pub minio: Option<MinioClient>,
     pub payment_settings_seed: PaymentSettingsSeed,
 }
@@ -121,11 +124,14 @@ async fn main() {
     let state = AppState {
         graph,
         xendit,
+        http_client: reqwest::Client::new(),
         tenant_id: cfg.tenant_id.clone(),
         xendit_webhook_token: cfg.xendit_webhook_token.clone(),
         default_currency: cfg.default_fee_currency.clone(),
         default_due_hours: cfg.default_fee_due_hours,
         jwt_secret: cfg.jwt_secret.clone(),
+        notification_service_url: cfg.notification_service_url.clone(),
+        frontend_url: cfg.frontend_url.clone(),
         minio,
         payment_settings_seed,
     };

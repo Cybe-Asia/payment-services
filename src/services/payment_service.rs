@@ -42,6 +42,13 @@ pub struct PaymentReviewList {
     pub offset: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PaymentNotificationContext {
+    pub parent_name: String,
+    pub whatsapp: String,
+    pub school: String,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewManualPaymentRequest {
@@ -873,6 +880,59 @@ pub async fn fetch_payment(graph: &Graph, payment_id: &str) -> Result<Option<Pay
     payment_repository::find_by_id(graph, payment_id)
         .await
         .map_err(|e| format!("payment fetch failed: {e}"))
+}
+
+pub async fn payment_notification_context(
+    graph: &Graph,
+    payment: &Payment,
+) -> Result<Option<PaymentNotificationContext>, String> {
+    let Some(lead_id) = payment.lead_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(lead) = fetch_lead(graph, lead_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(PaymentNotificationContext {
+        parent_name: lead.parent_name,
+        whatsapp: lead.whatsapp,
+        school: lead.target_school_preference,
+    }))
+}
+
+pub async fn mark_payment_whatsapp_notification_queued(
+    graph: &Graph,
+    payment_id: &str,
+    event: &str,
+) -> Result<bool, String> {
+    let property = match event {
+        "payment_approved" => "payment_approved_whatsapp_queued_at",
+        "payment_underpaid" => "payment_underpaid_whatsapp_queued_at",
+        "payment_rejected" => "payment_rejected_whatsapp_queued_at",
+        _ => {
+            return Err(format!(
+                "unsupported payment whatsapp notification event: {event}"
+            ))
+        }
+    };
+    let now = Utc::now().to_rfc3339();
+    let cypher = format!(
+        "MATCH (p:Payment {{payment_id: $payment_id}}) \
+         WHERE p.{property} IS NULL \
+         SET p.{property} = datetime($now) \
+         RETURN true AS marked"
+    );
+    let q = Query::new(cypher)
+        .param("payment_id", payment_id.to_string())
+        .param("now", now);
+    let mut result = graph
+        .execute(q)
+        .await
+        .map_err(|e| format!("mark payment whatsapp notification: {e}"))?;
+    Ok(result
+        .next()
+        .await
+        .map_err(|e| format!("mark payment whatsapp notification row: {e}"))?
+        .is_some())
 }
 
 /// Refresh a pending payment by asking Xendit for the authoritative status.

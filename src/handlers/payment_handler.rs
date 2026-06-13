@@ -6,7 +6,7 @@ use axum::{
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -403,10 +403,15 @@ pub async fn get_payment_handler(
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
     match payment_service::fetch_payment_refreshed(&graph, &state.xendit, &payment_id).await {
-        Ok(Some(p)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(p)).unwrap()),
-        ),
+        Ok(Some(p)) => {
+            if p.status == "paid" {
+                queue_payment_status_whatsapp(&state, &graph, &p, "payment_approved").await;
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(ApiResponse::success(p)).unwrap()),
+            )
+        }
         Ok(None) => fail(StatusCode::NOT_FOUND, "Payment not found"),
         Err(e) => {
             error!("fetch_payment failed: {e}");
@@ -575,11 +580,15 @@ pub async fn admin_review_manual_payment_handler(
         Ok(admin) => admin,
         Err((status, msg)) => return fail(status, &msg),
     };
+    let decision = payload.decision.to_lowercase();
     match payment_service::review_manual_payment(&graph, &payment_id, payload, &admin.email).await {
-        Ok(payment) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(payment)).unwrap()),
-        ),
+        Ok(payment) => {
+            queue_payment_review_whatsapp(&state, &graph, &payment, &decision).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(ApiResponse::success(payment)).unwrap()),
+            )
+        }
         Err(e) => {
             error!("admin_review_manual_payment failed: {e}");
             let status = if e.contains("not found") {
@@ -697,10 +706,20 @@ pub async fn xendit_webhook_handler(
     )
     .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "responseCode": 200, "responseMessage": "ok" })),
-        ),
+        Ok(()) => {
+            if let Ok(Some(payment)) =
+                payment_service::fetch_payment(&graph, &payload.external_id).await
+            {
+                if payment.status == "paid" {
+                    queue_payment_status_whatsapp(&state, &graph, &payment, "payment_approved")
+                        .await;
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "responseCode": 200, "responseMessage": "ok" })),
+            )
+        }
         Err(e) => {
             error!("webhook handling failed: {e}");
             fail(StatusCode::INTERNAL_SERVER_ERROR, &e)
@@ -713,4 +732,224 @@ fn fail(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) 
     let mut value = serde_json::to_value(body).unwrap();
     value["responseCode"] = serde_json::json!(status.as_u16());
     (status, Json(value))
+}
+
+async fn queue_payment_review_whatsapp(
+    state: &AppState,
+    graph: &std::sync::Arc<neo4rs::Graph>,
+    payment: &crate::models::payment::Payment,
+    decision: &str,
+) {
+    let event = match decision {
+        "approve" => "payment_approved",
+        "underpaid" => "payment_underpaid",
+        "reject" => "payment_rejected",
+        _ => return,
+    };
+    queue_payment_status_whatsapp(state, graph, payment, event).await;
+}
+
+async fn queue_payment_status_whatsapp(
+    state: &AppState,
+    graph: &std::sync::Arc<neo4rs::Graph>,
+    payment: &crate::models::payment::Payment,
+    event: &str,
+) {
+    let context = match payment_service::payment_notification_context(graph, payment).await {
+        Ok(Some(context)) => context,
+        Ok(None) => {
+            warn!(
+                payment_id=%payment.payment_id,
+                "Skipping payment WhatsApp notification because context was not found"
+            );
+            return;
+        }
+        Err(err) => {
+            warn!(
+                payment_id=%payment.payment_id,
+                error=%err,
+                "Failed to load payment WhatsApp notification context"
+            );
+            return;
+        }
+    };
+    if context.whatsapp.trim().is_empty() {
+        warn!(
+            payment_id=%payment.payment_id,
+            "Skipping payment WhatsApp notification because parent phone is empty"
+        );
+        return;
+    }
+
+    match payment_service::mark_payment_whatsapp_notification_queued(
+        graph,
+        &payment.payment_id,
+        event,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            info!(
+                payment_id=%payment.payment_id,
+                event=%event,
+                "Payment WhatsApp notification already queued"
+            );
+            return;
+        }
+        Err(err) => {
+            warn!(
+                payment_id=%payment.payment_id,
+                event=%event,
+                error=%err,
+                "Failed to mark payment WhatsApp notification"
+            );
+            return;
+        }
+    }
+
+    let body = payment_whatsapp_body(payment, event, &context, &state.frontend_url);
+    dispatch_whatsapp_notification(state, context.whatsapp, event, body);
+}
+
+fn payment_whatsapp_body(
+    payment: &crate::models::payment::Payment,
+    event: &str,
+    context: &payment_service::PaymentNotificationContext,
+    frontend_url: &str,
+) -> String {
+    let parent_name = display_or_parent(&context.parent_name);
+    let fee_label = payment_type_label(&payment.payment_type);
+    let amount = format_idr(payment.amount);
+    let portal_url = parent_dashboard_url(frontend_url);
+    let school = school_label(&context.school);
+
+    match event {
+        "payment_approved" => {
+            let next_step = if payment.payment_type == "application_fee" {
+                "Silakan login ke portal untuk booking jadwal tes masuk."
+            } else {
+                "Silakan login ke portal untuk melanjutkan proses pendaftaran."
+            };
+            format!(
+                "Halo Bapak/Ibu {},\n\nPembayaran {} {} sebesar {} sudah disetujui/diterima.\n\n{}\n\n{}",
+                parent_name, fee_label, school, amount, next_step, portal_url
+            )
+        }
+        "payment_underpaid" => {
+            let short_amount = payment
+                .short_amount
+                .unwrap_or_else(|| (payment.amount - payment.amount_verified.unwrap_or(0)).max(0));
+            format!(
+                "Halo Bapak/Ibu {},\n\nPembayaran {} {} sudah dicek, namun masih kurang {}. Mohon transfer kekurangan lalu unggah bukti pembayaran baru di portal.\n\n{}",
+                parent_name,
+                fee_label,
+                school,
+                format_idr(short_amount),
+                portal_url
+            )
+        }
+        "payment_rejected" => {
+            let note = payment
+                .rejection_reason
+                .as_deref()
+                .or(payment.review_note.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("-");
+            format!(
+                "Halo Bapak/Ibu {},\n\nBukti pembayaran {} {} belum dapat diverifikasi. Mohon unggah ulang bukti pembayaran yang benar/jelas di portal.\n\nCatatan: {}\n\n{}",
+                parent_name, fee_label, school, note, portal_url
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+fn dispatch_whatsapp_notification(state: &AppState, to: String, event: &str, body: String) {
+    if body.trim().is_empty() {
+        return;
+    }
+    let client = state.http_client.clone();
+    let url = format!(
+        "{}/api/whatsapp/v1/send",
+        state.notification_service_url.trim_end_matches('/')
+    );
+    let event = event.to_string();
+    tokio::spawn(async move {
+        let response = client
+            .post(url)
+            .json(&serde_json::json!({
+                "to": to,
+                "body": body,
+                "event": event,
+            }))
+            .send()
+            .await;
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                info!("Queued WhatsApp payment notification");
+            }
+            Ok(resp) => {
+                warn!(
+                    "Notification service rejected WhatsApp payment notification with {}",
+                    resp.status()
+                );
+            }
+            Err(err) => warn!("Failed to queue WhatsApp payment notification: {}", err),
+        }
+    });
+}
+
+fn parent_dashboard_url(frontend_url: &str) -> String {
+    format!("{}/parent/dashboard", frontend_url.trim_end_matches('/'))
+}
+
+fn display_or_parent(value: &str) -> String {
+    if value.trim().is_empty() {
+        "Orang Tua".to_string()
+    } else {
+        value.trim().to_string()
+    }
+}
+
+fn format_idr(value: i64) -> String {
+    let mut digits = value.abs().to_string();
+    let mut groups = Vec::new();
+    while digits.len() > 3 {
+        let tail = digits.split_off(digits.len() - 3);
+        groups.push(tail);
+    }
+    groups.push(digits);
+    let formatted = groups.into_iter().rev().collect::<Vec<_>>().join(".");
+    if value < 0 {
+        format!("-Rp {}", formatted)
+    } else {
+        format!("Rp {}", formatted)
+    }
+}
+
+fn payment_type_label(payment_type: &str) -> &str {
+    match payment_type {
+        "application_fee" => "biaya pendaftaran",
+        "enrolment_fee" => "biaya enrolment",
+        "capital_levy" => "capital levy",
+        "term_fee" => "term fee",
+        _ => "pembayaran",
+    }
+}
+
+fn school_label(school: &str) -> String {
+    let label = match school {
+        "SCH-IIHS" | "IIHS" => "IIHS",
+        "SCH-IISS" | "IISS" => "IISS",
+        "SCH-IIBS" | "IIBS" => "IIBS",
+        value if !value.trim().is_empty() => value,
+        _ => "",
+    };
+    if label.is_empty() {
+        "".to_string()
+    } else {
+        format!("({})", label)
+    }
 }

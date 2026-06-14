@@ -45,9 +45,20 @@ pub struct PaymentReviewList {
 #[derive(Debug, Clone)]
 pub struct PaymentNotificationContext {
     pub parent_name: String,
+    pub email: String,
     pub whatsapp: String,
     pub school: String,
 }
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationChannelPreference {
+    event: String,
+    channels: Vec<String>,
+}
+
+pub const NOTIFICATION_CHANNEL_EMAIL: &str = "email";
+pub const NOTIFICATION_CHANNEL_WHATSAPP: &str = "whatsapp";
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -894,23 +905,67 @@ pub async fn payment_notification_context(
     };
     Ok(Some(PaymentNotificationContext {
         parent_name: lead.parent_name,
+        email: lead.email,
         whatsapp: lead.whatsapp,
         school: lead.target_school_preference,
     }))
 }
 
-pub async fn mark_payment_whatsapp_notification_queued(
+pub async fn resolve_notification_channels(
+    graph: &Graph,
+    school_code: &str,
+    event: &str,
+) -> Result<Vec<String>, String> {
+    let key = school_code
+        .trim()
+        .trim_start_matches("SCH-")
+        .trim_start_matches("sch-")
+        .to_uppercase();
+    if key.is_empty() {
+        return Ok(default_notification_channels_for_event(event));
+    }
+    let q = Query::new(
+        "MATCH (s:AdmissionsSettings) \
+         WHERE toUpper(s.school_id) = $key \
+            OR toUpper(s.school_id) = 'SCH-' + $key \
+         RETURN s.notification_channels_json AS channelsJson \
+         ORDER BY s.academic_year DESC, s.updated_at DESC \
+         LIMIT 1"
+            .to_string(),
+    )
+    .param("key", key);
+    let mut result = graph
+        .execute(q)
+        .await
+        .map_err(|e| format!("notification channels fetch: {e}"))?;
+    if let Some(row) = result
+        .next()
+        .await
+        .map_err(|e| format!("notification channels row: {e}"))?
+    {
+        let channels_json = row.get::<String>("channelsJson").unwrap_or_default();
+        let preferences = parse_notification_channels(&channels_json);
+        return Ok(channels_for_event(&preferences, event));
+    }
+    Ok(default_notification_channels_for_event(event))
+}
+
+pub async fn mark_payment_notification_queued(
     graph: &Graph,
     payment_id: &str,
     event: &str,
+    channel: &str,
 ) -> Result<bool, String> {
-    let property = match event {
-        "payment_approved" => "payment_approved_whatsapp_queued_at",
-        "payment_underpaid" => "payment_underpaid_whatsapp_queued_at",
-        "payment_rejected" => "payment_rejected_whatsapp_queued_at",
+    let property = match (event, channel) {
+        ("payment_approved", "email") => "payment_approved_email_queued_at",
+        ("payment_approved", "whatsapp") => "payment_approved_whatsapp_queued_at",
+        ("payment_underpaid", "email") => "payment_underpaid_email_queued_at",
+        ("payment_underpaid", "whatsapp") => "payment_underpaid_whatsapp_queued_at",
+        ("payment_rejected", "email") => "payment_rejected_email_queued_at",
+        ("payment_rejected", "whatsapp") => "payment_rejected_whatsapp_queued_at",
         _ => {
             return Err(format!(
-                "unsupported payment whatsapp notification event: {event}"
+                "unsupported payment notification event/channel: {event}/{channel}"
             ))
         }
     };
@@ -927,12 +982,47 @@ pub async fn mark_payment_whatsapp_notification_queued(
     let mut result = graph
         .execute(q)
         .await
-        .map_err(|e| format!("mark payment whatsapp notification: {e}"))?;
+        .map_err(|e| format!("mark payment notification: {e}"))?;
     Ok(result
         .next()
         .await
-        .map_err(|e| format!("mark payment whatsapp notification row: {e}"))?
+        .map_err(|e| format!("mark payment notification row: {e}"))?
         .is_some())
+}
+
+fn default_notification_channels_for_event(_event: &str) -> Vec<String> {
+    vec![NOTIFICATION_CHANNEL_EMAIL.to_string()]
+}
+
+fn parse_notification_channels(value: &str) -> Vec<NotificationChannelPreference> {
+    serde_json::from_str::<Vec<NotificationChannelPreference>>(value).unwrap_or_default()
+}
+
+fn channels_for_event(preferences: &[NotificationChannelPreference], event: &str) -> Vec<String> {
+    let mut channels = preferences
+        .iter()
+        .find(|preference| preference.event == event)
+        .map(|preference| normalize_notification_channels(&preference.channels))
+        .unwrap_or_default();
+    if channels.is_empty() {
+        channels.push(NOTIFICATION_CHANNEL_EMAIL.to_string());
+    }
+    channels
+}
+
+fn normalize_notification_channels(channels: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for channel in channels {
+        let canonical = match channel.trim().to_ascii_lowercase().as_str() {
+            "email" | "mail" => NOTIFICATION_CHANNEL_EMAIL,
+            "whatsapp" | "wa" | "phone" => NOTIFICATION_CHANNEL_WHATSAPP,
+            _ => continue,
+        };
+        if !out.iter().any(|value| value == canonical) {
+            out.push(canonical.to_string());
+        }
+    }
+    out
 }
 
 /// Refresh a pending payment by asking Xendit for the authoritative status.

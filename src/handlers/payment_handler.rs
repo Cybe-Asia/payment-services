@@ -405,7 +405,7 @@ pub async fn get_payment_handler(
     match payment_service::fetch_payment_refreshed(&graph, &state.xendit, &payment_id).await {
         Ok(Some(p)) => {
             if p.status == "paid" {
-                queue_payment_status_whatsapp(&state, &graph, &p, "payment_approved").await;
+                queue_payment_status_notification(&state, &graph, &p, "payment_approved").await;
             }
             (
                 StatusCode::OK,
@@ -583,7 +583,7 @@ pub async fn admin_review_manual_payment_handler(
     let decision = payload.decision.to_lowercase();
     match payment_service::review_manual_payment(&graph, &payment_id, payload, &admin.email).await {
         Ok(payment) => {
-            queue_payment_review_whatsapp(&state, &graph, &payment, &decision).await;
+            queue_payment_review_notification(&state, &graph, &payment, &decision).await;
             (
                 StatusCode::OK,
                 Json(serde_json::to_value(ApiResponse::success(payment)).unwrap()),
@@ -711,7 +711,7 @@ pub async fn xendit_webhook_handler(
                 payment_service::fetch_payment(&graph, &payload.external_id).await
             {
                 if payment.status == "paid" {
-                    queue_payment_status_whatsapp(&state, &graph, &payment, "payment_approved")
+                    queue_payment_status_notification(&state, &graph, &payment, "payment_approved")
                         .await;
                 }
             }
@@ -734,7 +734,7 @@ fn fail(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) 
     (status, Json(value))
 }
 
-async fn queue_payment_review_whatsapp(
+async fn queue_payment_review_notification(
     state: &AppState,
     graph: &std::sync::Arc<neo4rs::Graph>,
     payment: &crate::models::payment::Payment,
@@ -746,10 +746,10 @@ async fn queue_payment_review_whatsapp(
         "reject" => "payment_rejected",
         _ => return,
     };
-    queue_payment_status_whatsapp(state, graph, payment, event).await;
+    queue_payment_status_notification(state, graph, payment, event).await;
 }
 
-async fn queue_payment_status_whatsapp(
+async fn queue_payment_status_notification(
     state: &AppState,
     graph: &std::sync::Arc<neo4rs::Graph>,
     payment: &crate::models::payment::Payment,
@@ -760,7 +760,7 @@ async fn queue_payment_status_whatsapp(
         Ok(None) => {
             warn!(
                 payment_id=%payment.payment_id,
-                "Skipping payment WhatsApp notification because context was not found"
+                "Skipping payment notification because context was not found"
             );
             return;
         }
@@ -768,51 +768,93 @@ async fn queue_payment_status_whatsapp(
             warn!(
                 payment_id=%payment.payment_id,
                 error=%err,
-                "Failed to load payment WhatsApp notification context"
+                "Failed to load payment notification context"
             );
             return;
         }
     };
-    if context.whatsapp.trim().is_empty() {
-        warn!(
-            payment_id=%payment.payment_id,
-            "Skipping payment WhatsApp notification because parent phone is empty"
-        );
-        return;
-    }
 
-    match payment_service::mark_payment_whatsapp_notification_queued(
-        graph,
-        &payment.payment_id,
-        event,
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            info!(
-                payment_id=%payment.payment_id,
-                event=%event,
-                "Payment WhatsApp notification already queued"
-            );
-            return;
-        }
-        Err(err) => {
+    let channels =
+        match payment_service::resolve_notification_channels(graph, &context.school, event).await {
+            Ok(channels) if !channels.is_empty() => channels,
+            Ok(_) => vec![payment_service::NOTIFICATION_CHANNEL_EMAIL.to_string()],
+            Err(err) => {
+                warn!(
+                    payment_id=%payment.payment_id,
+                    event=%event,
+                    error=%err,
+                    "Failed to resolve payment notification channels; using email"
+                );
+                vec![payment_service::NOTIFICATION_CHANNEL_EMAIL.to_string()]
+            }
+        };
+
+    for channel in channels {
+        if channel == payment_service::NOTIFICATION_CHANNEL_EMAIL && context.email.trim().is_empty()
+        {
             warn!(
                 payment_id=%payment.payment_id,
                 event=%event,
-                error=%err,
-                "Failed to mark payment WhatsApp notification"
+                "Skipping payment email notification because parent email is empty"
             );
-            return;
+            continue;
+        }
+        if channel == payment_service::NOTIFICATION_CHANNEL_WHATSAPP
+            && context.whatsapp.trim().is_empty()
+        {
+            warn!(
+                payment_id=%payment.payment_id,
+                event=%event,
+                "Skipping payment WhatsApp notification because parent phone is empty"
+            );
+            continue;
+        }
+
+        match payment_service::mark_payment_notification_queued(
+            graph,
+            &payment.payment_id,
+            event,
+            &channel,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(
+                    payment_id=%payment.payment_id,
+                    event=%event,
+                    channel=%channel,
+                    "Payment notification already queued"
+                );
+                continue;
+            }
+            Err(err) => {
+                warn!(
+                    payment_id=%payment.payment_id,
+                    event=%event,
+                    channel=%channel,
+                    error=%err,
+                    "Failed to mark payment notification"
+                );
+                continue;
+            }
+        }
+
+        let body = payment_notification_body(payment, event, &context, &state.frontend_url);
+        if channel == payment_service::NOTIFICATION_CHANNEL_EMAIL {
+            dispatch_email_notification(
+                state,
+                context.email.clone(),
+                payment_email_subject(payment, event, &context),
+                body,
+            );
+        } else if channel == payment_service::NOTIFICATION_CHANNEL_WHATSAPP {
+            dispatch_whatsapp_notification(state, context.whatsapp.clone(), event, body);
         }
     }
-
-    let body = payment_whatsapp_body(payment, event, &context, &state.frontend_url);
-    dispatch_whatsapp_notification(state, context.whatsapp, event, body);
 }
 
-fn payment_whatsapp_body(
+fn payment_notification_body(
     payment: &crate::models::payment::Payment,
     event: &str,
     context: &payment_service::PaymentNotificationContext,
@@ -866,8 +908,59 @@ fn payment_whatsapp_body(
     }
 }
 
+fn payment_email_subject(
+    payment: &crate::models::payment::Payment,
+    event: &str,
+    context: &payment_service::PaymentNotificationContext,
+) -> String {
+    let fee_label = payment_type_label(&payment.payment_type);
+    let school = school_label(&context.school);
+    match event {
+        "payment_approved" => format!("Pembayaran {} {} diterima", fee_label, school),
+        "payment_underpaid" => format!("Pembayaran {} {} masih kurang", fee_label, school),
+        "payment_rejected" => format!("Bukti pembayaran {} {} perlu diperbaiki", fee_label, school),
+        _ => "Pembaruan pembayaran Digital School".to_string(),
+    }
+}
+
+fn dispatch_email_notification(state: &AppState, email: String, subject: String, body: String) {
+    if email.trim().is_empty() || body.trim().is_empty() {
+        return;
+    }
+    let html = body_to_html(&body);
+    let client = state.http_client.clone();
+    let url = format!(
+        "{}/api/email/v1/send",
+        state.notification_service_url.trim_end_matches('/')
+    );
+    tokio::spawn(async move {
+        let response = client
+            .post(url)
+            .json(&serde_json::json!({
+                "email": email,
+                "subject": subject,
+                "body": body,
+                "html": html,
+            }))
+            .send()
+            .await;
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                info!("Queued email payment notification");
+            }
+            Ok(resp) => {
+                warn!(
+                    "Notification service rejected email payment notification with {}",
+                    resp.status()
+                );
+            }
+            Err(err) => warn!("Failed to queue email payment notification: {}", err),
+        }
+    });
+}
+
 fn dispatch_whatsapp_notification(state: &AppState, to: String, event: &str, body: String) {
-    if body.trim().is_empty() {
+    if to.trim().is_empty() || body.trim().is_empty() {
         return;
     }
     let client = state.http_client.clone();
@@ -899,6 +992,31 @@ fn dispatch_whatsapp_notification(state: &AppState, to: String, event: &str, bod
             Err(err) => warn!("Failed to queue WhatsApp payment notification: {}", err),
         }
     });
+}
+
+fn body_to_html(body: &str) -> String {
+    let mut html = String::from("<div>");
+    for paragraph in body.split("\n\n").filter(|value| !value.trim().is_empty()) {
+        html.push_str("<p>");
+        for (idx, line) in paragraph.lines().enumerate() {
+            if idx > 0 {
+                html.push_str("<br />");
+            }
+            html.push_str(&escape_html(line.trim()));
+        }
+        html.push_str("</p>");
+    }
+    html.push_str("</div>");
+    html
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn parent_dashboard_url(frontend_url: &str) -> String {

@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use bytes::BytesMut;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
@@ -510,6 +511,7 @@ pub async fn admin_update_payment_settings_handler(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReviewQueueQuery {
     #[serde(default = "default_review_status")]
     pub status: String,
@@ -517,6 +519,10 @@ pub struct ReviewQueueQuery {
     pub school: String,
     #[serde(default)]
     pub search: String,
+    #[serde(default)]
+    pub date_from: String,
+    #[serde(default)]
+    pub date_to: String,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -545,11 +551,28 @@ pub async fn admin_payment_reviews_handler(
 
     let limit = q.limit.clamp(1, 200);
     let offset = q.offset.max(0);
-    match payment_service::list_manual_review_rows(
-        &graph, &q.status, &q.school, &q.search, limit, offset,
-    )
-    .await
-    {
+    let date_from = match normalize_optional_rfc3339(&q.date_from) {
+        Ok(v) => v,
+        Err(msg) => return fail(StatusCode::BAD_REQUEST, msg),
+    };
+    let date_to = match normalize_optional_rfc3339(&q.date_to) {
+        Ok(v) => v,
+        Err(msg) => return fail(StatusCode::BAD_REQUEST, msg),
+    };
+    if date_from.is_none() ^ date_to.is_none() {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "dateFrom and dateTo must be provided together",
+        );
+    }
+    let filters = payment_service::PaymentReviewFilters {
+        status: &q.status,
+        school: &q.school,
+        search: &q.search,
+        date_from: date_from.as_deref().unwrap_or(""),
+        date_to: date_to.as_deref().unwrap_or(""),
+    };
+    match payment_service::list_manual_review_rows(&graph, filters, limit, offset).await {
         Ok(payload) => (
             StatusCode::OK,
             Json(serde_json::to_value(ApiResponse::success(payload)).unwrap()),
@@ -559,6 +582,16 @@ pub async fn admin_payment_reviews_handler(
             fail(StatusCode::INTERNAL_SERVER_ERROR, &e)
         }
     }
+}
+
+fn normalize_optional_rfc3339(raw: &str) -> Result<Option<String>, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    DateTime::parse_from_rfc3339(trimmed)
+        .map(|dt| Some(dt.with_timezone(&Utc).to_rfc3339()))
+        .map_err(|_| "dateFrom/dateTo must be RFC3339 datetimes")
 }
 
 pub async fn admin_payment_review_detail_handler(

@@ -59,6 +59,16 @@ pub struct PaymentReviewRow {
     pub latest_proof_amount: Option<i64>,
     #[serde(rename = "latestProofUploadedAt")]
     pub latest_proof_uploaded_at: Option<String>,
+    #[serde(rename = "latestProofPaidAt", skip_serializing_if = "Option::is_none")]
+    pub latest_proof_paid_at: Option<String>,
+    #[serde(rename = "createdAt", skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(rename = "paidAt", skip_serializing_if = "Option::is_none")]
+    pub paid_at: Option<String>,
+    #[serde(rename = "reviewedAt", skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<String>,
+    #[serde(rename = "activityAt", skip_serializing_if = "Option::is_none")]
+    pub activity_at: Option<String>,
     #[serde(rename = "ageDays")]
     pub age_days: Option<i64>,
 }
@@ -79,6 +89,15 @@ pub struct PaymentReviewDetail {
     pub payment: Payment,
     pub lead: PaymentReviewLead,
     pub proofs: Vec<PaymentProof>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PaymentReviewFilters<'a> {
+    pub status: &'a str,
+    pub school: &'a str,
+    pub search: &'a str,
+    pub date_from: &'a str,
+    pub date_to: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -550,9 +569,7 @@ pub async fn find_payment_proof_object(
 
 pub async fn list_review_rows(
     graph: &Graph,
-    status: &str,
-    school: &str,
-    search: &str,
+    filters: PaymentReviewFilters<'_>,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<PaymentReviewRow>, neo4rs::Error> {
@@ -570,6 +587,9 @@ pub async fn list_review_rows(
          OPTIONAL MATCH (p)-[:HAS_PROOF]->(proof:PaymentProof) \
          WITH l, p, proof ORDER BY proof.uploaded_at DESC \
          WITH l, p, head(collect(proof)) AS proof \
+         WITH l, p, proof, coalesce(p.paid_at, proof.paid_at, proof.uploaded_at, p.created_at) AS activity_at \
+         WHERE ($date_from = '' OR activity_at >= datetime($date_from)) \
+           AND ($date_to = '' OR activity_at <= datetime($date_to)) \
          RETURN p.payment_id AS payment_id, l.lead_id AS lead_id, \
                 l.parent_name AS parent_name, l.email AS parent_email, \
                 l.target_school_preference AS school, p.payment_type AS payment_type, \
@@ -578,13 +598,18 @@ pub async fn list_review_rows(
                 p.short_amount AS short_amount, proof.payment_proof_id AS latest_proof_id, \
                 proof.file_name AS latest_proof_file_name, proof.amount_submitted AS latest_proof_amount, \
                 toString(proof.uploaded_at) AS latest_proof_uploaded_at, \
-                duration.inDays(coalesce(proof.uploaded_at, p.created_at), datetime()).days AS age_days \
-         ORDER BY coalesce(proof.uploaded_at, p.created_at) ASC \
+                toString(proof.paid_at) AS latest_proof_paid_at, \
+                toString(p.created_at) AS created_at, toString(p.paid_at) AS paid_at, \
+                toString(p.reviewed_at) AS reviewed_at, toString(activity_at) AS activity_at, \
+                duration.inDays(activity_at, datetime()).days AS age_days \
+         ORDER BY activity_at ASC \
          SKIP $offset LIMIT $limit".to_string(),
     )
-    .param("status", status.to_string())
-    .param("school", school.to_string())
-    .param("search", search.to_string())
+    .param("status", filters.status.to_string())
+    .param("school", filters.school.to_string())
+    .param("search", filters.search.to_string())
+    .param("date_from", filters.date_from.to_string())
+    .param("date_to", filters.date_to.to_string())
     .param("limit", limit)
     .param("offset", offset);
 
@@ -608,6 +633,11 @@ pub async fn list_review_rows(
             latest_proof_file_name: row.get("latest_proof_file_name"),
             latest_proof_amount: row.get("latest_proof_amount"),
             latest_proof_uploaded_at: row.get("latest_proof_uploaded_at"),
+            latest_proof_paid_at: row.get("latest_proof_paid_at"),
+            created_at: row.get("created_at"),
+            paid_at: row.get("paid_at"),
+            reviewed_at: row.get("reviewed_at"),
+            activity_at: row.get("activity_at"),
             age_days: row.get("age_days"),
         });
     }
@@ -616,9 +646,7 @@ pub async fn list_review_rows(
 
 pub async fn count_review_rows(
     graph: &Graph,
-    status: &str,
-    school: &str,
-    search: &str,
+    filters: PaymentReviewFilters<'_>,
 ) -> Result<i64, neo4rs::Error> {
     let q = Query::new(
         "MATCH (l:Lead)-[:MADE_PAYMENT]->(p:Payment) \
@@ -631,11 +659,19 @@ pub async fn count_review_rows(
              toLower(coalesce(l.email, '')) CONTAINS toLower($search) OR \
              toLower(p.payment_id) CONTAINS toLower($search) \
            ) \
+         OPTIONAL MATCH (p)-[:HAS_PROOF]->(proof:PaymentProof) \
+         WITH l, p, proof ORDER BY proof.uploaded_at DESC \
+         WITH l, p, head(collect(proof)) AS proof \
+         WITH l, p, proof, coalesce(p.paid_at, proof.paid_at, proof.uploaded_at, p.created_at) AS activity_at \
+         WHERE ($date_from = '' OR activity_at >= datetime($date_from)) \
+           AND ($date_to = '' OR activity_at <= datetime($date_to)) \
          RETURN count(p) AS total".to_string(),
     )
-    .param("status", status.to_string())
-    .param("school", school.to_string())
-    .param("search", search.to_string());
+    .param("status", filters.status.to_string())
+    .param("school", filters.school.to_string())
+    .param("search", filters.search.to_string())
+    .param("date_from", filters.date_from.to_string())
+    .param("date_to", filters.date_to.to_string());
     let mut result = graph.execute(q).await?;
     Ok(result
         .next()

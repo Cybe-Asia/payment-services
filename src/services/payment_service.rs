@@ -20,6 +20,8 @@ use crate::repositories::{
     promotion_repository::{self, PromotionRuleSnapshot},
 };
 
+pub use payment_repository::PaymentReviewFilters;
+
 #[derive(Debug)]
 pub struct CreateInvoiceOutcome {
     pub payment_id: String,
@@ -768,16 +770,14 @@ pub async fn record_manual_proof(
 
 pub async fn list_manual_review_rows(
     graph: &Graph,
-    status: &str,
-    school: &str,
-    search: &str,
+    filters: PaymentReviewFilters<'_>,
     limit: i64,
     offset: i64,
 ) -> Result<PaymentReviewList, String> {
-    let rows = payment_repository::list_review_rows(graph, status, school, search, limit, offset)
+    let rows = payment_repository::list_review_rows(graph, filters, limit, offset)
         .await
         .map_err(|e| format!("payment review queue failed: {e}"))?;
-    let total = payment_repository::count_review_rows(graph, status, school, search)
+    let total = payment_repository::count_review_rows(graph, filters)
         .await
         .map_err(|e| format!("payment review count failed: {e}"))?;
     Ok(PaymentReviewList {

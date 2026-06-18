@@ -12,6 +12,23 @@ pub struct Payment {
     pub payment_type: String,
     pub status: String,
     pub amount: i64,
+    #[serde(rename = "grossAmount", skip_serializing_if = "Option::is_none")]
+    pub gross_amount: Option<i64>,
+    #[serde(rename = "discountAmount", skip_serializing_if = "Option::is_none")]
+    pub discount_amount: Option<i64>,
+    #[serde(rename = "netAmount", skip_serializing_if = "Option::is_none")]
+    pub net_amount: Option<i64>,
+    #[serde(rename = "promotionCode", skip_serializing_if = "Option::is_none")]
+    pub promotion_code: Option<String>,
+    #[serde(rename = "promotionRuleId", skip_serializing_if = "Option::is_none")]
+    pub promotion_rule_id: Option<String>,
+    #[serde(
+        rename = "promotionSnapshotJson",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub promotion_snapshot_json: Option<String>,
+    #[serde(rename = "lineItemsJson", skip_serializing_if = "Option::is_none")]
+    pub line_items_json: Option<String>,
     pub currency: String,
     #[serde(rename = "paymentMethod")]
     pub payment_method: Option<String>,

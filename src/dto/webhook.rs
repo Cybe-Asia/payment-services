@@ -4,15 +4,10 @@ use serde::Deserialize;
 /// Xendit sends a larger envelope but serde ignores unknown fields.
 #[derive(Deserialize, Debug)]
 pub struct XenditInvoiceWebhook {
-    pub id: String,
     pub external_id: String,
     pub status: String,
     #[serde(default)]
     pub payment_method: Option<String>,
     #[serde(default)]
-    pub payment_channel: Option<String>,
-    #[serde(default)]
     pub payment_id: Option<String>,
-    #[serde(default)]
-    pub paid_amount: Option<i64>,
 }

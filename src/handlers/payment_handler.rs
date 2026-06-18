@@ -27,6 +27,18 @@ pub struct CreateInvoiceResponseData {
     #[serde(rename = "hostedInvoiceUrl")]
     pub hosted_invoice_url: String,
     pub amount: i64,
+    #[serde(rename = "grossAmount")]
+    pub gross_amount: i64,
+    #[serde(rename = "discountAmount")]
+    pub discount_amount: i64,
+    #[serde(rename = "netAmount")]
+    pub net_amount: i64,
+    #[serde(rename = "promotionCode", skip_serializing_if = "Option::is_none")]
+    pub promotion_code: Option<String>,
+    #[serde(rename = "promotionRuleId", skip_serializing_if = "Option::is_none")]
+    pub promotion_rule_id: Option<String>,
+    #[serde(rename = "lineItems")]
+    pub line_items: Vec<payment_service::PaymentLineItem>,
     pub currency: String,
     #[serde(rename = "expiresAt")]
     pub expires_at: String,
@@ -69,6 +81,12 @@ pub async fn create_invoice_handler(
                 payment_id: outcome.payment_id,
                 hosted_invoice_url: outcome.hosted_invoice_url,
                 amount: outcome.amount,
+                gross_amount: outcome.gross_amount,
+                discount_amount: outcome.discount_amount,
+                net_amount: outcome.net_amount,
+                promotion_code: outcome.promotion_code,
+                promotion_rule_id: outcome.promotion_rule_id,
+                line_items: outcome.line_items,
                 currency: outcome.currency,
                 expires_at: outcome.expires_at,
             };

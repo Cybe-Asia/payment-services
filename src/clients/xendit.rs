@@ -13,7 +13,12 @@ pub struct XenditClient {
 }
 
 impl XenditClient {
-    pub fn new(api_url: &str, api_key: &str, success_redirect_url: &str, failure_redirect_url: &str) -> Self {
+    pub fn new(
+        api_url: &str,
+        api_key: &str,
+        success_redirect_url: &str,
+        failure_redirect_url: &str,
+    ) -> Self {
         Self {
             http: Client::new(),
             api_url: api_url.trim_end_matches('/').to_string(),
@@ -25,7 +30,10 @@ impl XenditClient {
 
     /// Create a Xendit Invoice (hosted checkout).
     /// Docs: https://api.xendit.co/v2/invoices
-    pub async fn create_invoice(&self, req: &CreateInvoiceRequest<'_>) -> Result<CreateInvoiceResponse, String> {
+    pub async fn create_invoice(
+        &self,
+        req: &CreateInvoiceRequest<'_>,
+    ) -> Result<CreateInvoiceResponse, String> {
         if self.api_key.is_empty() {
             return Err("XENDIT_API_KEY not configured".into());
         }

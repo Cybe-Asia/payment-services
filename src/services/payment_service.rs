@@ -17,6 +17,7 @@ use crate::repositories::payment_settings_repository::{
 use crate::repositories::{
     fee_obligation_repository, fee_structure_repository, payment_repository,
     payment_settings_repository,
+    promotion_repository::{self, PromotionRuleSnapshot},
 };
 
 #[derive(Debug)]
@@ -24,6 +25,12 @@ pub struct CreateInvoiceOutcome {
     pub payment_id: String,
     pub hosted_invoice_url: String,
     pub amount: i64,
+    pub gross_amount: i64,
+    pub discount_amount: i64,
+    pub net_amount: i64,
+    pub promotion_code: Option<String>,
+    pub promotion_rule_id: Option<String>,
+    pub line_items: Vec<PaymentLineItem>,
     pub currency: String,
     pub expires_at: String,
 }
@@ -77,6 +84,103 @@ pub struct PaymentContext<'a> {
 }
 
 const STATIC_QRIS_ACCOUNT_ID: &str = "__qris";
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentLineItem {
+    pub label: String,
+    pub amount: i64,
+}
+
+#[derive(Debug, Clone)]
+struct PaymentCalculation {
+    gross_amount: i64,
+    discount_amount: i64,
+    net_amount: i64,
+    promotion_code: Option<String>,
+    promotion_rule_id: Option<String>,
+    promotion_snapshot_json: Option<String>,
+    line_items_json: String,
+    line_items: Vec<PaymentLineItem>,
+}
+
+async fn calculate_payment(
+    graph: &Graph,
+    lead_id: &str,
+    school_code: &str,
+    payment_type: &str,
+    unit_amount: i64,
+    _currency: &str,
+    student_count: i64,
+) -> Result<PaymentCalculation, String> {
+    let gross_amount = (unit_amount * student_count).max(0);
+    let rule = promotion_repository::find_active_for_lead(graph, lead_id, payment_type)
+        .await
+        .map_err(|e| format!("promotion lookup failed: {e}"))?;
+    let discount_amount = rule
+        .as_ref()
+        .map(|rule| calculate_discount_amount(gross_amount, rule))
+        .unwrap_or(0);
+    let net_amount = (gross_amount - discount_amount).max(0);
+
+    let mut line_items = vec![PaymentLineItem {
+        label: format!("{} — {}", pretty_payment_type(payment_type), school_code),
+        amount: gross_amount,
+    }];
+    if let Some(rule) = &rule {
+        if discount_amount > 0 {
+            line_items.push(PaymentLineItem {
+                label: format!("Reference code discount ({})", rule.promotion_code),
+                amount: -discount_amount,
+            });
+        }
+    }
+    let line_items_json =
+        serde_json::to_string(&line_items).map_err(|e| format!("line item encode failed: {e}"))?;
+    let promotion_snapshot_json = rule.as_ref().map(|rule| {
+        serde_json::json!({
+            "promotionCode": rule.promotion_code,
+            "promotionRuleId": rule.promotion_rule_id,
+            "discountType": rule.discount_type,
+            "discountValue": rule.discount_value,
+            "maxDiscountAmount": rule.max_discount_amount,
+            "minNetAmount": rule.min_net_amount,
+        })
+        .to_string()
+    });
+
+    Ok(PaymentCalculation {
+        gross_amount,
+        discount_amount,
+        net_amount,
+        promotion_code: rule.as_ref().map(|rule| rule.promotion_code.clone()),
+        promotion_rule_id: rule.as_ref().map(|rule| rule.promotion_rule_id.clone()),
+        promotion_snapshot_json,
+        line_items_json,
+        line_items,
+    })
+}
+
+fn calculate_discount_amount(gross_amount: i64, rule: &PromotionRuleSnapshot) -> i64 {
+    if gross_amount <= 0 {
+        return 0;
+    }
+    let raw_discount = match rule.discount_type.as_str() {
+        "fixed_amount" => rule.discount_value,
+        "percent" => gross_amount
+            .saturating_mul(rule.discount_value)
+            .saturating_div(100),
+        _ => 0,
+    }
+    .max(0);
+    let capped = rule
+        .max_discount_amount
+        .map(|cap| raw_discount.min(cap.max(0)))
+        .unwrap_or(raw_discount);
+    let min_net = rule.min_net_amount.unwrap_or(0).max(0);
+    let max_allowed_discount = (gross_amount - min_net).max(0);
+    capped.min(max_allowed_discount)
+}
 
 pub async fn create_invoice(
     ctx: PaymentContext<'_>,
@@ -139,20 +243,38 @@ pub async fn create_invoice(
                 .to_string(),
         );
     }
-    let total_amount = fs.amount * student_count;
+    let calculation = calculate_payment(
+        &ctx.graph,
+        &lead.lead_id,
+        &fs.school_code,
+        payment_type,
+        fs.amount,
+        &fs.currency,
+        student_count,
+    )
+    .await?;
 
     // 4) Create (or reuse pending) FeeObligation with the *scaled* total.
     let due_at = Utc::now() + Duration::hours(ctx.default_due_hours);
+    let due_iso = due_at.to_rfc3339();
     let obligation_id = format!("FEEOBL-{}", Uuid::new_v4());
     let obligation = fee_obligation_repository::upsert_for_lead(
         &ctx.graph,
-        ctx.tenant_id,
-        &lead.lead_id,
-        payment_type,
-        total_amount,
-        &fs.currency,
-        &due_at.to_rfc3339(),
-        &obligation_id,
+        fee_obligation_repository::FeeObligationUpsert {
+            tenant_id: ctx.tenant_id,
+            lead_id: &lead.lead_id,
+            obligation_type: payment_type,
+            amount_due: calculation.net_amount,
+            currency: &fs.currency,
+            due_iso: &due_iso,
+            new_id: &obligation_id,
+            gross_amount: calculation.gross_amount,
+            discount_amount: calculation.discount_amount,
+            promotion_code: calculation.promotion_code.as_deref(),
+            promotion_rule_id: calculation.promotion_rule_id.as_deref(),
+            promotion_snapshot_json: calculation.promotion_snapshot_json.as_deref(),
+            line_items_json: &calculation.line_items_json,
+        },
     )
     .await
     .map_err(|e| format!("fee obligation upsert failed: {e}"))?;
@@ -169,7 +291,7 @@ pub async fn create_invoice(
     );
     let xendit_req = XenditInvoiceReq {
         external_id: &payment_id,
-        amount: total_amount,
+        amount: calculation.net_amount,
         currency: &fs.currency,
         description: &description,
         payer_email: &lead.email,
@@ -185,7 +307,7 @@ pub async fn create_invoice(
         &payment_id,
         ctx.tenant_id,
         payment_type,
-        total_amount,
+        calculation.net_amount,
         &fs.currency,
         &invoice.id,
         &invoice.id,
@@ -196,6 +318,12 @@ pub async fn create_invoice(
             .unwrap_or_else(|| due_at.to_rfc3339()),
         &obligation.fee_obligation_id,
         &lead.lead_id,
+        calculation.gross_amount,
+        calculation.discount_amount,
+        calculation.promotion_code.as_deref(),
+        calculation.promotion_rule_id.as_deref(),
+        calculation.promotion_snapshot_json.as_deref(),
+        &calculation.line_items_json,
     )
     .await
     .map_err(|e| format!("payment persist failed: {e}"))?;
@@ -213,7 +341,9 @@ pub async fn create_invoice(
         admission_id=%admission_id,
         unit_amount=fs.amount,
         student_count=student_count,
-        total_amount=total_amount,
+        gross_amount=calculation.gross_amount,
+        discount_amount=calculation.discount_amount,
+        net_amount=calculation.net_amount,
         currency=%fs.currency,
         "created pending payment + xendit invoice"
     );
@@ -221,7 +351,13 @@ pub async fn create_invoice(
     Ok(CreateInvoiceOutcome {
         payment_id,
         hosted_invoice_url: invoice.invoice_url,
-        amount: total_amount,
+        amount: calculation.net_amount,
+        gross_amount: calculation.gross_amount,
+        discount_amount: calculation.discount_amount,
+        net_amount: calculation.net_amount,
+        promotion_code: calculation.promotion_code,
+        promotion_rule_id: calculation.promotion_rule_id,
+        line_items: calculation.line_items,
         currency: fs.currency,
         expires_at: invoice.expiry_date.unwrap_or_else(|| due_at.to_rfc3339()),
     })
@@ -315,19 +451,37 @@ pub async fn create_manual_payment(
                 .to_string(),
         );
     }
-    let total_amount = fs.amount * student_count;
+    let calculation = calculate_payment(
+        &ctx.graph,
+        &lead.lead_id,
+        &fs.school_code,
+        payment_type,
+        fs.amount,
+        &fs.currency,
+        student_count,
+    )
+    .await?;
 
     let due_at = Utc::now() + Duration::hours(ctx.default_due_hours);
+    let due_iso = due_at.to_rfc3339();
     let obligation_id = format!("FEEOBL-{}", Uuid::new_v4());
     let obligation = fee_obligation_repository::upsert_for_lead(
         &ctx.graph,
-        ctx.tenant_id,
-        &lead.lead_id,
-        payment_type,
-        total_amount,
-        &fs.currency,
-        &due_at.to_rfc3339(),
-        &obligation_id,
+        fee_obligation_repository::FeeObligationUpsert {
+            tenant_id: ctx.tenant_id,
+            lead_id: &lead.lead_id,
+            obligation_type: payment_type,
+            amount_due: calculation.net_amount,
+            currency: &fs.currency,
+            due_iso: &due_iso,
+            new_id: &obligation_id,
+            gross_amount: calculation.gross_amount,
+            discount_amount: calculation.discount_amount,
+            promotion_code: calculation.promotion_code.as_deref(),
+            promotion_rule_id: calculation.promotion_rule_id.as_deref(),
+            promotion_snapshot_json: calculation.promotion_snapshot_json.as_deref(),
+            line_items_json: &calculation.line_items_json,
+        },
     )
     .await
     .map_err(|e| format!("fee obligation upsert failed: {e}"))?;
@@ -341,13 +495,19 @@ pub async fn create_manual_payment(
         &payment_id,
         ctx.tenant_id,
         payment_type,
-        total_amount,
+        calculation.net_amount,
         &fs.currency,
         &due_at.to_rfc3339(),
         &obligation.fee_obligation_id,
         &lead.lead_id,
         &manual_reference,
         &bank,
+        calculation.gross_amount,
+        calculation.discount_amount,
+        calculation.promotion_code.as_deref(),
+        calculation.promotion_rule_id.as_deref(),
+        calculation.promotion_snapshot_json.as_deref(),
+        &calculation.line_items_json,
     )
     .await
     .map_err(|e| format!("manual payment persist failed: {e}"))?;
@@ -408,7 +568,16 @@ pub async fn preview_invoice(
     } else {
         count_students_for_lead(graph, admission_id).await?
     };
-    let total = fs.amount * student_count;
+    let calculation = calculate_payment(
+        graph,
+        &lead.lead_id,
+        &fs.school_code,
+        payment_type,
+        fs.amount,
+        &fs.currency,
+        student_count,
+    )
+    .await?;
 
     Ok(InvoicePreview {
         school_code: fs.school_code,
@@ -416,7 +585,13 @@ pub async fn preview_invoice(
         unit_amount: fs.amount,
         currency: fs.currency,
         student_count,
-        total,
+        total: calculation.net_amount,
+        gross_amount: calculation.gross_amount,
+        discount_amount: calculation.discount_amount,
+        net_amount: calculation.net_amount,
+        promotion_code: calculation.promotion_code,
+        promotion_rule_id: calculation.promotion_rule_id,
+        line_items: calculation.line_items,
     })
 }
 
@@ -713,24 +888,26 @@ pub async fn review_manual_payment(
 
     payment_repository::review_manual_payment(
         graph,
-        payment_id,
-        payment_status,
-        proof_status,
-        verified,
-        short,
-        overpaid,
-        if note.trim().is_empty() {
-            None
-        } else {
-            Some(note.as_str())
+        payment_repository::ManualPaymentReviewUpdate {
+            payment_id,
+            payment_status,
+            proof_status,
+            amount_verified: verified,
+            short_amount: short,
+            overpaid_amount: overpaid,
+            note: if note.trim().is_empty() {
+                None
+            } else {
+                Some(note.as_str())
+            },
+            rejection_reason: if rejection_reason.is_empty() {
+                None
+            } else {
+                Some(rejection_reason)
+            },
+            reviewed_by: actor,
+            receipt_ref,
         },
-        if rejection_reason.is_empty() {
-            None
-        } else {
-            Some(rejection_reason)
-        },
-        actor,
-        receipt_ref,
     )
     .await
     .map_err(|e| format!("payment review persist failed: {e}"))?;
@@ -759,8 +936,20 @@ pub struct InvoicePreview {
     pub currency: String,
     #[serde(rename = "studentCount")]
     pub student_count: i64,
-    /// unit_amount × student_count. What the parent will actually be charged.
+    /// Net due amount. Kept for backwards-compatible frontend readers.
     pub total: i64,
+    #[serde(rename = "grossAmount")]
+    pub gross_amount: i64,
+    #[serde(rename = "discountAmount")]
+    pub discount_amount: i64,
+    #[serde(rename = "netAmount")]
+    pub net_amount: i64,
+    #[serde(rename = "promotionCode", skip_serializing_if = "Option::is_none")]
+    pub promotion_code: Option<String>,
+    #[serde(rename = "promotionRuleId", skip_serializing_if = "Option::is_none")]
+    pub promotion_rule_id: Option<String>,
+    #[serde(rename = "lineItems")]
+    pub line_items: Vec<PaymentLineItem>,
 }
 
 /// Conditionally advance `Application.status` for the Application bound
@@ -1260,6 +1449,50 @@ fn pretty_payment_type(ty: &str) -> &str {
         "capital_levy" => "Capital levy",
         "term_fee" => "Term fee",
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{calculate_discount_amount, PromotionRuleSnapshot};
+
+    fn rule(discount_type: &str, discount_value: i64) -> PromotionRuleSnapshot {
+        PromotionRuleSnapshot {
+            promotion_code: "MKT-NADIA".to_string(),
+            promotion_rule_id: "PROMO-1".to_string(),
+            discount_type: discount_type.to_string(),
+            discount_value,
+            max_discount_amount: None,
+            min_net_amount: None,
+        }
+    }
+
+    #[test]
+    fn fixed_amount_discount_cannot_exceed_gross() {
+        let mut rule = rule("fixed_amount", 500_000);
+        assert_eq!(calculate_discount_amount(2_000_000, &rule), 500_000);
+        rule.discount_value = 3_000_000;
+        assert_eq!(calculate_discount_amount(2_000_000, &rule), 2_000_000);
+    }
+
+    #[test]
+    fn percent_discount_honors_max_cap() {
+        let mut rule = rule("percent", 25);
+        rule.max_discount_amount = Some(300_000);
+        assert_eq!(calculate_discount_amount(2_000_000, &rule), 300_000);
+    }
+
+    #[test]
+    fn min_net_amount_limits_discount() {
+        let mut rule = rule("fixed_amount", 900_000);
+        rule.min_net_amount = Some(1_500_000);
+        assert_eq!(calculate_discount_amount(2_000_000, &rule), 500_000);
+    }
+
+    #[test]
+    fn unsupported_discount_type_is_zero() {
+        let rule = rule("free_text", 100);
+        assert_eq!(calculate_discount_amount(2_000_000, &rule), 0);
     }
 }
 

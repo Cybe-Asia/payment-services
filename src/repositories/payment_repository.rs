@@ -95,12 +95,21 @@ pub async fn create_pending(
     expires_iso: &str,
     fee_obligation_id: &str,
     lead_id: &str,
+    gross_amount: i64,
+    discount_amount: i64,
+    promotion_code: Option<&str>,
+    promotion_rule_id: Option<&str>,
+    promotion_snapshot_json: Option<&str>,
+    line_items_json: &str,
 ) -> Result<(), neo4rs::Error> {
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$lead_id}), (f:FeeObligation {fee_obligation_id:$fid}) \
          CREATE (p:Payment { \
             payment_id:$payment_id, tenant_id:$tenant_id, payment_type:$payment_type, \
             status:'pending', amount:$amount, currency:$currency, \
+            gross_amount:$gross_amount, discount_amount:$discount_amount, net_amount:$amount, \
+            promotion_code:$promotion_code, promotion_rule_id:$promotion_rule_id, \
+            promotion_snapshot_json:$promotion_snapshot_json, line_items_json:$line_items_json, \
             gateway_ref:$gateway_ref, invoice_ref:$invoice_ref, \
             hosted_invoice_url:$hosted_invoice_url, \
             expires_at:datetime($expires_iso), created_at:datetime() \
@@ -120,7 +129,19 @@ pub async fn create_pending(
     .param("hosted_invoice_url", hosted_invoice_url.to_string())
     .param("expires_iso", expires_iso.to_string())
     .param("fid", fee_obligation_id.to_string())
-    .param("lead_id", lead_id.to_string());
+    .param("lead_id", lead_id.to_string())
+    .param("gross_amount", gross_amount)
+    .param("discount_amount", discount_amount)
+    .param("promotion_code", promotion_code.unwrap_or("").to_string())
+    .param(
+        "promotion_rule_id",
+        promotion_rule_id.unwrap_or("").to_string(),
+    )
+    .param(
+        "promotion_snapshot_json",
+        promotion_snapshot_json.unwrap_or("").to_string(),
+    )
+    .param("line_items_json", line_items_json.to_string());
 
     let mut result = graph.execute(q).await?;
     let _ = result.next().await?;
@@ -140,12 +161,21 @@ pub async fn create_manual_pending(
     lead_id: &str,
     manual_reference: &str,
     bank: &ManualBankDetails,
+    gross_amount: i64,
+    discount_amount: i64,
+    promotion_code: Option<&str>,
+    promotion_rule_id: Option<&str>,
+    promotion_snapshot_json: Option<&str>,
+    line_items_json: &str,
 ) -> Result<(), neo4rs::Error> {
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$lead_id}), (f:FeeObligation {fee_obligation_id:$fid}) \
          CREATE (p:Payment { \
             payment_id:$payment_id, tenant_id:$tenant_id, payment_type:$payment_type, \
             status:'awaiting_proof', amount:$amount, currency:$currency, \
+            gross_amount:$gross_amount, discount_amount:$discount_amount, net_amount:$amount, \
+            promotion_code:$promotion_code, promotion_rule_id:$promotion_rule_id, \
+            promotion_snapshot_json:$promotion_snapshot_json, line_items_json:$line_items_json, \
             payment_method:'manual_transfer', manual_reference:$manual_reference, \
             manual_bank_account_id:$manual_bank_account_id, \
             bank_name:$bank_name, bank_account_name:$account_name, \
@@ -171,7 +201,19 @@ pub async fn create_manual_pending(
     .param("bank_name", bank.bank_name.clone())
     .param("account_name", bank.account_name.clone())
     .param("account_number", bank.account_number.clone())
-    .param("instructions", bank.instructions.clone());
+    .param("instructions", bank.instructions.clone())
+    .param("gross_amount", gross_amount)
+    .param("discount_amount", discount_amount)
+    .param("promotion_code", promotion_code.unwrap_or("").to_string())
+    .param(
+        "promotion_rule_id",
+        promotion_rule_id.unwrap_or("").to_string(),
+    )
+    .param(
+        "promotion_snapshot_json",
+        promotion_snapshot_json.unwrap_or("").to_string(),
+    )
+    .param("line_items_json", line_items_json.to_string());
 
     let mut result = graph.execute(q).await?;
     let _ = result.next().await?;
@@ -221,6 +263,11 @@ pub async fn find_active_manual_for_lead(
          RETURN p.payment_id AS payment_id, p.tenant_id AS tenant_id, \
                 p.payment_type AS payment_type, p.status AS status, \
                 p.amount AS amount, p.currency AS currency, \
+                p.gross_amount AS gross_amount, p.discount_amount AS discount_amount, \
+                p.net_amount AS net_amount, p.promotion_code AS promotion_code, \
+                p.promotion_rule_id AS promotion_rule_id, \
+                p.promotion_snapshot_json AS promotion_snapshot_json, \
+                p.line_items_json AS line_items_json, \
                 p.payment_method AS payment_method, p.gateway_ref AS gateway_ref, \
                 p.invoice_ref AS invoice_ref, p.hosted_invoice_url AS hosted_invoice_url, \
                 p.receipt_ref AS receipt_ref, p.manual_reference AS manual_reference, \
@@ -251,6 +298,7 @@ pub async fn find_by_id(graph: &Graph, payment_id: &str) -> Result<Option<Paymen
     find_by(graph, "p.payment_id = $val", payment_id).await
 }
 
+#[allow(dead_code)]
 pub async fn find_by_gateway_ref(
     graph: &Graph,
     gateway_ref: &str,
@@ -269,6 +317,11 @@ async fn find_by(
          RETURN p.payment_id AS payment_id, p.tenant_id AS tenant_id, \
                 p.payment_type AS payment_type, p.status AS status, \
                 p.amount AS amount, p.currency AS currency, \
+                p.gross_amount AS gross_amount, p.discount_amount AS discount_amount, \
+                p.net_amount AS net_amount, p.promotion_code AS promotion_code, \
+                p.promotion_rule_id AS promotion_rule_id, \
+                p.promotion_snapshot_json AS promotion_snapshot_json, \
+                p.line_items_json AS line_items_json, \
                 p.payment_method AS payment_method, p.gateway_ref AS gateway_ref, \
                 p.invoice_ref AS invoice_ref, p.hosted_invoice_url AS hosted_invoice_url, \
                 p.receipt_ref AS receipt_ref, p.manual_reference AS manual_reference, \
@@ -299,6 +352,13 @@ fn payment_from_row(row: &Row) -> Payment {
         payment_type: row.get("payment_type").unwrap_or_default(),
         status: row.get("status").unwrap_or_default(),
         amount: row.get::<i64>("amount").unwrap_or_default(),
+        gross_amount: row.get("gross_amount"),
+        discount_amount: row.get("discount_amount"),
+        net_amount: row.get("net_amount"),
+        promotion_code: row.get("promotion_code"),
+        promotion_rule_id: row.get("promotion_rule_id"),
+        promotion_snapshot_json: row.get("promotion_snapshot_json"),
+        line_items_json: row.get("line_items_json"),
         currency: row.get("currency").unwrap_or_default(),
         payment_method: row.get("payment_method"),
         gateway_ref: row.get("gateway_ref"),
@@ -611,18 +671,22 @@ pub async fn find_review_detail(
     }))
 }
 
+pub struct ManualPaymentReviewUpdate<'a> {
+    pub payment_id: &'a str,
+    pub payment_status: &'a str,
+    pub proof_status: &'a str,
+    pub amount_verified: i64,
+    pub short_amount: i64,
+    pub overpaid_amount: i64,
+    pub note: Option<&'a str>,
+    pub rejection_reason: Option<&'a str>,
+    pub reviewed_by: &'a str,
+    pub receipt_ref: Option<&'a str>,
+}
+
 pub async fn review_manual_payment(
     graph: &Graph,
-    payment_id: &str,
-    payment_status: &str,
-    proof_status: &str,
-    amount_verified: i64,
-    short_amount: i64,
-    overpaid_amount: i64,
-    note: Option<&str>,
-    rejection_reason: Option<&str>,
-    reviewed_by: &str,
-    receipt_ref: Option<&str>,
+    input: ManualPaymentReviewUpdate<'_>,
 ) -> Result<(), neo4rs::Error> {
     let q = Query::new(
         "MATCH (p:Payment {payment_id:$payment_id}) \
@@ -651,16 +715,19 @@ pub async fn review_manual_payment(
              proof.updated_at = datetime() \
          RETURN p".to_string(),
     )
-    .param("payment_id", payment_id.to_string())
-    .param("payment_status", payment_status.to_string())
-    .param("proof_status", proof_status.to_string())
-    .param("amount_verified", amount_verified)
-    .param("short_amount", short_amount)
-    .param("overpaid_amount", overpaid_amount)
-    .param("note", note.unwrap_or("").to_string())
-    .param("rejection_reason", rejection_reason.unwrap_or("").to_string())
-    .param("reviewed_by", reviewed_by.to_string())
-    .param("receipt_ref", receipt_ref.unwrap_or("").to_string());
+    .param("payment_id", input.payment_id.to_string())
+    .param("payment_status", input.payment_status.to_string())
+    .param("proof_status", input.proof_status.to_string())
+    .param("amount_verified", input.amount_verified)
+    .param("short_amount", input.short_amount)
+    .param("overpaid_amount", input.overpaid_amount)
+    .param("note", input.note.unwrap_or("").to_string())
+    .param(
+        "rejection_reason",
+        input.rejection_reason.unwrap_or("").to_string(),
+    )
+    .param("reviewed_by", input.reviewed_by.to_string())
+    .param("receipt_ref", input.receipt_ref.unwrap_or("").to_string());
 
     let mut result = graph.execute(q).await?;
     let _ = result.next().await?;

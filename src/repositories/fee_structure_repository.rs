@@ -4,7 +4,12 @@ use crate::models::fee::FeeStructure;
 
 /// Return the active FeeStructure for a given school × payment_type.
 /// "Active" = status=active AND effective_to is null OR in the future.
-pub async fn find_active(graph: &Graph, tenant_id: &str, school_id: &str, payment_type: &str) -> Result<Option<FeeStructure>, neo4rs::Error> {
+pub async fn find_active(
+    graph: &Graph,
+    tenant_id: &str,
+    school_id: &str,
+    payment_type: &str,
+) -> Result<Option<FeeStructure>, neo4rs::Error> {
     let q = Query::new(
         "MATCH (s:School {school_id:$school_id})-[:HAS_FEE_STRUCTURE]->(fs:FeeStructure { \
             tenant_id:$tenant_id, payment_type:$payment_type, status:'active' }) \
@@ -17,7 +22,8 @@ pub async fn find_active(graph: &Graph, tenant_id: &str, school_id: &str, paymen
                 fs.amount AS amount, \
                 fs.currency AS currency, \
                 fs.status AS status \
-         ORDER BY fs.effective_from DESC LIMIT 1".to_string(),
+         ORDER BY fs.effective_from DESC LIMIT 1"
+            .to_string(),
     )
     .param("tenant_id", tenant_id.to_string())
     .param("school_id", school_id.to_string())
@@ -43,7 +49,15 @@ pub async fn find_active(graph: &Graph, tenant_id: &str, school_id: &str, paymen
 /// Update amount on the active FeeStructure for (school, payment_type). Admin
 /// operation — supersedes the previous version with effective_to=now and
 /// creates a new active row.
-pub async fn supersede_amount(graph: &Graph, tenant_id: &str, school_id: &str, payment_type: &str, new_amount: i64, currency: &str, new_id: &str) -> Result<(), neo4rs::Error> {
+pub async fn supersede_amount(
+    graph: &Graph,
+    tenant_id: &str,
+    school_id: &str,
+    payment_type: &str,
+    new_amount: i64,
+    currency: &str,
+    new_id: &str,
+) -> Result<(), neo4rs::Error> {
     let q = Query::new(
         "MATCH (s:School {school_id:$school_id})-[:HAS_FEE_STRUCTURE]->(old:FeeStructure { \
             tenant_id:$tenant_id, payment_type:$payment_type, status:'active' }) \
@@ -53,7 +67,8 @@ pub async fn supersede_amount(graph: &Graph, tenant_id: &str, school_id: &str, p
             fee_structure_id:$new_id, tenant_id:$tenant_id, school_id:$school_id, \
             payment_type:$payment_type, amount:$amount, currency:$currency, \
             status:'active', effective_from: datetime(), effective_to: null }) \
-         RETURN fs".to_string(),
+         RETURN fs"
+            .to_string(),
     )
     .param("tenant_id", tenant_id.to_string())
     .param("school_id", school_id.to_string())

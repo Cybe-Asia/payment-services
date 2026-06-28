@@ -131,8 +131,13 @@ async fn calculate_payment(
     }];
     if let Some(rule) = &rule {
         if discount_amount > 0 {
+            let label_prefix = if rule.source == "lead_promotion_code" {
+                "Promotion discount"
+            } else {
+                "Reference code discount"
+            };
             line_items.push(PaymentLineItem {
-                label: format!("Reference code discount ({})", rule.promotion_code),
+                label: format!("{} ({})", label_prefix, rule.promotion_code),
                 amount: -discount_amount,
             });
         }
@@ -143,6 +148,7 @@ async fn calculate_payment(
         serde_json::json!({
             "promotionCode": rule.promotion_code,
             "promotionRuleId": rule.promotion_rule_id,
+            "promotionSource": rule.source,
             "discountType": rule.discount_type,
             "discountValue": rule.discount_value,
             "maxDiscountAmount": rule.max_discount_amount,
@@ -1460,6 +1466,7 @@ mod tests {
         PromotionRuleSnapshot {
             promotion_code: "MKT-NADIA".to_string(),
             promotion_rule_id: "PROMO-1".to_string(),
+            source: "reference_code".to_string(),
             discount_type: discount_type.to_string(),
             discount_value,
             max_discount_amount: None,

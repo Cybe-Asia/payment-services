@@ -38,6 +38,7 @@ async fn find_explicit_lead_promotion(
            AND p.payment_type_scope = $payment_type \
            AND coalesce(p.approved_by, '') <> '' \
          OPTIONAL MATCH (l)-[:HAS_STUDENT]->(s:Student) \
+         WITH p, l, count(s) AS applicantCount \
          RETURN p.normalized_code AS promotionCode, \
                 p.promotion_code_id AS promotionRuleId, \
                 p.discount_type AS discountType, \
@@ -49,7 +50,7 @@ async fn find_explicit_lead_promotion(
                 toString(p.valid_until) AS validUntil, \
                 p.eligibility AS eligibility, \
                 coalesce(l.n_label, '') AS intake, \
-                count(s) AS applicantCount \
+                applicantCount \
          ORDER BY p.approved_at DESC \
          LIMIT 1"
             .to_string(),

@@ -98,6 +98,33 @@ pub struct PaymentReviewFilters<'a> {
     pub search: &'a str,
     pub date_from: &'a str,
     pub date_to: &'a str,
+    /// Whitelisted sort key + direction (additive; default ordering preserved).
+    pub sort: &'a str,
+    pub sort_dir: &'a str,
+}
+
+/// Sortable columns for the manual payment review queue (key → RETURN alias).
+const REVIEW_SORT_COLUMNS: &[(&str, &str)] = &[
+    ("parent", "parent_name"),
+    ("payment", "payment_type"),
+    ("due", "amount"),
+    ("submitted", "amount_submitted"),
+    ("verified", "amount_verified"),
+    ("status", "status"),
+    ("proof_age", "age_days"),
+];
+
+/// Builds a safe ORDER BY for the review queue. Unknown/absent sort preserves
+/// the default ordering exactly; user input only ever selects a whitelist
+/// entry, so there is no Cypher injection surface.
+fn review_order_by(sort: &str, dir: &str) -> String {
+    match REVIEW_SORT_COLUMNS.iter().find(|(key, _)| *key == sort) {
+        Some((_, expr)) => {
+            let direction = if dir == "asc" { "ASC" } else { "DESC" };
+            format!("ORDER BY {} {}", expr, direction)
+        }
+        None => "ORDER BY activity_at ASC".to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -573,7 +600,8 @@ pub async fn list_review_rows(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<PaymentReviewRow>, neo4rs::Error> {
-    let q = Query::new(
+    let order_sql = review_order_by(filters.sort, filters.sort_dir);
+    let q = Query::new(format!(
         "MATCH (l:Lead)-[:MADE_PAYMENT]->(p:Payment) \
          WHERE p.payment_method = 'manual_transfer' \
            AND ($status = '' OR p.status = $status) \
@@ -587,7 +615,7 @@ pub async fn list_review_rows(
          OPTIONAL MATCH (p)-[:HAS_PROOF]->(proof:PaymentProof) \
          WITH l, p, proof ORDER BY proof.uploaded_at DESC \
          WITH l, p, head(collect(proof)) AS proof \
-         WITH l, p, proof, coalesce(p.paid_at, proof.paid_at, proof.uploaded_at, p.created_at) AS activity_at \
+         WITH l, p, proof, coalesce(p.paid_at, proof.uploaded_at, p.created_at) AS activity_at \
          WHERE ($date_from = '' OR activity_at >= datetime($date_from)) \
            AND ($date_to = '' OR activity_at <= datetime($date_to)) \
          RETURN p.payment_id AS payment_id, l.lead_id AS lead_id, \
@@ -602,9 +630,9 @@ pub async fn list_review_rows(
                 toString(p.created_at) AS created_at, toString(p.paid_at) AS paid_at, \
                 toString(p.reviewed_at) AS reviewed_at, toString(activity_at) AS activity_at, \
                 duration.inDays(activity_at, datetime()).days AS age_days \
-         ORDER BY activity_at ASC \
-         SKIP $offset LIMIT $limit".to_string(),
-    )
+         {order_sql} \
+         SKIP $offset LIMIT $limit"
+    ))
     .param("status", filters.status.to_string())
     .param("school", filters.school.to_string())
     .param("search", filters.search.to_string())
@@ -662,7 +690,7 @@ pub async fn count_review_rows(
          OPTIONAL MATCH (p)-[:HAS_PROOF]->(proof:PaymentProof) \
          WITH l, p, proof ORDER BY proof.uploaded_at DESC \
          WITH l, p, head(collect(proof)) AS proof \
-         WITH l, p, proof, coalesce(p.paid_at, proof.paid_at, proof.uploaded_at, p.created_at) AS activity_at \
+         WITH l, p, proof, coalesce(p.paid_at, proof.uploaded_at, p.created_at) AS activity_at \
          WHERE ($date_from = '' OR activity_at >= datetime($date_from)) \
            AND ($date_to = '' OR activity_at <= datetime($date_to)) \
          RETURN count(p) AS total".to_string(),
@@ -842,5 +870,29 @@ fn payment_proof_from_row(row: &Row) -> PaymentProof {
         reviewed_by: row.get("reviewed_by"),
         reviewed_at: row.get("reviewed_at"),
         review_note: row.get("review_note"),
+    }
+}
+
+#[cfg(test)]
+mod review_order_by_tests {
+    use super::review_order_by;
+
+    #[test]
+    fn absent_or_unknown_preserves_default() {
+        assert_eq!(review_order_by("", ""), "ORDER BY activity_at ASC");
+        // Injection attempt is not in the whitelist → default preserved.
+        assert_eq!(
+            review_order_by("p.x DESC //", "'; DROP"),
+            "ORDER BY activity_at ASC"
+        );
+    }
+
+    #[test]
+    fn whitelisted_keys_apply_direction() {
+        assert_eq!(review_order_by("parent", "asc"), "ORDER BY parent_name ASC");
+        assert_eq!(review_order_by("due", "desc"), "ORDER BY amount DESC");
+        assert_eq!(review_order_by("proof_age", "asc"), "ORDER BY age_days ASC");
+        // Direction defaults to DESC when not "asc".
+        assert_eq!(review_order_by("status", ""), "ORDER BY status DESC");
     }
 }

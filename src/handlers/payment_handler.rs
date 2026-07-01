@@ -523,6 +523,10 @@ pub struct ReviewQueueQuery {
     pub date_from: String,
     #[serde(default)]
     pub date_to: String,
+    #[serde(default)]
+    pub sort: String,
+    #[serde(default)]
+    pub dir: String,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -571,6 +575,8 @@ pub async fn admin_payment_reviews_handler(
         search: &q.search,
         date_from: date_from.as_deref().unwrap_or(""),
         date_to: date_to.as_deref().unwrap_or(""),
+        sort: &q.sort,
+        sort_dir: &q.dir,
     };
     match payment_service::list_manual_review_rows(&graph, filters, limit, offset).await {
         Ok(payload) => (

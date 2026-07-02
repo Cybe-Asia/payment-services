@@ -15,10 +15,14 @@ on:
 
 env:
   SERVICE_NAME: payment-services
-  # Published by this workflow to ghcr under the repo owner namespace
-  # (ariefnugrahaaa). The other Cybe-Asia services publish under
-  # ghcr.io/cybe-asia/*; this one is under the personal owner until
-  # the repo is transferred.
+  # Kustomize `images:` key — must match the image name in the BASE
+  # manifest (digital-school-gitops/base/payment/deployment.yaml), which
+  # still says ghcr.io/ariefnugrahaaa/... from before the repo moved to
+  # the Cybe-Asia org. New builds publish under ghcr.io/cybe-asia/* (the
+  # image_ref derives from the repo owner), and the bump step rewrites
+  # each overlay's newName to it on that environment's next deploy — so
+  # every env migrates namespace naturally, prod included, with no manual
+  # gitops flip. Only change this key if the base manifest image changes.
   KUSTOMIZE_IMAGE_KEY: ghcr.io/ariefnugrahaaa/payment-services
 
 jobs:
@@ -50,6 +54,17 @@ jobs:
             *)                       OVERLAY="" ;;
           esac
           echo "overlay_path=${OVERLAY}" >> "$GITHUB_OUTPUT"
+
+      # Fail LOUDLY when a deployable branch has no gitops credential.
+      # The bump step below is conditioned on GITOPS_TOKEN, which once
+      # made it skip silently for months (the repo predated the org and
+      # the org secret never reached it) — every deploy looked green
+      # while staging never moved. Never let that be quiet again.
+      - name: Guard — gitops token present for mapped branch
+        if: steps.vars.outputs.overlay_path != '' && env.GITOPS_TOKEN == ''
+        run: |
+          echo "::error::GITOPS_TOKEN is empty, so the ${{ steps.vars.outputs.overlay_path }} auto-bump would be silently skipped. Grant this repo access to the org GITOPS_TOKEN secret (org Settings → Secrets and variables → Actions), then re-run."
+          exit 1
 
       - name: Login to GHCR
         uses: docker/login-action@v3

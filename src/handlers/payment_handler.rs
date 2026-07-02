@@ -191,7 +191,7 @@ pub async fn upload_manual_proof_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(payment_id): Path<String>,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
@@ -219,6 +219,27 @@ pub async fn upload_manual_proof_handler(
             "Payment does not belong to the current session",
         );
     }
+
+    let uploaded_by = parent
+        .email
+        .clone()
+        .unwrap_or_else(|| parent.subject.clone());
+    process_manual_proof_upload(&graph, minio, payment, multipart, uploaded_by).await
+}
+
+/// Shared core of the manual-proof upload: status guards, multipart parsing,
+/// duplicate detection, MinIO write, and the `pending_verification`
+/// transition. Callers do auth first — the parent path checks lead
+/// ownership, the assisted path checks staff roles — then hand over here so
+/// both proofs land in the finance review queue byte-identically.
+async fn process_manual_proof_upload(
+    graph: &neo4rs::Graph,
+    minio: crate::clients::minio::MinioClient,
+    payment: crate::models::payment::Payment,
+    mut multipart: Multipart,
+    uploaded_by: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let payment_id = payment.payment_id.clone();
     if payment.payment_method.as_deref() != Some("manual_transfer") {
         return fail(StatusCode::BAD_REQUEST, "Payment is not a manual transfer");
     }
@@ -326,7 +347,6 @@ pub async fn upload_manual_proof_handler(
         return fail(StatusCode::BAD_GATEWAY, &format!("upload failed: {e}"));
     }
 
-    let uploaded_by = parent.email.as_deref().unwrap_or(parent.subject.as_str());
     let input = CreateProofInput {
         payment_proof_id: &proof_id,
         payment_id: &payment_id,
@@ -340,7 +360,7 @@ pub async fn upload_manual_proof_handler(
         mime_type: &mime,
         size_bytes,
         document_hash: &hash,
-        uploaded_by,
+        uploaded_by: &uploaded_by,
     };
 
     match payment_service::record_manual_proof(&graph, input).await {
@@ -353,6 +373,158 @@ pub async fn upload_manual_proof_handler(
             fail(StatusCode::INTERNAL_SERVER_ERROR, &e)
         }
     }
+}
+
+// ---------- Marketing-assisted payment (staff submits, finance verifies) ----
+//
+// The Indonesian manual-transfer reality: the parent wires the money to the
+// school's account and WhatsApps the receipt photo to their marketing
+// contact. These endpoints let that staffer submit the evidence on the
+// family's behalf. Crucially they can only SUBMIT — the proof lands in the
+// same `pending_verification` finance queue as a parent upload, and only
+// finance (require_admin) can approve. Maker-checker preserved.
+
+#[derive(Deserialize, ToSchema)]
+pub struct AssistManualPaymentRequest {
+    #[serde(rename = "paymentType", default = "default_payment_type")]
+    pub payment_type: String,
+    #[serde(rename = "manualBankAccountId")]
+    pub manual_bank_account_id: Option<String>,
+}
+
+/// POST /api/v1/payments/admin/leads/{lead_id}/manual — staff opens (or
+/// resumes) a manual-transfer payment for a lead, mirroring what the parent's
+/// own "pay by bank transfer" click does.
+#[utoipa::path(post, path = "/api/v1/payments/admin/leads/{lead_id}/manual")]
+pub async fn admin_assist_manual_payment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(lead_id): Path<String>,
+    Json(payload): Json<AssistManualPaymentRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    let staff = match auth::require_staff(&graph, &headers, &state.jwt_secret).await {
+        Ok(auth) => auth,
+        Err((status, msg)) => return fail(status, &msg),
+    };
+
+    let ctx = PaymentContext {
+        graph: graph.clone(),
+        xendit: &state.xendit,
+        tenant_id: &state.tenant_id,
+        default_due_hours: state.default_due_hours,
+        settings_seed: state.payment_settings_seed.clone(),
+    };
+    match payment_service::create_manual_payment(
+        ctx,
+        &lead_id,
+        &payload.payment_type,
+        payload.manual_bank_account_id.as_deref(),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            emit_assist_audit(
+                graph,
+                staff.email,
+                "payment.manual.assisted",
+                lead_id.clone(),
+            );
+            let data = ManualPaymentResponseData {
+                payment: outcome.payment,
+                settings: outcome.settings,
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(ApiResponse::success(data)).unwrap()),
+            )
+        }
+        Err(e) => {
+            error!("assisted create_manual_payment failed: {e}");
+            let status = if e.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if e.contains("disabled")
+                || e.contains("no students registered")
+                || e.contains("bank account")
+                || e.contains("not configured")
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            fail(status, &e)
+        }
+    }
+}
+
+/// POST /api/v1/payments/admin/payments/{payment_id}/proofs — staff uploads
+/// the transfer receipt the parent sent them. Same guards, dedupe, storage,
+/// and `pending_verification` transition as the parent upload; `uploaded_by`
+/// records the staff email so finance sees who submitted it.
+pub async fn admin_assist_proof_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(payment_id): Path<String>,
+    multipart: Multipart,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    let Some(minio) = state.minio.clone() else {
+        return fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Object storage not configured",
+        );
+    };
+    let staff = match auth::require_staff(&graph, &headers, &state.jwt_secret).await {
+        Ok(auth) => auth,
+        Err((status, msg)) => return fail(status, &msg),
+    };
+
+    let payment = match payment_service::fetch_payment(&graph, &payment_id).await {
+        Ok(Some(payment)) => payment,
+        Ok(None) => return fail(StatusCode::NOT_FOUND, "Payment not found"),
+        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    let lead_id = payment.lead_id.clone().unwrap_or_default();
+
+    let response =
+        process_manual_proof_upload(&graph, minio, payment, multipart, staff.email.clone()).await;
+    if response.0 == StatusCode::OK {
+        emit_assist_audit(graph, staff.email, "payment.proof.assisted", lead_id);
+    }
+    response
+}
+
+/// Fire-and-forget AuditEvent write onto the shared graph — the same node
+/// shape admission-services' `audit_repository::emit_staff` creates, so
+/// assisted payment actions show up in the admin audit log alongside every
+/// other staff mutation. A failed write never blocks the payment flow.
+fn emit_assist_audit(
+    graph: std::sync::Arc<neo4rs::Graph>,
+    actor_email: String,
+    action: &'static str,
+    target_id: String,
+) {
+    tokio::spawn(async move {
+        let q = neo4rs::Query::new(
+            "CREATE (:AuditEvent { \
+                event_id: $id, actor_lead_id: '', actor_email: $actor_email, \
+                action: $action, target_type: 'lead', target_id: $tid, \
+                diff: '', created_at: datetime() \
+             })"
+            .to_string(),
+        )
+        .param("id", format!("AUDIT-{}", Uuid::new_v4()))
+        .param("actor_email", actor_email)
+        .param("action", action.to_string())
+        .param("tid", target_id);
+        if let Err(e) = graph.run(q).await {
+            warn!("assist audit write failed: {e}");
+        }
+    });
 }
 
 /// Query params for the invoice preview endpoint.
@@ -549,7 +721,11 @@ pub async fn admin_payment_reviews_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    if let Err((status, msg)) = auth::require_admin(&graph, &headers, &state.jwt_secret).await {
+    // View gate: finance roles (+ admissions managers) work this queue from
+    // their role alone — no ADMIN_EMAILS entry needed.
+    if let Err((status, msg)) =
+        auth::require_finance(&graph, &headers, &state.jwt_secret, false).await
+    {
         return fail(status, &msg);
     }
 
@@ -608,7 +784,9 @@ pub async fn admin_payment_review_detail_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    if let Err((status, msg)) = auth::require_admin(&graph, &headers, &state.jwt_secret).await {
+    if let Err((status, msg)) =
+        auth::require_finance(&graph, &headers, &state.jwt_secret, false).await
+    {
         return fail(status, &msg);
     }
     match payment_service::get_manual_review_detail(&graph, &payment_id).await {
@@ -633,7 +811,9 @@ pub async fn admin_review_manual_payment_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    let admin = match auth::require_admin(&graph, &headers, &state.jwt_secret).await {
+    // Approve gate: strictly finance + full-admin-like roles. Marketing and
+    // admissions staff can submit evidence but never confirm money.
+    let admin = match auth::require_finance(&graph, &headers, &state.jwt_secret, true).await {
         Ok(admin) => admin,
         Err((status, msg)) => return fail(status, &msg),
     };
@@ -641,6 +821,7 @@ pub async fn admin_review_manual_payment_handler(
     match payment_service::review_manual_payment(&graph, &payment_id, payload, &admin.email).await {
         Ok(payment) => {
             queue_payment_review_notification(&state, &graph, &payment, &decision).await;
+            queue_staff_review_notification(&state, &graph, &payment, &decision).await;
             (
                 StatusCode::OK,
                 Json(serde_json::to_value(ApiResponse::success(payment)).unwrap()),
@@ -696,10 +877,10 @@ pub async fn download_payment_proof_handler(
             }
         };
 
-    let is_admin = auth::require_admin(&graph, &headers, &state.jwt_secret)
+    let is_finance_viewer = auth::require_finance(&graph, &headers, &state.jwt_secret, false)
         .await
         .is_ok();
-    if !is_admin {
+    if !is_finance_viewer {
         let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
             Ok(parent) => parent,
             Err((status, msg)) => return fail(status, &msg),
@@ -804,6 +985,96 @@ async fn queue_payment_review_notification(
         _ => return,
     };
     queue_payment_status_notification(state, graph, payment, event).await;
+}
+
+/// Staff-side counterpart of the review notification. After finance decides,
+/// email the people walking this family: the proof uploader when it was an
+/// assisted (staff) upload, and the lead's assigned staffer. The parent is
+/// excluded — they get their own notification above. Rejected/underpaid is
+/// the case marketing needs most: they're the ones who chase the parent.
+/// Fire-and-forget; a failure never blocks the review.
+async fn queue_staff_review_notification(
+    state: &AppState,
+    graph: &std::sync::Arc<neo4rs::Graph>,
+    payment: &crate::models::payment::Payment,
+    decision: &str,
+) {
+    let q = neo4rs::Query::new(
+        "MATCH (l:Lead)-[:MADE_PAYMENT]->(p:Payment {payment_id: $id}) \
+         OPTIONAL MATCH (p)-[:HAS_PROOF]->(proof:PaymentProof) \
+         WITH l, proof ORDER BY proof.uploaded_at DESC LIMIT 1 \
+         RETURN l.email AS parent_email, l.parent_name AS parent_name, \
+                coalesce(l.assigned_admin_email, '') AS assigned_email, \
+                coalesce(proof.uploaded_by, '') AS uploaded_by"
+            .to_string(),
+    )
+    .param("id", payment.payment_id.clone());
+
+    let row = match graph.execute(q).await {
+        Ok(mut rs) => match rs.next().await {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(err) => {
+                warn!(payment_id=%payment.payment_id, error=%err, "staff review notification row failed");
+                return;
+            }
+        },
+        Err(err) => {
+            warn!(payment_id=%payment.payment_id, error=%err, "staff review notification lookup failed");
+            return;
+        }
+    };
+
+    let parent_email = row.get::<String>("parent_email").unwrap_or_default();
+    let parent_name = row.get::<String>("parent_name").unwrap_or_default();
+    let assigned = row.get::<String>("assigned_email").unwrap_or_default();
+    let uploaded_by = row.get::<String>("uploaded_by").unwrap_or_default();
+
+    // Staff recipients: uploader + assigned staffer, deduped, never the
+    // parent (a parent-uploaded proof has uploaded_by == parent email).
+    let mut recipients: Vec<String> = Vec::new();
+    for candidate in [uploaded_by, assigned] {
+        let c = candidate.trim().to_lowercase();
+        if c.is_empty() || c == parent_email.trim().to_lowercase() || recipients.contains(&c) {
+            continue;
+        }
+        recipients.push(c);
+    }
+    if recipients.is_empty() {
+        return;
+    }
+
+    let who = if parent_name.trim().is_empty() {
+        "keluarga ini".to_string()
+    } else {
+        parent_name.trim().to_string()
+    };
+    let fee_label = payment_type_label(&payment.payment_type);
+    let amount = format_idr(payment.amount);
+    let (status_word, follow_up) = match decision {
+        "approve" => (
+            "disetujui",
+            "Keluarga ini sudah bisa melanjutkan ke tahap berikutnya (booking jadwal tes).",
+        ),
+        "underpaid" => (
+            "ditandai kurang bayar",
+            "Mohon hubungi orang tua untuk melunasi kekurangan pembayarannya.",
+        ),
+        "reject" => (
+            "ditolak",
+            "Mohon hubungi orang tua dan unggah ulang bukti transfer yang benar.",
+        ),
+        _ => return,
+    };
+
+    let subject = format!("Pembayaran {who} {status_word}");
+    let body = format!(
+        "Halo,\n\nPembayaran {fee_label} atas nama {who} sebesar {amount} telah {status_word} oleh finance.\n\n{follow_up}\n\nBuka detail lead di portal admin untuk menindaklanjuti.\n\n— Digital Schools",
+    );
+
+    for recipient in recipients {
+        dispatch_email_notification(state, recipient, subject.clone(), body.clone());
+    }
 }
 
 async fn queue_payment_status_notification(

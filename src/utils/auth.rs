@@ -65,6 +65,139 @@ pub async fn require_admin(
     Ok(AdminAuth { email })
 }
 
+/// Staff gate for the marketing-assisted payment endpoints.
+///
+/// Accepts the ADMIN_EMAILS allowlist OR any account with an active staff
+/// role on the shared graph's User node (same lookup admission-services
+/// uses — suspended StaffProfiles resolve to no roles, so deactivation
+/// bites here too). Marketing only *submits* evidence through these
+/// endpoints; approving money stays behind `require_admin` on the
+/// finance review routes.
+pub async fn require_staff(
+    graph: &Graph,
+    headers: &HeaderMap,
+    jwt_secret: &str,
+) -> Result<AdminAuth, (StatusCode, String)> {
+    let claims = claims_from_bearer(headers, jwt_secret)?;
+    let email = match claims.email.clone() {
+        Some(email) if !email.trim().is_empty() => email,
+        _ => resolve_email_for_subject(graph, &claims.sub)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "Token missing email claim".to_string(),
+                )
+            })?,
+    };
+
+    if is_admin_email(&email) {
+        return Ok(AdminAuth { email });
+    }
+
+    let roles = staff_roles_for_email(graph, &email).await?;
+    if roles.iter().any(|r| !r.trim().is_empty()) {
+        return Ok(AdminAuth { email });
+    }
+    Err((StatusCode::FORBIDDEN, "Staff access required".to_string()))
+}
+
+/// Roles allowed to APPROVE money: finance plus the full-admin-like roles.
+/// Deliberately excludes marketing (any level) and admissions staff — they
+/// can submit evidence via `require_staff`, never confirm it.
+const FINANCE_APPROVE_ROLES: &[&str] = &[
+    "finance_admin",
+    "finance_approver",
+    "owner",
+    "admissions_admin",
+];
+
+/// Roles allowed to VIEW the payment review queue/detail/proofs. Superset of
+/// the approve roles: admissions managers can look (they track applications
+/// blocked on payment) but the approve endpoint stays finance-only.
+const FINANCE_VIEW_ROLES: &[&str] = &[
+    "finance_admin",
+    "finance_approver",
+    "owner",
+    "admissions_admin",
+    "admissions_manager",
+];
+
+/// Role-aware finance gate. `approve = true` for the money-mutating review
+/// endpoint; `false` for read surfaces (queue, detail, proof download).
+/// Accepts the ADMIN_EMAILS allowlist OR a matching active role from the
+/// shared graph — so finance staff work from their role alone, without
+/// needing an env-var entry per person.
+pub async fn require_finance(
+    graph: &Graph,
+    headers: &HeaderMap,
+    jwt_secret: &str,
+    approve: bool,
+) -> Result<AdminAuth, (StatusCode, String)> {
+    let claims = claims_from_bearer(headers, jwt_secret)?;
+    let email = match claims.email.clone() {
+        Some(email) if !email.trim().is_empty() => email,
+        _ => resolve_email_for_subject(graph, &claims.sub)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "Token missing email claim".to_string(),
+                )
+            })?,
+    };
+
+    if is_admin_email(&email) {
+        return Ok(AdminAuth { email });
+    }
+
+    let allowed: &[&str] = if approve {
+        FINANCE_APPROVE_ROLES
+    } else {
+        FINANCE_VIEW_ROLES
+    };
+    let roles = staff_roles_for_email(graph, &email).await?;
+    if roles.iter().any(|r| allowed.contains(&r.as_str())) {
+        return Ok(AdminAuth { email });
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        if approve {
+            "Finance approval access required".to_string()
+        } else {
+            "Finance access required".to_string()
+        },
+    ))
+}
+
+/// Active staff roles for an email from the shared graph (empty when the
+/// StaffProfile is suspended — deactivation bites here too).
+async fn staff_roles_for_email(
+    graph: &Graph,
+    email: &str,
+) -> Result<Vec<String>, (StatusCode, String)> {
+    let q = Query::new(
+        "MATCH (u:User) WHERE toLower(u.email) = toLower($email) \
+         OPTIONAL MATCH (u)-[:STAFF_PROFILE]->(s:StaffProfile) \
+         RETURN CASE WHEN s IS NOT NULL AND s.status = 'suspended' THEN [] \
+                     ELSE coalesce(u.marketingRoles, u.roles, []) END AS roles LIMIT 1"
+            .to_string(),
+    )
+    .param("email", email.to_string());
+    let mut res = graph
+        .execute(q)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("staff role lookup: {e}")))?;
+    Ok(res
+        .next()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("staff role row: {e}")))?
+        .and_then(|row| row.get::<Vec<String>>("roles"))
+        .unwrap_or_default())
+}
+
 pub fn owns_lead(auth: &ParentAuth, lead_id: Option<&str>) -> bool {
     let Some(lead_id) = lead_id else {
         return false;

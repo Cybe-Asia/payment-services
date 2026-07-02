@@ -59,6 +59,19 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/payments/admin/reviews/:payment_id/review",
             post(payment_handler::admin_review_manual_payment_handler),
         )
+        // Marketing-assisted manual payment: staff open a manual payment for
+        // a lead and upload the transfer proof the parent sent them over
+        // WhatsApp. Staff can only SUBMIT — approval stays on the
+        // /admin/reviews routes above (finance).
+        .route(
+            "/api/v1/payments/admin/leads/:lead_id/manual",
+            post(payment_handler::admin_assist_manual_payment_handler),
+        )
+        .route(
+            "/api/v1/payments/admin/payments/:payment_id/proofs",
+            post(payment_handler::admin_assist_proof_handler)
+                .layer(DefaultBodyLimit::max(PROOF_UPLOAD_MAX_BYTES)),
+        )
         .route(
             "/api/v1/payments/:payment_id",
             get(payment_handler::get_payment_handler),

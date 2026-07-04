@@ -1,4 +1,12 @@
-use chrono::{NaiveDate, Utc};
+use chrono::{Duration, NaiveDate, Utc};
+
+/// Promo windows are business dates in school time. "Until 31 July" must
+/// mean 31 July in Jakarta, not UTC — at 05:00 WIB on 1 August, UTC is
+/// still 22:00 on 31 July and would honour an expired promo (and the
+/// mirror error at month start). WIB has no DST, so a fixed +7 is exact.
+pub fn jakarta_today() -> NaiveDate {
+    (Utc::now() + Duration::hours(7)).date_naive()
+}
 use neo4rs::{Graph, Query};
 
 const ELIGIBILITY_SIBLING: &str = "sibling";
@@ -14,15 +22,90 @@ pub struct PromotionRuleSnapshot {
     pub min_net_amount: Option<i64>,
 }
 
-pub async fn find_active_for_lead(
+/// Every promotion that could apply to this payment right now. The caller
+/// computes the actual rupiah discount per candidate (percent vs fixed needs
+/// the gross amount) and keeps the single best one — promos never stack.
+pub async fn find_candidates_for_lead(
     graph: &Graph,
     lead_id: &str,
     payment_type: &str,
-) -> Result<Option<PromotionRuleSnapshot>, neo4rs::Error> {
+) -> Result<Vec<PromotionRuleSnapshot>, neo4rs::Error> {
+    let mut out = Vec::new();
     if let Some(explicit) = find_explicit_lead_promotion(graph, lead_id, payment_type).await? {
-        return Ok(Some(explicit));
+        out.push(explicit);
     }
-    find_reference_code_promotion(graph, lead_id, payment_type).await
+    if let Some(reference) = find_reference_code_promotion(graph, lead_id, payment_type).await? {
+        out.push(reference);
+    }
+    out.extend(find_global_ladder_promotions(graph, lead_id, payment_type).await?);
+    Ok(out)
+}
+
+/// Auto-apply ladder rows (e.g. the early-bird monthly discount): global
+/// PromotionCodes flagged `auto_apply` whose window covers today. No
+/// per-lead attachment — every payment in the window is a candidate.
+async fn find_global_ladder_promotions(
+    graph: &Graph,
+    lead_id: &str,
+    payment_type: &str,
+) -> Result<Vec<PromotionRuleSnapshot>, neo4rs::Error> {
+    let q = Query::new(
+        "MATCH (l:Lead {lead_id:$lead_id}) \
+         OPTIONAL MATCH (l)-[:HAS_STUDENT]->(s:Student) \
+         WITH l, count(s) AS applicantCount \
+         MATCH (p:PromotionCode) \
+         WHERE coalesce(p.auto_apply, false) = true \
+           AND p.status IN ['active', 'approved'] \
+           AND p.payment_type_scope IN [$payment_type, 'both'] \
+           AND coalesce(p.approved_by, '') <> '' \
+         RETURN p.normalized_code AS promotionCode, \
+                p.promotion_code_id AS promotionRuleId, \
+                p.discount_type AS discountType, \
+                p.discount_value AS discountValue, \
+                p.max_discount_amount AS maxDiscountAmount, \
+                p.min_net_amount AS minNetAmount, \
+                p.intake_scope AS intakeScope, \
+                toString(p.valid_from) AS validFrom, \
+                toString(p.valid_until) AS validUntil, \
+                p.eligibility AS eligibility, \
+                coalesce(l.n_label, '') AS intake, \
+                applicantCount"
+            .to_string(),
+    )
+    .param("lead_id", lead_id.to_string())
+    .param("payment_type", payment_type.to_string());
+
+    let mut result = graph.execute(q).await?;
+    let mut out = Vec::new();
+    while let Some(row) = result.next().await? {
+        let intake_scope: Option<String> = row.get("intakeScope");
+        let valid_from: Option<String> = row.get("validFrom");
+        let valid_until: Option<String> = row.get("validUntil");
+        let eligibility: Option<String> = row.get("eligibility");
+        let intake: String = row.get("intake").unwrap_or_default();
+        let applicant_count: i64 = row.get("applicantCount").unwrap_or_default();
+        if !promotion_window_ok(
+            intake_scope.as_deref(),
+            valid_from.as_deref(),
+            valid_until.as_deref(),
+            eligibility.as_deref(),
+            &intake,
+            applicant_count,
+            jakarta_today(),
+        ) {
+            continue;
+        }
+        out.push(PromotionRuleSnapshot {
+            promotion_code: row.get("promotionCode").unwrap_or_default(),
+            promotion_rule_id: row.get("promotionRuleId").unwrap_or_default(),
+            source: "global_ladder".to_string(),
+            discount_type: row.get("discountType").unwrap_or_default(),
+            discount_value: row.get::<i64>("discountValue").unwrap_or_default(),
+            max_discount_amount: row.get("maxDiscountAmount"),
+            min_net_amount: row.get("minNetAmount"),
+        });
+    }
+    Ok(out)
 }
 
 async fn find_explicit_lead_promotion(
@@ -77,7 +160,7 @@ async fn find_explicit_lead_promotion(
             eligibility.as_deref(),
             &intake,
             applicant_count,
-            Utc::now().date_naive(),
+            jakarta_today(),
         ) {
             return Ok(None);
         }

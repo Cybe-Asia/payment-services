@@ -116,9 +116,26 @@ async fn calculate_payment(
     student_count: i64,
 ) -> Result<PaymentCalculation, String> {
     let gross_amount = (unit_amount * student_count).max(0);
-    let rule = promotion_repository::find_active_for_lead(graph, lead_id, payment_type)
+    // One payment, one promo: rank every valid candidate by the rupiah it
+    // actually saves on THIS gross and keep the winner. Ties prefer the
+    // promo a human attached (most specific) over the global ladder, and
+    // the ladder over reference-code perks.
+    let candidates = promotion_repository::find_candidates_for_lead(graph, lead_id, payment_type)
         .await
         .map_err(|e| format!("promotion lookup failed: {e}"))?;
+    let rule = candidates
+        .into_iter()
+        .map(|rule| (calculate_discount_amount(gross_amount, &rule), rule))
+        .filter(|(discount, _)| *discount > 0)
+        .max_by_key(|(discount, rule)| {
+            let priority = match rule.source.as_str() {
+                "lead_promotion_code" => 2i64,
+                "global_ladder" => 1,
+                _ => 0,
+            };
+            (*discount, priority)
+        })
+        .map(|(_, rule)| rule);
     let discount_amount = rule
         .as_ref()
         .map(|rule| calculate_discount_amount(gross_amount, rule))
@@ -131,10 +148,10 @@ async fn calculate_payment(
     }];
     if let Some(rule) = &rule {
         if discount_amount > 0 {
-            let label_prefix = if rule.source == "lead_promotion_code" {
-                "Promotion discount"
-            } else {
-                "Reference code discount"
+            let label_prefix = match rule.source.as_str() {
+                "lead_promotion_code" => "Promotion discount",
+                "global_ladder" => "Early-bird discount",
+                _ => "Reference code discount",
             };
             line_items.push(PaymentLineItem {
                 label: format!("{} ({})", label_prefix, rule.promotion_code),

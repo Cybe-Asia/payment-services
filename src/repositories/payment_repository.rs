@@ -443,7 +443,12 @@ pub async fn mark_paid(
              p.receipt_ref = coalesce($receipt, p.receipt_ref) \
          WITH p \
          OPTIONAL MATCH (l:Lead)-[:MADE_PAYMENT]->(p) \
-         SET l.status = 'paid' \
+         SET l.status = 'paid', \
+             l.setup_step = CASE \
+               WHEN coalesce(l.setup_step, '') IN ['test_booked','test_completed','documents_requested','documents_complete','offer_pending','closed'] \
+                 THEN l.setup_step \
+               ELSE 'application_fee_paid' \
+             END \
          RETURN p"
             .to_string(),
     )
@@ -767,6 +772,16 @@ pub async fn review_manual_payment(
              p.receipt_ref = CASE WHEN $receipt_ref = '' THEN p.receipt_ref ELSE $receipt_ref END \
          FOREACH (_ IN CASE WHEN $payment_status = 'paid' THEN [1] ELSE [] END | \
              SET p.paid_at = datetime() \
+         ) \
+         WITH p \
+         OPTIONAL MATCH (l:Lead)-[:MADE_PAYMENT]->(p) \
+         FOREACH (_ IN CASE WHEN $payment_status = 'paid' AND l IS NOT NULL THEN [1] ELSE [] END | \
+             SET l.status = 'paid', \
+                 l.setup_step = CASE \
+                   WHEN coalesce(l.setup_step, '') IN ['test_booked','test_completed','documents_requested','documents_complete','offer_pending','closed'] \
+                     THEN l.setup_step \
+                   ELSE 'application_fee_paid' \
+                 END \
          ) \
          WITH p \
          OPTIONAL MATCH (p)-[:HAS_PROOF]->(proof:PaymentProof) \

@@ -8,7 +8,7 @@ pub async fn find_school_id_by_code(
     let raw_code = school_code.trim().to_uppercase();
     let canonical_code = canonical_school_code(&raw_code);
     let school_code_alias = format!("SCH-{canonical_code}");
-    let school_id_alias = format!("SCHOOL-{canonical_code}");
+    let school_id_alias = format!("SCH-{canonical_code}");
 
     let q = Query::new(
         "MATCH (s:School {tenant_id:$tenant_id}) \

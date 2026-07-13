@@ -50,7 +50,7 @@ pub async fn seed_fees(graph: &Graph, tenant_id: &str) -> Result<(), String> {
     ] {
         let q = Query::new(
             "MERGE (s:School {tenant_id:$tid, school_code:$code}) \
-             ON CREATE SET s.school_id = 'SCHOOL-' + $code, \
+             ON CREATE SET s.school_id = 'SCH-' + $code, \
                            s.school_name = $name, \
                            s.school_type = 'secondary_islamic', \
                            s.status = 'active', \

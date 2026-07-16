@@ -307,6 +307,22 @@ async fn process_manual_proof_upload(
             "amountSubmitted must be greater than zero",
         );
     }
+    // Every field on the transfer-proof form is mandatory: an incomplete
+    // proof can't be reconciled by finance, so reject it at the boundary
+    // rather than let a half-filled record into the review queue. The
+    // frontend enforces the same set — these are the server-side backstop.
+    if paid_at.is_none() {
+        return fail(StatusCode::BAD_REQUEST, "paidAt is required");
+    }
+    if payer_name.is_none() {
+        return fail(StatusCode::BAD_REQUEST, "payerName is required");
+    }
+    if payer_bank.is_none() {
+        return fail(StatusCode::BAD_REQUEST, "payerBank is required");
+    }
+    if reference_number.is_none() {
+        return fail(StatusCode::BAD_REQUEST, "referenceNumber is required");
+    }
     if buffer.is_empty() {
         return fail(StatusCode::BAD_REQUEST, "file field missing or empty");
     }

@@ -1,3 +1,4 @@
+use axum::body::Bytes;
 use axum::{
     extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -11,6 +12,7 @@ use tracing::{error, info, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::clients::doku::{verify_non_snap_webhook, DokuWebhook};
 use crate::clients::xendit::verify_webhook;
 use crate::dto::create_invoice_request::CreateInvoiceRequest;
 use crate::dto::webhook::XenditInvoiceWebhook;
@@ -51,6 +53,281 @@ pub struct ManualPaymentResponseData {
     pub settings: crate::repositories::payment_settings_repository::PaymentSettings,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDokuCheckoutBody {
+    pub offer_id: String,
+    #[serde(default = "default_doku_attempt")]
+    pub attempt: u32,
+}
+
+fn default_doku_attempt() -> u32 {
+    1
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateOfferManualPaymentBody {
+    pub manual_bank_account_id: Option<String>,
+}
+
+pub async fn create_doku_checkout_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateDokuCheckoutBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+        Ok(value) => value,
+        Err((status, message)) => return fail(status, &message),
+    };
+    match payment_service::create_doku_checkout(
+        &graph,
+        &state.doku,
+        &state.tenant_id,
+        &payload.offer_id,
+        &parent.lead_ids,
+        payload.attempt,
+        &state.payment_settings_seed,
+    )
+    .await
+    {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(ApiResponse::success(outcome)).unwrap()),
+        ),
+        Err(message) => {
+            let status = if message.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if message.contains("prerequisites") || message.contains("disabled") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if message.contains("snapshot")
+                || message.contains("attempt")
+                || message.contains("payment method")
+            {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            fail(status, &message)
+        }
+    }
+}
+
+pub async fn get_offer_payment_methods_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(offer_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+        Ok(value) => value,
+        Err((status, message)) => return fail(status, &message),
+    };
+    match payment_service::offer_payment_settings(
+        &graph,
+        &state.tenant_id,
+        &offer_id,
+        &parent.lead_ids,
+        &state.payment_settings_seed,
+    )
+    .await
+    {
+        Ok(settings) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
+        ),
+        Err(message) if message.contains("not found") => fail(StatusCode::NOT_FOUND, &message),
+        Err(message) => fail(StatusCode::CONFLICT, &message),
+    }
+}
+
+pub async fn get_offer_manual_payment_methods_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(offer_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+        Ok(value) => value,
+        Err((status, message)) => return fail(status, &message),
+    };
+    match payment_service::offer_manual_payment_settings(
+        &graph,
+        &state.tenant_id,
+        &offer_id,
+        &parent.lead_ids,
+        &state.payment_settings_seed,
+    )
+    .await
+    {
+        Ok(settings) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
+        ),
+        Err(message) => {
+            let status = if message.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if message.contains("disabled") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::CONFLICT
+            };
+            fail(status, &message)
+        }
+    }
+}
+
+pub async fn create_offer_manual_payment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(offer_id): Path<String>,
+    Json(payload): Json<CreateOfferManualPaymentBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+        Ok(value) => value,
+        Err((status, message)) => return fail(status, &message),
+    };
+    match payment_service::create_offer_manual_payment(
+        &graph,
+        &state.tenant_id,
+        &offer_id,
+        &parent.lead_ids,
+        payload.manual_bank_account_id.as_deref(),
+        state.default_due_hours,
+        &state.payment_settings_seed,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let data = ManualPaymentResponseData {
+                payment: outcome.payment,
+                settings: outcome.settings,
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(ApiResponse::success(data)).unwrap()),
+            )
+        }
+        Err(message) => {
+            let status = if message.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if message.contains("disabled") || message.contains("not configured") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if message.contains("snapshot")
+                || message.contains("payment method")
+                || message.contains("terminal")
+            {
+                StatusCode::CONFLICT
+            } else if message.contains("bank account") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            fail(status, &message)
+        }
+    }
+}
+
+pub async fn doku_webhook_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+    };
+    let client_id = header("Client-Id");
+    let request_id = header("Request-Id");
+    let timestamp = header("Request-Timestamp");
+    let signature = header("Signature");
+    if client_id != state.doku_client_id
+        || request_id.is_empty()
+        || !verify_non_snap_webhook(
+            signature,
+            client_id,
+            request_id,
+            timestamp,
+            "/api/v1/payments/webhook/doku",
+            &body,
+            &state.doku_secret_key,
+        )
+    {
+        return fail(StatusCode::UNAUTHORIZED, "Invalid DOKU signature");
+    }
+    let received_at = match DateTime::parse_from_rfc3339(timestamp) {
+        Ok(value) => value.with_timezone(&Utc),
+        Err(_) => return fail(StatusCode::UNAUTHORIZED, "Invalid DOKU timestamp"),
+    };
+    if (Utc::now() - received_at).num_seconds().abs() > 300 {
+        return fail(StatusCode::UNAUTHORIZED, "Expired DOKU timestamp");
+    }
+    let webhook: DokuWebhook = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return fail(StatusCode::BAD_REQUEST, "Invalid DOKU callback body"),
+    };
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    match payment_service::handle_doku_webhook(&graph, request_id, &webhook).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"responseCode": 200, "responseMessage": "ok"})),
+        ),
+        Err(message) if message.contains("mismatch") => fail(StatusCode::CONFLICT, &message),
+        Err(message) if message.contains("not found") => fail(StatusCode::NOT_FOUND, &message),
+        Err(message) => fail(StatusCode::INTERNAL_SERVER_ERROR, &message),
+    }
+}
+
+pub async fn reconcile_doku_payment_handler(
+    State(state): State<AppState>,
+    Path(payment_id): Path<String>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    if let Err((status, message)) =
+        auth::require_finance(&graph, &headers, &state.jwt_secret, true).await
+    {
+        return fail(status, &message);
+    }
+    match payment_service::reconcile_doku_payment(
+        &graph,
+        &state.doku,
+        &state.tenant_id,
+        &payment_id,
+    )
+    .await
+    {
+        Ok(payment) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(ApiResponse::success(payment)).unwrap()),
+        ),
+        Err(message) if message.contains("not found") => fail(StatusCode::NOT_FOUND, &message),
+        Err(message) if message.contains("mismatch") || message.contains("missing") => {
+            fail(StatusCode::CONFLICT, &message)
+        }
+        Err(message) if message.contains("prerequisites") => {
+            fail(StatusCode::SERVICE_UNAVAILABLE, &message)
+        }
+        Err(message) => fail(StatusCode::BAD_GATEWAY, &message),
+    }
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct DownloadUrlResponse {
     #[serde(rename = "presignedUrl")]
@@ -66,6 +343,12 @@ pub async fn create_invoice_handler(
     State(state): State<AppState>,
     Json(payload): Json<CreateInvoiceRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if !state.legacy_parent_payments_enabled {
+        return fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Legacy parent payment providers are disabled; use an accepted-offer DOKU checkout",
+        );
+    }
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
@@ -117,6 +400,12 @@ pub async fn create_manual_payment_handler(
     headers: HeaderMap,
     Json(payload): Json<CreateInvoiceRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if !state.legacy_parent_payments_enabled {
+        return fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Legacy parent payment providers are disabled; use an accepted-offer DOKU checkout",
+        );
+    }
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
@@ -219,12 +508,23 @@ pub async fn upload_manual_proof_handler(
             "Payment does not belong to the current session",
         );
     }
+    if payment.tenant_id != state.tenant_id {
+        return fail(StatusCode::NOT_FOUND, "Payment not found");
+    }
 
     let uploaded_by = parent
         .email
         .clone()
         .unwrap_or_else(|| parent.subject.clone());
-    process_manual_proof_upload(&graph, minio, payment, multipart, uploaded_by).await
+    process_manual_proof_upload(
+        &graph,
+        minio,
+        payment,
+        multipart,
+        uploaded_by,
+        state.tenant_id,
+    )
+    .await
 }
 
 /// Shared core of the manual-proof upload: status guards, multipart parsing,
@@ -238,18 +538,16 @@ async fn process_manual_proof_upload(
     payment: crate::models::payment::Payment,
     mut multipart: Multipart,
     uploaded_by: String,
+    tenant_id: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let payment_id = payment.payment_id.clone();
     if payment.payment_method.as_deref() != Some("manual_transfer") {
         return fail(StatusCode::BAD_REQUEST, "Payment is not a manual transfer");
     }
-    if payment.status == "paid" {
-        return fail(StatusCode::CONFLICT, "Payment is already paid");
-    }
-    if payment.status == "pending_verification" {
+    if !crate::repositories::payment_repository::manual_proof_upload_allowed(&payment.status) {
         return fail(
             StatusCode::CONFLICT,
-            "A proof is already waiting for finance review",
+            "Payment no longer accepts transfer proof",
         );
     }
 
@@ -377,6 +675,8 @@ async fn process_manual_proof_upload(
         size_bytes,
         document_hash: &hash,
         uploaded_by: &uploaded_by,
+        tenant_id: &tenant_id,
+        lead_id: payment.lead_id.as_deref().unwrap_or(""),
     };
 
     match payment_service::record_manual_proof(&graph, input).await {
@@ -386,7 +686,12 @@ async fn process_manual_proof_upload(
         ),
         Err(e) => {
             error!("record_manual_proof failed: {e}");
-            fail(StatusCode::INTERNAL_SERVER_ERROR, &e)
+            let status = if e.contains("no longer accepts") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            fail(status, &e)
         }
     }
 }
@@ -504,10 +809,20 @@ pub async fn admin_assist_proof_handler(
         Ok(None) => return fail(StatusCode::NOT_FOUND, "Payment not found"),
         Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
+    if payment.tenant_id != state.tenant_id {
+        return fail(StatusCode::NOT_FOUND, "Payment not found");
+    }
     let lead_id = payment.lead_id.clone().unwrap_or_default();
 
-    let response =
-        process_manual_proof_upload(&graph, minio, payment, multipart, staff.email.clone()).await;
+    let response = process_manual_proof_upload(
+        &graph,
+        minio,
+        payment,
+        multipart,
+        staff.email.clone(),
+        state.tenant_id.clone(),
+    )
+    .await;
     if response.0 == StatusCode::OK {
         emit_assist_audit(graph, staff.email, "payment.proof.assisted", lead_id);
     }
@@ -634,10 +949,19 @@ pub async fn get_payment_settings_handler(
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
     match payment_service::get_payment_settings(&graph, &state.payment_settings_seed).await {
-        Ok(settings) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
-        ),
+        Ok(mut settings) => {
+            if !state.legacy_parent_payments_enabled {
+                settings.xendit_enabled = false;
+                settings.manual_transfer_enabled = false;
+                settings.qris_enabled = false;
+                settings.qris_image_url.clear();
+                settings.manual_bank_accounts.clear();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
+            )
+        }
         Err(e) => {
             error!("get_payment_settings failed: {e}");
             fail(StatusCode::INTERNAL_SERVER_ERROR, &e)
@@ -770,7 +1094,9 @@ pub async fn admin_payment_reviews_handler(
         sort: &q.sort,
         sort_dir: &q.dir,
     };
-    match payment_service::list_manual_review_rows(&graph, filters, limit, offset).await {
+    match payment_service::list_manual_review_rows(&graph, &state.tenant_id, filters, limit, offset)
+        .await
+    {
         Ok(payload) => (
             StatusCode::OK,
             Json(serde_json::to_value(ApiResponse::success(payload)).unwrap()),
@@ -805,7 +1131,7 @@ pub async fn admin_payment_review_detail_handler(
     {
         return fail(status, &msg);
     }
-    match payment_service::get_manual_review_detail(&graph, &payment_id).await {
+    match payment_service::get_manual_review_detail(&graph, &state.tenant_id, &payment_id).await {
         Ok(Some(detail)) => (
             StatusCode::OK,
             Json(serde_json::to_value(ApiResponse::success(detail)).unwrap()),
@@ -834,7 +1160,15 @@ pub async fn admin_review_manual_payment_handler(
         Err((status, msg)) => return fail(status, &msg),
     };
     let decision = payload.decision.to_lowercase();
-    match payment_service::review_manual_payment(&graph, &payment_id, payload, &admin.email).await {
+    match payment_service::review_manual_payment(
+        &graph,
+        &state.tenant_id,
+        &payment_id,
+        payload,
+        &admin.email,
+    )
+    .await
+    {
         Ok(payment) => {
             queue_payment_review_notification(&state, &graph, &payment, &decision).await;
             queue_staff_review_notification(&state, &graph, &payment, &decision).await;
@@ -853,6 +1187,8 @@ pub async fn admin_review_manual_payment_handler(
                 || e.contains("covers")
                 || e.contains("decision")
                 || e.contains("already")
+                || e.contains("not waiting")
+                || e.contains("conflicted")
                 || e.contains("not a manual")
             {
                 StatusCode::BAD_REQUEST
@@ -879,19 +1215,22 @@ pub async fn download_payment_proof_handler(
         );
     };
 
-    let proof =
-        match crate::repositories::payment_repository::find_payment_proof_object(&graph, &proof_id)
-            .await
-        {
-            Ok(Some(proof)) => proof,
-            Ok(None) => return fail(StatusCode::NOT_FOUND, "Payment proof not found"),
-            Err(e) => {
-                return fail(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("proof lookup failed: {e}"),
-                )
-            }
-        };
+    let proof = match crate::repositories::payment_repository::find_payment_proof_object(
+        &graph,
+        &proof_id,
+        &state.tenant_id,
+    )
+    .await
+    {
+        Ok(Some(proof)) => proof,
+        Ok(None) => return fail(StatusCode::NOT_FOUND, "Payment proof not found"),
+        Err(e) => {
+            return fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("proof lookup failed: {e}"),
+            )
+        }
+    };
 
     let is_finance_viewer = auth::require_finance(&graph, &headers, &state.jwt_secret, false)
         .await

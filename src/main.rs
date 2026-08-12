@@ -20,6 +20,7 @@ mod routes;
 mod services;
 mod utils;
 
+use clients::doku::DokuClient;
 use clients::minio::MinioClient;
 use clients::xendit::XenditClient;
 use config::config::load;
@@ -31,6 +32,10 @@ use repositories::seed::seed_fees;
 pub struct AppState {
     pub graph: Option<Arc<Graph>>,
     pub xendit: XenditClient,
+    pub doku: DokuClient,
+    pub doku_client_id: String,
+    pub doku_secret_key: String,
+    pub legacy_parent_payments_enabled: bool,
     pub http_client: reqwest::Client,
     pub tenant_id: String,
     pub xendit_webhook_token: String,
@@ -77,6 +82,9 @@ async fn main() {
             if let Err(e) = seed_fees(&arc, &cfg.tenant_id).await {
                 warn!("seed failed (continuing): {e}");
             }
+            if let Err(e) = repositories::payment_repository::init_doku_indexes(&arc).await {
+                warn!("DOKU idempotency index initialization failed (continuing): {e}");
+            }
             Some(arc)
         }
         Err(e) => {
@@ -90,6 +98,14 @@ async fn main() {
         &cfg.xendit_api_key,
         &cfg.xendit_success_redirect_url,
         &cfg.xendit_failure_redirect_url,
+    );
+    let doku = DokuClient::new(
+        &cfg.doku_api_url,
+        &cfg.doku_client_id,
+        &cfg.doku_secret_key,
+        &cfg.doku_return_url,
+        &cfg.doku_notification_url,
+        cfg.doku_payment_method_types.clone(),
     );
 
     let minio = match (
@@ -124,6 +140,10 @@ async fn main() {
     let state = AppState {
         graph,
         xendit,
+        doku,
+        doku_client_id: cfg.doku_client_id.clone(),
+        doku_secret_key: cfg.doku_secret_key.clone(),
+        legacy_parent_payments_enabled: cfg.legacy_parent_payments_enabled,
         http_client: reqwest::Client::new(),
         tenant_id: cfg.tenant_id.clone(),
         xendit_webhook_token: cfg.xendit_webhook_token.clone(),

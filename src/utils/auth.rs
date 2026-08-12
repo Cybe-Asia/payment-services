@@ -106,12 +106,7 @@ pub async fn require_staff(
 /// Roles allowed to APPROVE money: finance plus the full-admin-like roles.
 /// Deliberately excludes marketing (any level) and admissions staff — they
 /// can submit evidence via `require_staff`, never confirm it.
-const FINANCE_APPROVE_ROLES: &[&str] = &[
-    "finance_admin",
-    "finance_approver",
-    "owner",
-    "admissions_admin",
-];
+const FINANCE_APPROVE_ROLES: &[&str] = &["finance_admin", "finance_approver", "owner"];
 
 /// Roles allowed to VIEW the payment review queue/detail/proofs. Superset of
 /// the approve roles: admissions managers can look (they track applications
@@ -149,17 +144,12 @@ pub async fn require_finance(
             })?,
     };
 
-    if is_admin_email(&email) {
+    if !approve && is_admin_email(&email) {
         return Ok(AdminAuth { email });
     }
 
-    let allowed: &[&str] = if approve {
-        FINANCE_APPROVE_ROLES
-    } else {
-        FINANCE_VIEW_ROLES
-    };
     let roles = staff_roles_for_email(graph, &email).await?;
-    if roles.iter().any(|r| allowed.contains(&r.as_str())) {
+    if finance_roles_allowed(&roles, approve) {
         return Ok(AdminAuth { email });
     }
     Err((
@@ -170,6 +160,15 @@ pub async fn require_finance(
             "Finance access required".to_string()
         },
     ))
+}
+
+fn finance_roles_allowed(roles: &[String], approve: bool) -> bool {
+    let allowed: &[&str] = if approve {
+        FINANCE_APPROVE_ROLES
+    } else {
+        FINANCE_VIEW_ROLES
+    };
+    roles.iter().any(|role| allowed.contains(&role.as_str()))
 }
 
 /// Active staff roles for an email from the shared graph (empty when the
@@ -186,14 +185,21 @@ async fn staff_roles_for_email(
             .to_string(),
     )
     .param("email", email.to_string());
-    let mut res = graph
-        .execute(q)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("staff role lookup: {e}")))?;
+    let mut res = graph.execute(q).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("staff role lookup: {e}"),
+        )
+    })?;
     Ok(res
         .next()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("staff role row: {e}")))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("staff role row: {e}"),
+            )
+        })?
         .and_then(|row| row.get::<Vec<String>>("roles"))
         .unwrap_or_default())
 }
@@ -325,4 +331,22 @@ async fn resolve_email_for_subject(graph: &Graph, subject: &str) -> Result<Optio
         .await
         .map_err(|e| format!("user email row: {e}"))?
         .and_then(|row| row.get::<String>("email")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finance_roles_allowed;
+
+    fn roles(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn admissions_can_view_but_cannot_confirm_money() {
+        let admissions = roles(&["admissions_admin"]);
+        assert!(finance_roles_allowed(&admissions, false));
+        assert!(!finance_roles_allowed(&admissions, true));
+        assert!(finance_roles_allowed(&roles(&["finance_approver"]), true));
+        assert!(finance_roles_allowed(&roles(&["owner"]), true));
+    }
 }

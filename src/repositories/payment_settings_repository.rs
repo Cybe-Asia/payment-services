@@ -21,6 +21,8 @@ pub struct PaymentSettings {
     pub tenant_id: String,
     #[serde(rename = "xenditEnabled")]
     pub xendit_enabled: bool,
+    #[serde(rename = "dokuEnabled")]
+    pub doku_enabled: bool,
     #[serde(rename = "manualTransferEnabled")]
     pub manual_transfer_enabled: bool,
     #[serde(rename = "qrisEnabled")]
@@ -58,7 +60,10 @@ pub struct PaymentSettingsSeed {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePaymentSettings {
+    #[serde(default)]
     pub xendit_enabled: bool,
+    #[serde(default)]
+    pub doku_enabled: bool,
     pub manual_transfer_enabled: bool,
     pub qris_enabled: Option<bool>,
     pub qris_image_url: Option<String>,
@@ -85,7 +90,8 @@ pub async fn get_or_seed(
         serde_json::to_string(&seeded_accounts).unwrap_or_else(|_| "[]".to_string());
     let q = Query::new(
         "MERGE (s:PaymentSettings {tenant_id:$tenant_id}) \
-         ON CREATE SET s.xendit_enabled = true, \
+         ON CREATE SET s.xendit_enabled = false, \
+                       s.doku_enabled = false, \
                        s.manual_transfer_enabled = true, \
                        s.qris_enabled = false, \
                        s.qris_image_url = '', \
@@ -98,7 +104,8 @@ pub async fn get_or_seed(
                        s.manual_bank_accounts_json = $manual_bank_accounts_json, \
                        s.created_at = datetime(), s.updated_at = datetime() \
          RETURN s.tenant_id AS tenant_id, \
-                coalesce(s.xendit_enabled, true) AS xendit_enabled, \
+                false AS xendit_enabled, \
+                coalesce(s.doku_enabled, false) AS doku_enabled, \
                 coalesce(s.manual_transfer_enabled, true) AS manual_transfer_enabled, \
                 coalesce(s.qris_enabled, false) AS qris_enabled, \
                 coalesce(s.qris_image_url, '') AS qris_image_url, \
@@ -124,7 +131,8 @@ pub async fn get_or_seed(
         Ok(PaymentSettings::from_parts(
             row.get("tenant_id")
                 .unwrap_or_else(|| seed.tenant_id.clone()),
-            row.get("xendit_enabled").unwrap_or(true),
+            false,
+            row.get("doku_enabled").unwrap_or(false),
             row.get("manual_transfer_enabled").unwrap_or(true),
             row.get("qris_enabled").unwrap_or(false),
             row.get("qris_image_url").unwrap_or_default(),
@@ -141,7 +149,8 @@ pub async fn get_or_seed(
     } else {
         Ok(PaymentSettings::from_parts(
             seed.tenant_id.clone(),
-            true,
+            false,
+            false,
             true,
             false,
             String::new(),
@@ -170,7 +179,8 @@ pub async fn update(
         serde_json::to_string(&manual_bank_accounts).unwrap_or_else(|_| "[]".to_string());
     let q = Query::new(
         "MERGE (s:PaymentSettings {tenant_id:$tenant_id}) \
-         SET s.xendit_enabled = $xendit_enabled, \
+         SET s.xendit_enabled = false, \
+             s.doku_enabled = $doku_enabled, \
              s.manual_transfer_enabled = $manual_transfer_enabled, \
              s.qris_enabled = $qris_enabled, \
              s.qris_image_url = coalesce($qris_image_url, s.qris_image_url, ''), \
@@ -183,7 +193,8 @@ pub async fn update(
              s.manual_bank_accounts_json = $manual_bank_accounts_json, \
              s.updated_by = $actor, s.updated_at = datetime() \
          RETURN s.tenant_id AS tenant_id, \
-                coalesce(s.xendit_enabled, true) AS xendit_enabled, \
+                false AS xendit_enabled, \
+                coalesce(s.doku_enabled, false) AS doku_enabled, \
                 coalesce(s.manual_transfer_enabled, true) AS manual_transfer_enabled, \
                 coalesce(s.qris_enabled, false) AS qris_enabled, \
                 coalesce(s.qris_image_url, '') AS qris_image_url, \
@@ -199,7 +210,7 @@ pub async fn update(
             .to_string(),
     )
     .param("tenant_id", tenant_id.to_string())
-    .param("xendit_enabled", payload.xendit_enabled)
+    .param("doku_enabled", payload.doku_enabled)
     .param("manual_transfer_enabled", payload.manual_transfer_enabled)
     .param("qris_enabled", payload.qris_enabled.unwrap_or(false))
     .param("qris_image_url", payload.qris_image_url.unwrap_or_default())
@@ -231,7 +242,8 @@ pub async fn update(
     Ok(PaymentSettings::from_parts(
         row.get("tenant_id")
             .unwrap_or_else(|| tenant_id.to_string()),
-        row.get("xendit_enabled").unwrap_or(true),
+        false,
+        row.get("doku_enabled").unwrap_or(false),
         row.get("manual_transfer_enabled").unwrap_or(true),
         row.get("qris_enabled").unwrap_or(false),
         row.get("qris_image_url").unwrap_or_default(),
@@ -252,6 +264,7 @@ impl PaymentSettings {
     fn from_parts(
         tenant_id: String,
         xendit_enabled: bool,
+        doku_enabled: bool,
         manual_transfer_enabled: bool,
         qris_enabled: bool,
         qris_image_url: String,
@@ -280,6 +293,7 @@ impl PaymentSettings {
         Self {
             tenant_id,
             xendit_enabled,
+            doku_enabled,
             manual_transfer_enabled,
             qris_enabled,
             qris_image_url,
@@ -390,6 +404,7 @@ mod tests {
         let settings = PaymentSettings::from_parts(
             "TENANT-001".to_string(),
             false,
+            false,
             true,
             false,
             String::new(),
@@ -407,5 +422,14 @@ mod tests {
         assert_eq!(settings.manual_bank_accounts.len(), 1);
         assert_eq!(settings.manual_bank_accounts[0].id, "primary");
         assert_eq!(settings.manual_bank_accounts[0].bank_name, "BCA");
+    }
+
+    #[test]
+    fn missing_provider_flags_fail_closed() {
+        let payload: UpdatePaymentSettings =
+            serde_json::from_str(r#"{"manualTransferEnabled":true}"#).expect("settings payload");
+
+        assert!(!payload.xendit_enabled);
+        assert!(!payload.doku_enabled);
     }
 }

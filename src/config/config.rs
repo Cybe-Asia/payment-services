@@ -12,6 +12,13 @@ pub struct Config {
     pub xendit_webhook_token: String,
     pub xendit_success_redirect_url: String,
     pub xendit_failure_redirect_url: String,
+    pub legacy_parent_payments_enabled: bool,
+    pub doku_api_url: String,
+    pub doku_client_id: String,
+    pub doku_secret_key: String,
+    pub doku_return_url: String,
+    pub doku_notification_url: String,
+    pub doku_payment_method_types: Vec<String>,
     pub default_fee_currency: String,
     pub default_fee_due_hours: i64,
     pub minio_endpoint: String,
@@ -49,6 +56,22 @@ pub fn load() -> Config {
         env::var("XENDIT_FAILURE_REDIRECT_URL").unwrap_or_else(|_| {
             "http://localhost:3000/auth/setup-account/payment/return?status=failed".to_string()
         });
+    let legacy_parent_payments_enabled = env::var("LEGACY_PARENT_PAYMENTS_ENABLED")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let doku_api_url =
+        env::var("DOKU_API_URL").unwrap_or_else(|_| "https://api-sandbox.doku.com".to_string());
+    let doku_client_id = env::var("DOKU_CLIENT_ID").unwrap_or_default();
+    let doku_secret_key = env::var("DOKU_SECRET_KEY").unwrap_or_default();
+    let doku_return_url = env::var("DOKU_RETURN_URL").unwrap_or_default();
+    let doku_notification_url = env::var("DOKU_NOTIFICATION_URL").unwrap_or_default();
+    let doku_payment_method_types = env::var("DOKU_PAYMENT_METHOD_TYPES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
     let default_fee_currency =
         env::var("DEFAULT_FEE_CURRENCY").unwrap_or_else(|_| "IDR".to_string());
     let default_fee_due_hours = env::var("DEFAULT_FEE_DUE_HOURS")
@@ -82,6 +105,13 @@ pub fn load() -> Config {
         xendit_webhook_token,
         xendit_success_redirect_url,
         xendit_failure_redirect_url,
+        legacy_parent_payments_enabled,
+        doku_api_url,
+        doku_client_id,
+        doku_secret_key,
+        doku_return_url,
+        doku_notification_url,
+        doku_payment_method_types,
         default_fee_currency,
         default_fee_due_hours,
         minio_endpoint,

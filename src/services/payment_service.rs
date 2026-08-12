@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use neo4rs::{Graph, Query};
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::clients::doku::{CreateCheckoutRequest as DokuCheckoutRequest, DokuClient, DokuWebhook};
 use crate::clients::xendit::{CreateInvoiceRequest as XenditInvoiceReq, XenditClient};
 use crate::models::payment::Payment;
 use crate::models::payment_proof::PaymentProof;
@@ -83,6 +85,428 @@ pub struct PaymentContext<'a> {
     pub tenant_id: &'a str,
     pub default_due_hours: i64,
     pub settings_seed: PaymentSettingsSeed,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceptedPricingSnapshot {
+    snapshot_version: String,
+    currency: String,
+    amount_due_now: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DokuCheckoutOutcome {
+    pub payment_id: String,
+    pub checkout_url: String,
+    pub amount: i64,
+    pub currency: String,
+    pub pricing_snapshot_hash: String,
+    pub provider: &'static str,
+}
+
+pub async fn create_doku_checkout(
+    graph: &Graph,
+    doku: &DokuClient,
+    tenant_id: &str,
+    offer_id: &str,
+    owned_lead_ids: &[String],
+    attempt: u32,
+    seed: &PaymentSettingsSeed,
+) -> Result<DokuCheckoutOutcome, String> {
+    if !(1..=5).contains(&attempt) {
+        return Err("attempt must be between 1 and 5".into());
+    }
+    let (offer, pricing) =
+        accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
+    let settings = get_payment_settings(graph, seed).await?;
+    if !settings.doku_enabled {
+        return Err("DOKU offer payment is disabled by the school".into());
+    }
+    if pricing.amount_due_now <= 0 || pricing.currency != "IDR" {
+        return Err("accepted snapshot has no payable DOKU due-now obligation".into());
+    }
+
+    let idempotency_material = format!(
+        "doku:{}:{}:{}:{}",
+        offer.offer_id, offer.offer_revision, offer.pricing_snapshot_hash, attempt
+    );
+    let idempotency_hash = hex::encode(Sha256::digest(idempotency_material.as_bytes()));
+    let payment_id = format!("PAY-DOKU-{}", &idempotency_hash[..24]);
+    if let Some(existing) = payment_repository::find_by_id(graph, &payment_id)
+        .await
+        .map_err(|e| format!("existing DOKU payment lookup failed: {e}"))?
+    {
+        if existing.payment_method.as_deref() != Some("doku")
+            || existing.amount != pricing.amount_due_now
+            || existing.currency != pricing.currency
+        {
+            return Err("existing DOKU payment does not match accepted snapshot".into());
+        }
+        if matches!(existing.status.as_str(), "expired" | "failed" | "cancelled") {
+            return Err("DOKU payment attempt is terminal; retry with the next attempt".into());
+        }
+        if existing.status == "paid" {
+            return Err("accepted offer due-now payment is already paid".into());
+        }
+        if let Some(url) = existing.hosted_invoice_url {
+            return Ok(DokuCheckoutOutcome {
+                payment_id,
+                checkout_url: url,
+                amount: existing.amount,
+                currency: existing.currency,
+                pricing_snapshot_hash: offer.pricing_snapshot_hash,
+                provider: "doku",
+            });
+        }
+    }
+    let request_id = format!("DS{}", &idempotency_hash[..48]);
+    let invoice_number = format!("DS{}", &idempotency_hash[..24]);
+    let reserved = payment_repository::reserve_offer_payment_slot(
+        graph,
+        tenant_id,
+        &offer,
+        &payment_id,
+        "doku",
+        true,
+    )
+    .await
+    .map_err(|e| format!("DOKU payment reservation failed: {e}"))?;
+    if !reserved {
+        return Err(
+            "another offer payment method is already active for this accepted snapshot".into(),
+        );
+    }
+    let response = doku
+        .create_checkout(&DokuCheckoutRequest {
+            request_id: &request_id,
+            invoice_number: &invoice_number,
+            amount: pricing.amount_due_now,
+            currency: &pricing.currency,
+            due_minutes: 60 * 24,
+        })
+        .await?;
+    let persisted = payment_repository::upsert_doku_pending(
+        graph,
+        &payment_id,
+        tenant_id,
+        &offer,
+        pricing.amount_due_now,
+        &pricing.currency,
+        &invoice_number,
+        &response.request_id,
+        attempt,
+        &response.checkout_url,
+        &response.token_id,
+        response.session_id.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("DOKU payment persistence failed: {e}"))?;
+    if !persisted {
+        return Err(
+            "another offer payment method is already active for this accepted snapshot".into(),
+        );
+    }
+    Ok(DokuCheckoutOutcome {
+        payment_id,
+        checkout_url: response.checkout_url,
+        amount: pricing.amount_due_now,
+        currency: pricing.currency,
+        pricing_snapshot_hash: offer.pricing_snapshot_hash,
+        provider: "doku",
+    })
+}
+
+async fn accepted_offer_pricing(
+    graph: &Graph,
+    tenant_id: &str,
+    offer_id: &str,
+    owned_lead_ids: &[String],
+) -> Result<
+    (
+        payment_repository::AcceptedOfferSnapshot,
+        AcceptedPricingSnapshot,
+    ),
+    String,
+> {
+    let offer = payment_repository::find_accepted_offer_snapshot(
+        graph,
+        offer_id,
+        owned_lead_ids,
+        tenant_id,
+    )
+    .await
+    .map_err(|e| format!("accepted offer lookup failed: {e}"))?
+    .ok_or_else(|| "accepted offer snapshot not found for current parent".to_string())?;
+    let actual_hash = hex::encode(Sha256::digest(offer.pricing_snapshot_json.as_bytes()));
+    if actual_hash != offer.pricing_snapshot_hash {
+        return Err("accepted pricing snapshot integrity check failed".into());
+    }
+    let pricing: AcceptedPricingSnapshot = serde_json::from_str(&offer.pricing_snapshot_json)
+        .map_err(|_| "accepted pricing snapshot is malformed".to_string())?;
+    if pricing.snapshot_version != "offer-pricing-v1" {
+        return Err("accepted pricing snapshot version is unsupported".into());
+    }
+    Ok((offer, pricing))
+}
+
+pub async fn offer_manual_payment_settings(
+    graph: &Graph,
+    tenant_id: &str,
+    offer_id: &str,
+    owned_lead_ids: &[String],
+    seed: &PaymentSettingsSeed,
+) -> Result<PaymentSettings, String> {
+    let _ = accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
+    let mut settings = get_payment_settings(graph, seed).await?;
+    settings.xendit_enabled = false;
+    if !settings.manual_transfer_enabled && !settings.qris_enabled {
+        return Err("manual offer payment is disabled".into());
+    }
+    Ok(settings)
+}
+
+pub async fn offer_payment_settings(
+    graph: &Graph,
+    tenant_id: &str,
+    offer_id: &str,
+    owned_lead_ids: &[String],
+    seed: &PaymentSettingsSeed,
+) -> Result<PaymentSettings, String> {
+    let _ = accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
+    let mut settings = get_payment_settings(graph, seed).await?;
+    settings.xendit_enabled = false;
+    Ok(settings)
+}
+
+pub async fn create_offer_manual_payment(
+    graph: &Graph,
+    tenant_id: &str,
+    offer_id: &str,
+    owned_lead_ids: &[String],
+    manual_bank_account_id: Option<&str>,
+    default_due_hours: i64,
+    seed: &PaymentSettingsSeed,
+) -> Result<ManualPaymentOutcome, String> {
+    let (offer, pricing) =
+        accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
+    if pricing.amount_due_now <= 0 || pricing.currency != "IDR" {
+        return Err("accepted snapshot has no payable manual due-now obligation".into());
+    }
+
+    let mut settings = get_payment_settings(graph, seed).await?;
+    settings.xendit_enabled = false;
+    if !settings.manual_transfer_enabled && !settings.qris_enabled {
+        return Err("manual offer payment is disabled".into());
+    }
+
+    let idempotency_material = format!(
+        "manual:{}:{}:{}",
+        offer.offer_id, offer.offer_revision, offer.pricing_snapshot_hash
+    );
+    let idempotency_hash = hex::encode(Sha256::digest(idempotency_material.as_bytes()));
+    let payment_id = format!("PAY-MANUAL-{}", &idempotency_hash[..24]);
+    if let Some(existing) = payment_repository::find_by_id(graph, &payment_id)
+        .await
+        .map_err(|e| format!("existing manual offer payment lookup failed: {e}"))?
+    {
+        if existing.payment_method.as_deref() != Some("manual_transfer")
+            || existing.amount != pricing.amount_due_now
+            || existing.currency != pricing.currency
+        {
+            return Err("existing manual offer payment does not match accepted snapshot".into());
+        }
+        if matches!(existing.status.as_str(), "expired" | "failed" | "cancelled") {
+            return Err(
+                "manual offer payment is terminal; an authorized replacement is required".into(),
+            );
+        }
+        return Ok(ManualPaymentOutcome {
+            payment: existing,
+            settings,
+        });
+    }
+
+    let bank = resolve_manual_bank_details(&settings, manual_bank_account_id)?;
+    let due_at = Utc::now() + Duration::hours(default_due_hours.max(1));
+    let manual_reference = format!("OFFER-{}", &idempotency_hash[..10].to_uppercase());
+    let reserved = payment_repository::reserve_offer_payment_slot(
+        graph,
+        tenant_id,
+        &offer,
+        &payment_id,
+        "manual_transfer",
+        false,
+    )
+    .await
+    .map_err(|e| format!("manual offer payment reservation failed: {e}"))?;
+    if !reserved {
+        return Err(
+            "another offer payment method is already active for this accepted snapshot".into(),
+        );
+    }
+    let persisted = payment_repository::upsert_offer_manual_pending(
+        graph,
+        &payment_id,
+        tenant_id,
+        &offer,
+        pricing.amount_due_now,
+        &pricing.currency,
+        &due_at.to_rfc3339(),
+        &manual_reference,
+        &bank,
+    )
+    .await
+    .map_err(|e| format!("manual offer payment persistence failed: {e}"))?;
+    if !persisted {
+        return Err(
+            "another offer payment method is already active for this accepted snapshot".into(),
+        );
+    }
+    let payment = payment_repository::find_by_id(graph, &payment_id)
+        .await
+        .map_err(|e| format!("manual offer payment fetch failed: {e}"))?
+        .ok_or_else(|| "manual offer payment was not returned".to_string())?;
+    Ok(ManualPaymentOutcome { payment, settings })
+}
+
+pub async fn handle_doku_webhook(
+    graph: &Graph,
+    request_id: &str,
+    webhook: &DokuWebhook,
+) -> Result<bool, String> {
+    let payment = payment_repository::find_by_invoice_ref(graph, &webhook.order.invoice_number)
+        .await
+        .map_err(|e| format!("DOKU payment lookup failed: {e}"))?
+        .ok_or_else(|| "DOKU payment reference not found".to_string())?;
+    let expected_request_id = payment_repository::find_doku_request_id(graph, &payment.payment_id)
+        .await
+        .map_err(|e| format!("DOKU request reference lookup failed: {e}"))?
+        .ok_or_else(|| "DOKU original request reference is missing".to_string())?;
+    validate_doku_callback_contract(
+        payment.amount,
+        &payment.currency,
+        payment.payment_method.as_deref(),
+        &expected_request_id,
+        webhook,
+    )?;
+    let raw_status = webhook
+        .transaction
+        .as_ref()
+        .map(|value| value.status.as_str())
+        .or(webhook.order.status.as_deref())
+        .unwrap_or("PENDING")
+        .to_ascii_uppercase();
+    let status = match raw_status.as_str() {
+        "SUCCESS" | "PAID" | "SETTLED" => "paid",
+        "EXPIRED" | "ORDER_EXPIRED" => "expired",
+        "FAILED" => "failed",
+        "CANCELLED" => "cancelled",
+        _ => "pending",
+    };
+    let provider_reference = webhook
+        .transaction
+        .as_ref()
+        .and_then(|value| value.original_request_id.as_deref());
+    let applied = payment_repository::apply_doku_webhook(
+        graph,
+        request_id,
+        &payment.payment_id,
+        status,
+        provider_reference,
+    )
+    .await
+    .map_err(|e| format!("DOKU webhook persistence failed: {e}"))?;
+    if applied && status == "paid" {
+        let persisted = payment_repository::find_by_id(graph, &payment.payment_id)
+            .await
+            .map_err(|e| format!("DOKU payment state confirmation failed: {e}"))?
+            .ok_or_else(|| "DOKU payment disappeared after callback persistence".to_string())?;
+        if should_apply_doku_paid_side_effect(applied, status, &persisted.status) {
+            apply_paid_side_effects(graph, &persisted).await?;
+        }
+    }
+    Ok(applied)
+}
+
+fn should_apply_doku_paid_side_effect(
+    callback_applied: bool,
+    callback_status: &str,
+    persisted_status: &str,
+) -> bool {
+    callback_applied && callback_status == "paid" && persisted_status == "paid"
+}
+
+/// Finance-only recovery path for a missing or delayed webhook. The same
+/// amount/currency/provider checks and idempotent persistence used by the
+/// webhook path are deliberately reused here; a browser return can never
+/// call this function directly.
+pub async fn reconcile_doku_payment(
+    graph: &Graph,
+    doku: &DokuClient,
+    tenant_id: &str,
+    payment_id: &str,
+) -> Result<Payment, String> {
+    let payment = payment_repository::find_by_id(graph, payment_id)
+        .await
+        .map_err(|e| format!("DOKU payment lookup failed: {e}"))?
+        .ok_or_else(|| "DOKU payment not found".to_string())?;
+    if payment.tenant_id != tenant_id || payment.payment_method.as_deref() != Some("doku") {
+        return Err("DOKU payment not found for current tenant".into());
+    }
+    if payment.status == "paid" {
+        return Ok(payment);
+    }
+    let invoice_number = payment
+        .invoice_ref
+        .as_deref()
+        .ok_or_else(|| "DOKU invoice reference is missing".to_string())?;
+    let request_id = format!("DS-RECON-{}", Uuid::new_v4().simple());
+    let provider_status = doku.check_status(invoice_number, &request_id).await?;
+    if provider_status.order.invoice_number != invoice_number {
+        return Err("DOKU reconciliation reference mismatch".into());
+    }
+    handle_doku_webhook(graph, &request_id, &provider_status).await?;
+    payment_repository::find_by_id(graph, payment_id)
+        .await
+        .map_err(|e| format!("reconciled DOKU payment lookup failed: {e}"))?
+        .ok_or_else(|| "reconciled DOKU payment was not found".to_string())
+}
+
+fn validate_doku_callback_contract(
+    expected_amount: i64,
+    expected_currency: &str,
+    expected_provider: Option<&str>,
+    expected_request_id: &str,
+    webhook: &DokuWebhook,
+) -> Result<(), String> {
+    let amount = webhook
+        .order
+        .amount
+        .as_i64()
+        .or_else(|| {
+            webhook.order.amount.as_f64().and_then(|value| {
+                (value.is_finite()
+                    && value.fract() == 0.0
+                    && value >= 0.0
+                    && value <= i64::MAX as f64)
+                    .then_some(value as i64)
+            })
+        })
+        .ok_or_else(|| "DOKU callback amount must be an integer".to_string())?;
+    let provider_request_id = webhook
+        .transaction
+        .as_ref()
+        .and_then(|transaction| transaction.original_request_id.as_deref());
+    if expected_amount != amount
+        || expected_currency != webhook.order.currency
+        || expected_provider != Some("doku")
+        || provider_request_id != Some(expected_request_id)
+    {
+        return Err("DOKU callback amount, currency, provider, or reference mismatch".into());
+    }
+    Ok(())
 }
 
 const STATIC_QRIS_ACCOUNT_ID: &str = "__qris";
@@ -637,7 +1061,8 @@ pub async fn update_payment_settings(
 ) -> Result<PaymentSettings, String> {
     let current = get_payment_settings(graph, seed).await?;
     let merged = UpdatePaymentSettings {
-        xendit_enabled: payload.xendit_enabled,
+        xendit_enabled: false,
+        doku_enabled: payload.doku_enabled,
         manual_transfer_enabled: payload.manual_transfer_enabled,
         qris_enabled: Some(payload.qris_enabled.unwrap_or(current.qris_enabled)),
         qris_image_url: Some(payload.qris_image_url.unwrap_or(current.qris_image_url)),
@@ -786,21 +1211,26 @@ pub async fn record_manual_proof(
     graph: &Graph,
     input: CreateProofInput<'_>,
 ) -> Result<PaymentProof, String> {
-    payment_repository::create_payment_proof(graph, input)
+    let proof = payment_repository::create_payment_proof(graph, input)
         .await
-        .map_err(|e| format!("payment proof persist failed: {e}"))
+        .map_err(|e| format!("payment proof persist failed: {e}"))?;
+    if proof.payment_proof_id.is_empty() {
+        return Err("payment no longer accepts transfer proof".to_string());
+    }
+    Ok(proof)
 }
 
 pub async fn list_manual_review_rows(
     graph: &Graph,
+    tenant_id: &str,
     filters: PaymentReviewFilters<'_>,
     limit: i64,
     offset: i64,
 ) -> Result<PaymentReviewList, String> {
-    let rows = payment_repository::list_review_rows(graph, filters, limit, offset)
+    let rows = payment_repository::list_review_rows(graph, tenant_id, filters, limit, offset)
         .await
         .map_err(|e| format!("payment review queue failed: {e}"))?;
-    let total = payment_repository::count_review_rows(graph, filters)
+    let total = payment_repository::count_review_rows(graph, tenant_id, filters)
         .await
         .map_err(|e| format!("payment review count failed: {e}"))?;
     Ok(PaymentReviewList {
@@ -813,15 +1243,17 @@ pub async fn list_manual_review_rows(
 
 pub async fn get_manual_review_detail(
     graph: &Graph,
+    tenant_id: &str,
     payment_id: &str,
 ) -> Result<Option<PaymentReviewDetail>, String> {
-    payment_repository::find_review_detail(graph, payment_id)
+    payment_repository::find_review_detail(graph, tenant_id, payment_id)
         .await
         .map_err(|e| format!("payment review detail failed: {e}"))
 }
 
 pub async fn review_manual_payment(
     graph: &Graph,
+    tenant_id: &str,
     payment_id: &str,
     payload: ReviewManualPaymentRequest,
     actor: &str,
@@ -831,11 +1263,15 @@ pub async fn review_manual_payment(
         .map_err(|e| format!("payment fetch failed: {e}"))?
         .ok_or_else(|| "Payment not found".to_string())?;
 
+    if payment.tenant_id != tenant_id {
+        return Err("Payment not found".to_string());
+    }
+
     if payment.payment_method.as_deref() != Some("manual_transfer") {
         return Err("payment is not a manual transfer".to_string());
     }
-    if payment.status == "paid" {
-        return Err("payment is already paid".to_string());
+    if !payment_repository::manual_review_allowed(&payment.status) {
+        return Err("payment is not waiting for finance review".to_string());
     }
 
     let due = payment.amount.max(0);
@@ -909,10 +1345,11 @@ pub async fn review_manual_payment(
             _ => return Err("decision must be approve, underpaid, or reject".to_string()),
         };
 
-    payment_repository::review_manual_payment(
+    let applied = payment_repository::review_manual_payment(
         graph,
         payment_repository::ManualPaymentReviewUpdate {
             payment_id,
+            tenant_id,
             payment_status,
             proof_status,
             amount_verified: verified,
@@ -934,6 +1371,9 @@ pub async fn review_manual_payment(
     )
     .await
     .map_err(|e| format!("payment review persist failed: {e}"))?;
+    if !applied {
+        return Err("payment review conflicted with another terminal transition".to_string());
+    }
 
     let reviewed = payment_repository::find_by_id(graph, payment_id)
         .await
@@ -1257,6 +1697,12 @@ pub async fn fetch_payment_refreshed(
     if current.status != "pending" {
         return Ok(Some(current));
     }
+    // Browser polling is deliberately non-authoritative for DOKU. Only a
+    // verified webhook (or a future authenticated reconciliation command)
+    // may change its status; never query the legacy Xendit API for it.
+    if current.payment_method.as_deref() == Some("doku") {
+        return Ok(Some(current));
+    }
     let Some(invoice_id) = current.invoice_ref.clone() else {
         return Ok(Some(current));
     };
@@ -1443,6 +1889,28 @@ async fn apply_paid_side_effects(graph: &Graph, payment: &Payment) -> Result<(),
                 set_application_status_for_lead(graph, lead_id, "offer_stage", "completed").await;
                 cascade_students_on_enrolment_paid(graph, lead_id).await;
             }
+            "offer_due_now" => {
+                // Confirm the admissions payment gate, but do not create an
+                // EnrolledStudent/SIS record here. Handoff remains a separate
+                // authorized workflow after verified payment.
+                let q = Query::new(
+                    "MATCH (o:Offer)-[:PAID_VIA]->(p:Payment {payment_id:$payment_id, status:'paid', payment_type:'offer_due_now'}) \
+                     MATCH (s:Student)-[:HAS_OFFER]->(o) \
+                     WHERE o.status = 'accepted' \
+                       AND p.payment_method IN ['doku','manual_transfer'] \
+                       AND o.tenant_id = p.tenant_id \
+                       AND o.revision = p.offer_revision \
+                       AND o.pricing_snapshot_hash = p.pricing_snapshot_hash \
+                     SET o.payment_status='paid', o.paid_at=datetime(), o.updated_at=datetime(), \
+                         s.applicantStatus='enrolment_paid', s.updatedAt=datetime()"
+                        .to_string(),
+                )
+                .param("payment_id", payment.payment_id.clone());
+                graph
+                    .run(q)
+                    .await
+                    .map_err(|e| format!("offer payment gate update failed: {e}"))?;
+            }
             _ => {}
         }
     }
@@ -1477,7 +1945,11 @@ fn pretty_payment_type(ty: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_discount_amount, PromotionRuleSnapshot};
+    use super::{
+        calculate_discount_amount, should_apply_doku_paid_side_effect,
+        validate_doku_callback_contract, PromotionRuleSnapshot,
+    };
+    use crate::clients::doku::{DokuWebhook, DokuWebhookOrder, DokuWebhookTransaction};
 
     fn rule(discount_type: &str, discount_value: i64) -> PromotionRuleSnapshot {
         PromotionRuleSnapshot {
@@ -1497,6 +1969,62 @@ mod tests {
         assert_eq!(calculate_discount_amount(2_000_000, &rule), 500_000);
         rule.discount_value = 3_000_000;
         assert_eq!(calculate_discount_amount(2_000_000, &rule), 2_000_000);
+    }
+
+    #[test]
+    fn doku_callback_fails_closed_on_amount_currency_or_provider_mismatch() {
+        let webhook = DokuWebhook {
+            order: DokuWebhookOrder {
+                invoice_number: "DS1".into(),
+                amount: serde_json::Number::from(3_000_000),
+                currency: "IDR".into(),
+                status: Some("SUCCESS".into()),
+            },
+            transaction: Some(DokuWebhookTransaction {
+                status: "SUCCESS".into(),
+                original_request_id: Some("REQ-1".into()),
+                date: None,
+            }),
+            service: None,
+            channel: None,
+        };
+        assert!(
+            validate_doku_callback_contract(3_000_000, "IDR", Some("doku"), "REQ-1", &webhook)
+                .is_ok()
+        );
+        assert!(
+            validate_doku_callback_contract(3_000_001, "IDR", Some("doku"), "REQ-1", &webhook)
+                .is_err()
+        );
+        assert!(
+            validate_doku_callback_contract(3_000_000, "USD", Some("doku"), "REQ-1", &webhook)
+                .is_err()
+        );
+        assert!(validate_doku_callback_contract(
+            3_000_000,
+            "IDR",
+            Some("xendit"),
+            "REQ-1",
+            &webhook
+        )
+        .is_err());
+        assert!(
+            validate_doku_callback_contract(3_000_000, "IDR", Some("doku"), "REQ-2", &webhook)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn paid_callback_cannot_apply_side_effects_after_terminal_non_paid_state() {
+        for terminal_status in ["expired", "failed", "cancelled"] {
+            assert!(!should_apply_doku_paid_side_effect(
+                true,
+                "paid",
+                terminal_status
+            ));
+        }
+        assert!(should_apply_doku_paid_side_effect(true, "paid", "paid"));
+        assert!(!should_apply_doku_paid_side_effect(false, "paid", "paid"));
     }
 
     #[test]

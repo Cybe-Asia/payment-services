@@ -20,6 +20,22 @@ pub fn routes() -> Router<AppState> {
             post(payment_handler::create_invoice_handler),
         )
         .route(
+            "/api/v1/payments/doku/checkout",
+            post(payment_handler::create_doku_checkout_handler),
+        )
+        .route(
+            "/api/v1/payments/offers/:offer_id/methods",
+            get(payment_handler::get_offer_payment_methods_handler),
+        )
+        .route(
+            "/api/v1/payments/offers/:offer_id/manual/methods",
+            get(payment_handler::get_offer_manual_payment_methods_handler),
+        )
+        .route(
+            "/api/v1/payments/offers/:offer_id/manual",
+            post(payment_handler::create_offer_manual_payment_handler),
+        )
+        .route(
             "/api/v1/payments/manual",
             post(payment_handler::create_manual_payment_handler),
         )
@@ -32,6 +48,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/payments/webhook/xendit",
             post(payment_handler::xendit_webhook_handler),
+        )
+        .route(
+            "/api/v1/payments/webhook/doku",
+            post(payment_handler::doku_webhook_handler),
         )
         .route(
             "/api/v1/payments/:payment_id/proofs",
@@ -58,6 +78,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/payments/admin/reviews/:payment_id/review",
             post(payment_handler::admin_review_manual_payment_handler),
+        )
+        .route(
+            "/api/v1/payments/admin/payments/:payment_id/reconcile/doku",
+            post(payment_handler::reconcile_doku_payment_handler),
         )
         // Marketing-assisted manual payment: staff open a manual payment for
         // a lead and upload the transfer proof the parent sent them over

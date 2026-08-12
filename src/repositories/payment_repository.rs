@@ -27,6 +27,326 @@ pub struct CreateProofInput<'a> {
     pub size_bytes: i64,
     pub document_hash: &'a str,
     pub uploaded_by: &'a str,
+    pub tenant_id: &'a str,
+    pub lead_id: &'a str,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcceptedOfferSnapshot {
+    pub offer_id: String,
+    pub offer_revision: i64,
+    pub lead_id: String,
+    pub pricing_snapshot_hash: String,
+    pub pricing_snapshot_json: String,
+}
+
+pub async fn init_doku_indexes(graph: &Graph) -> Result<(), neo4rs::Error> {
+    graph
+        .run(Query::new(
+            "CREATE CONSTRAINT doku_webhook_request_unique IF NOT EXISTS FOR (r:DokuWebhookReceipt) REQUIRE r.request_id IS UNIQUE".to_string(),
+        ))
+        .await?;
+    graph
+        .run(Query::new(
+            "CREATE CONSTRAINT offer_payment_slot_unique IF NOT EXISTS FOR (s:OfferPaymentSlot) REQUIRE s.slot_id IS UNIQUE".to_string(),
+        ))
+        .await?;
+    Ok(())
+}
+
+pub async fn reserve_offer_payment_slot(
+    graph: &Graph,
+    tenant_id: &str,
+    offer: &AcceptedOfferSnapshot,
+    payment_id: &str,
+    payment_method: &str,
+    allow_terminal_handoff: bool,
+) -> Result<bool, neo4rs::Error> {
+    let slot_id = offer_payment_slot_id(tenant_id, offer);
+    let q = Query::new(
+        "MATCH (l:Lead {lead_id:$lead_id, tenant_id:$tenant_id}), \
+               (o:Offer {offer_id:$offer_id, tenant_id:$tenant_id}) \
+         WHERE o.status='accepted' AND o.revision=$offer_revision \
+           AND o.pricing_snapshot_hash=$snapshot_hash \
+         MERGE (slot:OfferPaymentSlot {slot_id:$slot_id}) \
+         ON CREATE SET slot.tenant_id=$tenant_id, slot.offer_id=$offer_id, \
+            slot.offer_revision=$offer_revision, slot.pricing_snapshot_hash=$snapshot_hash, \
+            slot.payment_id=$payment_id, slot.payment_method=$payment_method, \
+            slot.created_at=datetime(), slot.updated_at=datetime() \
+         WITH l, o, slot \
+         OPTIONAL MATCH (previous:Payment {payment_id:slot.payment_id, tenant_id:$tenant_id}) \
+         WITH l, o, slot, previous \
+         WHERE (slot.payment_id=$payment_id AND slot.payment_method=$payment_method) \
+            OR ($allow_terminal_handoff AND slot.payment_method='doku' \
+                AND previous.status IN ['expired','failed','cancelled']) \
+         SET slot.payment_id=$payment_id, slot.payment_method=$payment_method, \
+             slot.updated_at=datetime() \
+         MERGE (o)-[:HAS_PAYMENT_SLOT]->(slot) \
+         RETURN slot.slot_id AS slot_id"
+            .to_string(),
+    )
+    .param("lead_id", offer.lead_id.clone())
+    .param("tenant_id", tenant_id.to_string())
+    .param("offer_id", offer.offer_id.clone())
+    .param("offer_revision", offer.offer_revision)
+    .param("snapshot_hash", offer.pricing_snapshot_hash.clone())
+    .param("slot_id", slot_id)
+    .param("payment_id", payment_id.to_string())
+    .param("payment_method", payment_method.to_string())
+    .param("allow_terminal_handoff", allow_terminal_handoff);
+    let mut result = graph.execute(q).await?;
+    Ok(result.next().await?.is_some())
+}
+
+fn offer_payment_slot_id(tenant_id: &str, offer: &AcceptedOfferSnapshot) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        tenant_id, offer.offer_id, offer.offer_revision, offer.pricing_snapshot_hash
+    )
+}
+
+pub fn manual_proof_upload_allowed(status: &str) -> bool {
+    matches!(status, "awaiting_proof" | "underpaid" | "proof_rejected")
+}
+
+pub fn manual_review_allowed(status: &str) -> bool {
+    status == "pending_verification"
+}
+
+pub async fn find_accepted_offer_snapshot(
+    graph: &Graph,
+    offer_id: &str,
+    lead_ids: &[String],
+    tenant_id: &str,
+) -> Result<Option<AcceptedOfferSnapshot>, neo4rs::Error> {
+    let q = Query::new(
+        "MATCH (l:Lead)-[:HAS_STUDENT]->(:Student)-[:HAS_OFFER]->(o:Offer {offer_id:$offer_id}) \
+         MATCH (o)-[:ACCEPTED_VIA]->(a:OfferAcceptance) \
+         WHERE l.lead_id IN $lead_ids AND o.tenant_id = $tenant_id \
+           AND o.status = 'accepted' AND a.status = 'accepted' \
+           AND a.offer_revision = o.revision \
+           AND a.pricing_snapshot_hash = o.pricing_snapshot_hash \
+           AND a.terms_hash = o.terms_hash \
+         RETURN o.offer_id AS offer_id, o.revision AS offer_revision, l.lead_id AS lead_id, \
+                o.pricing_snapshot_hash AS pricing_snapshot_hash, \
+                o.pricing_snapshot_json AS pricing_snapshot_json LIMIT 1"
+            .to_string(),
+    )
+    .param("offer_id", offer_id.to_string())
+    .param("lead_ids", lead_ids.to_vec())
+    .param("tenant_id", tenant_id.to_string());
+    let mut result = graph.execute(q).await?;
+    Ok(result.next().await?.map(|row| AcceptedOfferSnapshot {
+        offer_id: row.get("offer_id").unwrap_or_default(),
+        offer_revision: row.get("offer_revision").unwrap_or(1),
+        lead_id: row.get("lead_id").unwrap_or_default(),
+        pricing_snapshot_hash: row.get("pricing_snapshot_hash").unwrap_or_default(),
+        pricing_snapshot_json: row.get("pricing_snapshot_json").unwrap_or_default(),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_doku_pending(
+    graph: &Graph,
+    payment_id: &str,
+    tenant_id: &str,
+    offer: &AcceptedOfferSnapshot,
+    amount: i64,
+    currency: &str,
+    invoice_number: &str,
+    request_id: &str,
+    attempt: u32,
+    checkout_url: &str,
+    token_id: &str,
+    session_id: Option<&str>,
+) -> Result<bool, neo4rs::Error> {
+    let q = Query::new(
+        "MATCH (l:Lead {lead_id:$lead_id, tenant_id:$tenant_id}), \
+               (o:Offer {offer_id:$offer_id, tenant_id:$tenant_id}) \
+         WHERE o.status='accepted' AND o.revision=$offer_revision \
+           AND o.pricing_snapshot_hash=$snapshot_hash \
+         MATCH (o)-[:HAS_PAYMENT_SLOT]->(slot:OfferPaymentSlot {payment_id:$payment_id, payment_method:'doku'}) \
+         WHERE slot.pricing_snapshot_hash=$snapshot_hash \
+         OPTIONAL MATCH (o)-[:PAID_VIA]->(active:Payment) \
+         WHERE active.status NOT IN ['expired','failed','cancelled'] \
+         WITH l, o, [payment IN collect(active) WHERE payment IS NOT NULL] AS active_payments \
+         WHERE size(active_payments) = 0 OR all(payment IN active_payments WHERE payment.payment_id = $payment_id) \
+         MERGE (f:FeeObligation {offer_id:$offer_id, obligation_type:'offer_due_now'}) \
+         ON CREATE SET f.fee_obligation_id=$fee_id, f.tenant_id=$tenant_id, \
+            f.amount_due=$amount, f.currency=$currency, f.status='outstanding', \
+            f.pricing_snapshot_hash=$snapshot_hash, f.created_at=datetime() \
+         MERGE (p:Payment {payment_id:$payment_id}) \
+         ON CREATE SET p.tenant_id=$tenant_id, p.payment_type='offer_due_now', \
+            p.status='pending', p.amount=$amount, p.net_amount=$amount, p.currency=$currency, \
+            p.payment_method='doku', p.provider='doku', p.invoice_ref=$invoice_number, \
+            p.gateway_ref=$token_id, p.doku_session_id=$session_id, p.doku_request_id=$request_id, \
+            p.provider_attempt=$attempt, \
+            p.hosted_invoice_url=$checkout_url, p.offer_id=$offer_id, \
+            p.offer_revision=$offer_revision, p.pricing_snapshot_hash=$snapshot_hash, \
+            p.created_at=datetime(), p.updated_at=datetime() \
+         MERGE (l)-[:MADE_PAYMENT]->(p) \
+         MERGE (o)-[:PAID_VIA]->(p) \
+         MERGE (f)-[:SETTLED_BY]->(p) RETURN p"
+            .to_string(),
+    )
+    .param("lead_id", offer.lead_id.clone())
+    .param("offer_id", offer.offer_id.clone())
+    .param("offer_revision", offer.offer_revision)
+    .param("snapshot_hash", offer.pricing_snapshot_hash.clone())
+    .param(
+        "fee_id",
+        format!(
+            "FEEOBL-OFFER-{}",
+            &offer.pricing_snapshot_hash[..24.min(offer.pricing_snapshot_hash.len())]
+        ),
+    )
+    .param("payment_id", payment_id.to_string())
+    .param("tenant_id", tenant_id.to_string())
+    .param("amount", amount)
+    .param("currency", currency.to_string())
+    .param("invoice_number", invoice_number.to_string())
+    .param("request_id", request_id.to_string())
+    .param("attempt", attempt as i64)
+    .param("checkout_url", checkout_url.to_string())
+    .param("token_id", token_id.to_string())
+    .param("session_id", session_id.unwrap_or("").to_string());
+    let mut result = graph.execute(q).await?;
+    Ok(result.next().await?.is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_offer_manual_pending(
+    graph: &Graph,
+    payment_id: &str,
+    tenant_id: &str,
+    offer: &AcceptedOfferSnapshot,
+    amount: i64,
+    currency: &str,
+    expires_iso: &str,
+    manual_reference: &str,
+    bank: &ManualBankDetails,
+) -> Result<bool, neo4rs::Error> {
+    let q = Query::new(
+        "MATCH (l:Lead {lead_id:$lead_id, tenant_id:$tenant_id}), \
+               (o:Offer {offer_id:$offer_id, tenant_id:$tenant_id}) \
+         WHERE o.status='accepted' AND o.revision=$offer_revision \
+           AND o.pricing_snapshot_hash=$snapshot_hash \
+         MATCH (o)-[:HAS_PAYMENT_SLOT]->(slot:OfferPaymentSlot {payment_id:$payment_id, payment_method:'manual_transfer'}) \
+         WHERE slot.pricing_snapshot_hash=$snapshot_hash \
+         OPTIONAL MATCH (o)-[:PAID_VIA]->(active:Payment) \
+         WHERE active.status NOT IN ['expired','failed','cancelled'] \
+         WITH l, o, [candidate IN collect(active) WHERE candidate IS NOT NULL] AS active_payments \
+         WHERE size(active_payments) = 0 OR all(candidate IN active_payments WHERE candidate.payment_id=$payment_id) \
+         MERGE (f:FeeObligation {offer_id:$offer_id, obligation_type:'offer_due_now'}) \
+         ON CREATE SET f.fee_obligation_id=$fee_id, f.tenant_id=$tenant_id, \
+            f.amount_due=$amount, f.currency=$currency, f.status='outstanding', \
+            f.pricing_snapshot_hash=$snapshot_hash, f.created_at=datetime() \
+         MERGE (p:Payment {payment_id:$payment_id}) \
+         ON CREATE SET p.tenant_id=$tenant_id, p.payment_type='offer_due_now', \
+            p.status='awaiting_proof', p.amount=$amount, p.net_amount=$amount, \
+            p.currency=$currency, p.payment_method='manual_transfer', p.provider='manual_transfer', \
+            p.manual_reference=$manual_reference, \
+            p.manual_bank_account_id=$manual_bank_account_id, p.bank_name=$bank_name, \
+            p.bank_account_name=$account_name, p.bank_account_number=$account_number, \
+            p.manual_instructions=$instructions, p.amount_submitted=0, p.amount_verified=0, \
+            p.short_amount=$amount, p.overpaid_amount=0, p.expires_at=datetime($expires_iso), \
+            p.offer_id=$offer_id, p.offer_revision=$offer_revision, \
+            p.pricing_snapshot_hash=$snapshot_hash, p.created_at=datetime(), p.updated_at=datetime() \
+         MERGE (l)-[:MADE_PAYMENT]->(p) \
+         MERGE (o)-[:PAID_VIA]->(p) \
+         MERGE (f)-[:SETTLED_BY]->(p) \
+         RETURN p.payment_id AS payment_id"
+            .to_string(),
+    )
+    .param("lead_id", offer.lead_id.clone())
+    .param("offer_id", offer.offer_id.clone())
+    .param("offer_revision", offer.offer_revision)
+    .param("snapshot_hash", offer.pricing_snapshot_hash.clone())
+    .param(
+        "fee_id",
+        format!(
+            "FEEOBL-OFFER-{}",
+            &offer.pricing_snapshot_hash[..24.min(offer.pricing_snapshot_hash.len())]
+        ),
+    )
+    .param("payment_id", payment_id.to_string())
+    .param("tenant_id", tenant_id.to_string())
+    .param("amount", amount)
+    .param("currency", currency.to_string())
+    .param("expires_iso", expires_iso.to_string())
+    .param("manual_reference", manual_reference.to_string())
+    .param("manual_bank_account_id", bank.bank_account_id.clone())
+    .param("bank_name", bank.bank_name.clone())
+    .param("account_name", bank.account_name.clone())
+    .param("account_number", bank.account_number.clone())
+    .param("instructions", bank.instructions.clone());
+    let mut result = graph.execute(q).await?;
+    Ok(result.next().await?.is_some())
+}
+
+pub async fn find_by_invoice_ref(
+    graph: &Graph,
+    invoice_ref: &str,
+) -> Result<Option<Payment>, neo4rs::Error> {
+    find_by(graph, "p.invoice_ref = $val", invoice_ref, None).await
+}
+
+pub async fn find_doku_request_id(
+    graph: &Graph,
+    payment_id: &str,
+) -> Result<Option<String>, neo4rs::Error> {
+    let q = Query::new(
+        "MATCH (p:Payment {payment_id:$payment_id, provider:'doku'}) \
+         RETURN p.doku_request_id AS request_id LIMIT 1"
+            .to_string(),
+    )
+    .param("payment_id", payment_id.to_string());
+    let mut result = graph.execute(q).await?;
+    Ok(result
+        .next()
+        .await?
+        .and_then(|row| row.get::<String>("request_id"))
+        .filter(|value| !value.is_empty()))
+}
+
+/// Records provider delivery exactly once and performs the authoritative paid
+/// transition only for a previously pending DOKU payment.
+pub async fn apply_doku_webhook(
+    graph: &Graph,
+    request_id: &str,
+    payment_id: &str,
+    normalized_status: &str,
+    provider_reference: Option<&str>,
+) -> Result<bool, neo4rs::Error> {
+    let q = Query::new(
+        "MERGE (r:DokuWebhookReceipt {request_id:$request_id}) \
+         ON CREATE SET r.payment_id=$payment_id, r.status=$status, r.processed=false, r.received_at=datetime() \
+         WITH r WHERE r.processed=false \
+         MATCH (p:Payment {payment_id:$payment_id, provider:'doku'}) \
+         WITH r, p, p.status AS previous_status \
+         SET p.status = CASE WHEN $status='paid' AND p.status='pending' THEN 'paid' \
+                             WHEN $status IN ['expired','failed','cancelled'] AND p.status='pending' THEN $status \
+                             ELSE p.status END, \
+             p.paid_at = CASE WHEN $status='paid' AND p.status='pending' THEN datetime() ELSE p.paid_at END, \
+             p.receipt_ref = coalesce($provider_reference, p.receipt_ref), p.updated_at=datetime(), \
+             r.processed=true, r.processed_at=datetime() \
+         WITH p, r, previous_status \
+         OPTIONAL MATCH (f:FeeObligation)-[:SETTLED_BY]->(p) \
+         SET f.status = CASE WHEN p.status='paid' THEN 'settled' ELSE f.status END, \
+             f.settled_at = CASE WHEN p.status='paid' THEN datetime() ELSE f.settled_at END \
+         RETURN previous_status='pending' AND $status <> 'pending' AS applied"
+            .to_string(),
+    )
+    .param("request_id", request_id.to_string())
+    .param("payment_id", payment_id.to_string())
+    .param("status", normalized_status.to_string())
+    .param("provider_reference", provider_reference.unwrap_or("").to_string());
+    let mut result = graph.execute(q).await?;
+    Ok(result
+        .next()
+        .await?
+        .and_then(|row| row.get::<bool>("applied"))
+        .unwrap_or(false))
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -341,7 +661,15 @@ pub async fn find_active_manual_for_lead(
 }
 
 pub async fn find_by_id(graph: &Graph, payment_id: &str) -> Result<Option<Payment>, neo4rs::Error> {
-    find_by(graph, "p.payment_id = $val", payment_id).await
+    find_by(graph, "p.payment_id = $val", payment_id, None).await
+}
+
+pub async fn find_by_id_for_tenant(
+    graph: &Graph,
+    payment_id: &str,
+    tenant_id: &str,
+) -> Result<Option<Payment>, neo4rs::Error> {
+    find_by(graph, "p.payment_id = $val", payment_id, Some(tenant_id)).await
 }
 
 #[allow(dead_code)]
@@ -349,16 +677,18 @@ pub async fn find_by_gateway_ref(
     graph: &Graph,
     gateway_ref: &str,
 ) -> Result<Option<Payment>, neo4rs::Error> {
-    find_by(graph, "p.gateway_ref = $val", gateway_ref).await
+    find_by(graph, "p.gateway_ref = $val", gateway_ref, None).await
 }
 
 async fn find_by(
     graph: &Graph,
     predicate: &str,
     val: &str,
+    tenant_id: Option<&str>,
 ) -> Result<Option<Payment>, neo4rs::Error> {
     let cypher = format!(
         "MATCH (p:Payment) WHERE {predicate} \
+           AND ($tenant_id = '' OR p.tenant_id = $tenant_id) \
          OPTIONAL MATCH (l:Lead)-[:MADE_PAYMENT]->(p) \
          RETURN p.payment_id AS payment_id, p.tenant_id AS tenant_id, \
                 p.payment_type AS payment_type, p.status AS status, \
@@ -382,7 +712,9 @@ async fn find_by(
                 l.lead_id AS lead_id \
          LIMIT 1"
     );
-    let q = Query::new(cypher).param("val", val.to_string());
+    let q = Query::new(cypher)
+        .param("val", val.to_string())
+        .param("tenant_id", tenant_id.unwrap_or("").to_string());
     let mut result = graph.execute(q).await?;
     if let Some(row) = result.next().await? {
         Ok(Some(payment_from_row(&row)))
@@ -503,7 +835,9 @@ pub async fn create_payment_proof(
     input: CreateProofInput<'_>,
 ) -> Result<PaymentProof, neo4rs::Error> {
     let q = Query::new(
-        "MATCH (p:Payment {payment_id:$payment_id}) \
+        "MATCH (l:Lead {lead_id:$lead_id, tenant_id:$tenant_id})-[:MADE_PAYMENT]->\
+               (p:Payment {payment_id:$payment_id, tenant_id:$tenant_id, payment_method:'manual_transfer'}) \
+         WHERE p.status IN ['awaiting_proof','underpaid','proof_rejected'] \
          CREATE (proof:PaymentProof { \
             payment_proof_id:$payment_proof_id, status:'uploaded', \
             amount_submitted:$amount_submitted, paid_at:$paid_at, \
@@ -536,6 +870,8 @@ pub async fn create_payment_proof(
          LIMIT 1".to_string(),
     )
     .param("payment_id", input.payment_id.to_string())
+    .param("tenant_id", input.tenant_id.to_string())
+    .param("lead_id", input.lead_id.to_string())
     .param("payment_proof_id", input.payment_proof_id.to_string())
     .param("amount_submitted", input.amount_submitted)
     .param("paid_at", input.paid_at.unwrap_or("").to_string())
@@ -578,15 +914,17 @@ pub async fn create_payment_proof(
 pub async fn find_payment_proof_object(
     graph: &Graph,
     proof_id: &str,
+    tenant_id: &str,
 ) -> Result<Option<(String, String, Option<String>)>, neo4rs::Error> {
     let q = Query::new(
-        "MATCH (p:Payment)-[:HAS_PROOF]->(proof:PaymentProof {payment_proof_id:$proof_id}) \
-         OPTIONAL MATCH (l:Lead)-[:MADE_PAYMENT]->(p) \
+        "MATCH (p:Payment {tenant_id:$tenant_id})-[:HAS_PROOF]->(proof:PaymentProof {payment_proof_id:$proof_id}) \
+         OPTIONAL MATCH (l:Lead {tenant_id:$tenant_id})-[:MADE_PAYMENT]->(p) \
          RETURN proof.object_key AS object_key, proof.file_name AS file_name, l.lead_id AS lead_id \
          LIMIT 1"
             .to_string(),
     )
-    .param("proof_id", proof_id.to_string());
+    .param("proof_id", proof_id.to_string())
+    .param("tenant_id", tenant_id.to_string());
     let mut result = graph.execute(q).await?;
     if let Some(row) = result.next().await? {
         Ok(Some((
@@ -601,13 +939,14 @@ pub async fn find_payment_proof_object(
 
 pub async fn list_review_rows(
     graph: &Graph,
+    tenant_id: &str,
     filters: PaymentReviewFilters<'_>,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<PaymentReviewRow>, neo4rs::Error> {
     let order_sql = review_order_by(filters.sort, filters.sort_dir);
     let q = Query::new(format!(
-        "MATCH (l:Lead)-[:MADE_PAYMENT]->(p:Payment) \
+        "MATCH (l:Lead {{tenant_id:$tenant_id}})-[:MADE_PAYMENT]->(p:Payment {{tenant_id:$tenant_id}}) \
          WHERE p.payment_method = 'manual_transfer' \
            AND ($status = '' OR p.status = $status) \
            AND ($school = '' OR toLower(coalesce(l.target_school_preference, '')) = toLower($school)) \
@@ -638,6 +977,7 @@ pub async fn list_review_rows(
          {order_sql} \
          SKIP $offset LIMIT $limit"
     ))
+    .param("tenant_id", tenant_id.to_string())
     .param("status", filters.status.to_string())
     .param("school", filters.school.to_string())
     .param("search", filters.search.to_string())
@@ -679,10 +1019,11 @@ pub async fn list_review_rows(
 
 pub async fn count_review_rows(
     graph: &Graph,
+    tenant_id: &str,
     filters: PaymentReviewFilters<'_>,
 ) -> Result<i64, neo4rs::Error> {
     let q = Query::new(
-        "MATCH (l:Lead)-[:MADE_PAYMENT]->(p:Payment) \
+        "MATCH (l:Lead {tenant_id:$tenant_id})-[:MADE_PAYMENT]->(p:Payment {tenant_id:$tenant_id}) \
          WHERE p.payment_method = 'manual_transfer' \
            AND ($status = '' OR p.status = $status) \
            AND ($school = '' OR toLower(coalesce(l.target_school_preference, '')) = toLower($school)) \
@@ -700,6 +1041,7 @@ pub async fn count_review_rows(
            AND ($date_to = '' OR activity_at <= datetime($date_to)) \
          RETURN count(p) AS total".to_string(),
     )
+    .param("tenant_id", tenant_id.to_string())
     .param("status", filters.status.to_string())
     .param("school", filters.school.to_string())
     .param("search", filters.search.to_string())
@@ -715,15 +1057,16 @@ pub async fn count_review_rows(
 
 pub async fn find_review_detail(
     graph: &Graph,
+    tenant_id: &str,
     payment_id: &str,
 ) -> Result<Option<PaymentReviewDetail>, neo4rs::Error> {
-    let payment = match find_by_id(graph, payment_id).await? {
+    let payment = match find_by_id_for_tenant(graph, payment_id, tenant_id).await? {
         Some(payment) => payment,
         None => return Ok(None),
     };
 
     let lead_id = payment.lead_id.clone().unwrap_or_default();
-    let lead = fetch_review_lead(graph, payment_id)
+    let lead = fetch_review_lead(graph, tenant_id, payment_id)
         .await?
         .unwrap_or(PaymentReviewLead {
             lead_id,
@@ -731,7 +1074,7 @@ pub async fn find_review_detail(
             parent_email: String::new(),
             school: String::new(),
         });
-    let proofs = list_proofs_for_payment(graph, payment_id).await?;
+    let proofs = list_proofs_for_payment(graph, tenant_id, payment_id).await?;
 
     Ok(Some(PaymentReviewDetail {
         payment,
@@ -742,6 +1085,7 @@ pub async fn find_review_detail(
 
 pub struct ManualPaymentReviewUpdate<'a> {
     pub payment_id: &'a str,
+    pub tenant_id: &'a str,
     pub payment_status: &'a str,
     pub proof_status: &'a str,
     pub amount_verified: i64,
@@ -756,9 +1100,10 @@ pub struct ManualPaymentReviewUpdate<'a> {
 pub async fn review_manual_payment(
     graph: &Graph,
     input: ManualPaymentReviewUpdate<'_>,
-) -> Result<(), neo4rs::Error> {
+) -> Result<bool, neo4rs::Error> {
     let q = Query::new(
-        "MATCH (p:Payment {payment_id:$payment_id}) \
+        "MATCH (p:Payment {payment_id:$payment_id, tenant_id:$tenant_id, payment_method:'manual_transfer'}) \
+         WHERE p.status='pending_verification' \
          SET p.status = $payment_status, \
              p.amount_verified = $amount_verified, \
              p.short_amount = $short_amount, \
@@ -795,6 +1140,7 @@ pub async fn review_manual_payment(
          RETURN p".to_string(),
     )
     .param("payment_id", input.payment_id.to_string())
+    .param("tenant_id", input.tenant_id.to_string())
     .param("payment_status", input.payment_status.to_string())
     .param("proof_status", input.proof_status.to_string())
     .param("amount_verified", input.amount_verified)
@@ -809,22 +1155,23 @@ pub async fn review_manual_payment(
     .param("receipt_ref", input.receipt_ref.unwrap_or("").to_string());
 
     let mut result = graph.execute(q).await?;
-    let _ = result.next().await?;
-    Ok(())
+    Ok(result.next().await?.is_some())
 }
 
 async fn fetch_review_lead(
     graph: &Graph,
+    tenant_id: &str,
     payment_id: &str,
 ) -> Result<Option<PaymentReviewLead>, neo4rs::Error> {
     let q = Query::new(
-        "MATCH (l:Lead)-[:MADE_PAYMENT]->(:Payment {payment_id:$payment_id}) \
+        "MATCH (l:Lead {tenant_id:$tenant_id})-[:MADE_PAYMENT]->(:Payment {payment_id:$payment_id, tenant_id:$tenant_id}) \
          RETURN l.lead_id AS lead_id, l.parent_name AS parent_name, \
                 l.email AS parent_email, l.target_school_preference AS school \
          LIMIT 1"
             .to_string(),
     )
-    .param("payment_id", payment_id.to_string());
+    .param("payment_id", payment_id.to_string())
+    .param("tenant_id", tenant_id.to_string());
     let mut result = graph.execute(q).await?;
     if let Some(row) = result.next().await? {
         Ok(Some(PaymentReviewLead {
@@ -840,10 +1187,11 @@ async fn fetch_review_lead(
 
 async fn list_proofs_for_payment(
     graph: &Graph,
+    tenant_id: &str,
     payment_id: &str,
 ) -> Result<Vec<PaymentProof>, neo4rs::Error> {
     let q = Query::new(
-        "MATCH (p:Payment {payment_id:$payment_id})-[:HAS_PROOF]->(proof:PaymentProof) \
+        "MATCH (p:Payment {payment_id:$payment_id, tenant_id:$tenant_id})-[:HAS_PROOF]->(proof:PaymentProof) \
          RETURN proof.payment_proof_id AS payment_proof_id, p.payment_id AS payment_id, \
                 proof.status AS status, proof.amount_submitted AS amount_submitted, \
                 proof.amount_verified AS amount_verified, toString(proof.paid_at) AS paid_at, \
@@ -856,7 +1204,8 @@ async fn list_proofs_for_payment(
          ORDER BY proof.uploaded_at DESC"
             .to_string(),
     )
-    .param("payment_id", payment_id.to_string());
+    .param("payment_id", payment_id.to_string())
+    .param("tenant_id", tenant_id.to_string());
     let mut result = graph.execute(q).await?;
     let mut proofs = Vec::new();
     while let Some(row) = result.next().await? {
@@ -890,7 +1239,10 @@ fn payment_proof_from_row(row: &Row) -> PaymentProof {
 
 #[cfg(test)]
 mod review_order_by_tests {
-    use super::review_order_by;
+    use super::{
+        manual_proof_upload_allowed, manual_review_allowed, offer_payment_slot_id, review_order_by,
+        AcceptedOfferSnapshot,
+    };
 
     #[test]
     fn absent_or_unknown_preserves_default() {
@@ -909,5 +1261,35 @@ mod review_order_by_tests {
         assert_eq!(review_order_by("proof_age", "asc"), "ORDER BY age_days ASC");
         // Direction defaults to DESC when not "asc".
         assert_eq!(review_order_by("status", ""), "ORDER BY status DESC");
+    }
+
+    #[test]
+    fn terminal_manual_states_cannot_accept_proof_or_review() {
+        for status in ["paid", "expired", "failed", "cancelled"] {
+            assert!(!manual_proof_upload_allowed(status));
+            assert!(!manual_review_allowed(status));
+        }
+        assert!(manual_proof_upload_allowed("awaiting_proof"));
+        assert!(manual_proof_upload_allowed("underpaid"));
+        assert!(manual_review_allowed("pending_verification"));
+    }
+
+    #[test]
+    fn payment_slot_is_bound_to_tenant_offer_revision_and_snapshot() {
+        let mut offer = AcceptedOfferSnapshot {
+            offer_id: "OFF-1".into(),
+            offer_revision: 2,
+            lead_id: "LEAD-1".into(),
+            pricing_snapshot_hash: "hash-a".into(),
+            pricing_snapshot_json: "{}".into(),
+        };
+        let original = offer_payment_slot_id("TENANT-1", &offer);
+        assert_eq!(original, offer_payment_slot_id("TENANT-1", &offer));
+        offer.offer_revision = 3;
+        assert_ne!(original, offer_payment_slot_id("TENANT-1", &offer));
+        offer.offer_revision = 2;
+        assert_ne!(original, offer_payment_slot_id("TENANT-2", &offer));
+        offer.pricing_snapshot_hash = "hash-b".into();
+        assert_ne!(original, offer_payment_slot_id("TENANT-1", &offer));
     }
 }

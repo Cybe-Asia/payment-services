@@ -1459,51 +1459,6 @@ async fn set_application_status_for_lead(
 ///
 /// The cypher is idempotent and no-op for students that are already
 /// past `submitted` (e.g. an admin-advanced student, or a re-payment).
-/// When an enrolment_fee Payment is confirmed paid, advance every
-/// ApplicantStudent under the Lead that's in `offer_accepted` all the
-/// way to `handed_to_sis`, creating the EnrolledStudent node and the
-/// (ApplicantStudent)-[:ENROLLED_AS]->(EnrolledStudent) edge per
-/// spec §2.2 (admissions + SIS linked, not overwritten).
-///
-/// student_id is `STU-<uuid>` and student_number is `{SCHOOL}{YEAR}-<4hex>`.
-/// For MVP we compute both inline in cypher using randomUUID() +
-/// current-year toString — good enough until SIS gets its own service
-/// with a real sequencing store.
-///
-/// Idempotent via MERGE; if the kid is already enrolled the query
-/// no-ops.
-async fn cascade_students_on_enrolment_paid(graph: &Graph, lead_id: &str) {
-    let q = Query::new(
-        "MATCH (:Lead {lead_id: $lead_id})-[:HAS_STUDENT]->(s:Student) \
-         WHERE coalesce(s.applicantStatus, '') = 'offer_accepted' \
-         OPTIONAL MATCH (s)-[:HAS_OFFER]->(o:Offer) \
-         WITH s, o, randomUUID() AS uid, toString(date().year) AS yyyy \
-         MERGE (e:EnrolledStudent {applicant_student_id: s.studentId}) \
-         ON CREATE SET e.student_id = 'STU-' + uid, \
-                       e.student_number = coalesce(replace(o.target_school_id, 'SCH-', ''), 'DS') + yyyy + '-' + toUpper(substring(uid, 0, 4)), \
-                       e.tenant_id = 'TENANT-001', \
-                       e.school_id = coalesce(o.target_school_id, ''), \
-                       e.year_group = coalesce(o.target_year_group, ''), \
-                       e.status = 'active', \
-                       e.enrolment_date = toString(date()), \
-                       e.created_at = datetime(), e.updated_at = datetime() \
-         ON MATCH SET e.updated_at = datetime() \
-         MERGE (s)-[:ENROLLED_AS]->(e) \
-         SET s.applicantStatus = 'handed_to_sis', s.updatedAt = datetime() \
-         RETURN count(s) AS enrolled_count".to_string(),
-    )
-    .param("lead_id", lead_id.to_string());
-    match graph.execute(q).await {
-        Ok(mut res) => {
-            let _ = res.next().await;
-            info!(lead_id=%lead_id, "students cascaded → handed_to_sis (EnrolledStudent created)");
-        }
-        Err(e) => {
-            warn!(lead_id=%lead_id, error=%e, "failed to enrol students on enrolment_paid");
-        }
-    }
-}
-
 async fn cascade_students_to_test_pending(graph: &Graph, lead_id: &str) {
     let q = Query::new(
         "MATCH (:Lead {lead_id:$lead_id})-[:HAS_STUDENT]->(s:Student) \
@@ -1732,9 +1687,10 @@ pub async fn fetch_payment_refreshed(
                         let _ = settle_obligation_for_payment(graph, payment_id).await;
 
                         // Payment-type-specific cascades. application_fee
-                        // moves us into the test phase; enrolment_fee
-                        // closes the admissions funnel and hands the
-                        // applicant to SIS.
+                        // moves us into the test phase. Legacy enrolment_fee
+                        // may close the application record, but never advances
+                        // a Student or SIS handoff without an offer-bound
+                        // payment.
                         if let Some(lead_id) = current.lead_id.as_deref() {
                             match current.payment_type.as_str() {
                                 "application_fee" => {
@@ -1762,7 +1718,6 @@ pub async fn fetch_payment_refreshed(
                                         "completed",
                                     )
                                     .await;
-                                    cascade_students_on_enrolment_paid(graph, lead_id).await;
                                 }
                                 _ => {
                                     // term_fee, capital_levy etc. — no
@@ -1842,7 +1797,6 @@ pub async fn handle_webhook(
                     "enrolment_fee" => {
                         set_application_status_for_lead(graph, lead_id, "offer_stage", "completed")
                             .await;
-                        cascade_students_on_enrolment_paid(graph, lead_id).await;
                     }
                     _ => {}
                 }
@@ -1887,7 +1841,6 @@ async fn apply_paid_side_effects(graph: &Graph, payment: &Payment) -> Result<(),
             }
             "enrolment_fee" => {
                 set_application_status_for_lead(graph, lead_id, "offer_stage", "completed").await;
-                cascade_students_on_enrolment_paid(graph, lead_id).await;
             }
             "offer_due_now" => {
                 // Confirm the admissions payment gate, but do not create an
@@ -2045,6 +1998,15 @@ mod tests {
     fn unsupported_discount_type_is_zero() {
         let rule = rule("free_text", 100);
         assert_eq!(calculate_discount_amount(2_000_000, &rule), 0);
+    }
+
+    #[test]
+    fn legacy_enrolment_fee_never_performs_lead_wide_sis_handoff() {
+        let source = include_str!("payment_service.rs");
+        let lead_wide_cascade = ["async fn cascade_students", "_on_enrolment_paid"].concat();
+        let hardcoded_tenant = ["e.tenant_id = '", "TENANT-001'"].concat();
+        assert!(!source.contains(&lead_wide_cascade));
+        assert!(!source.contains(&hardcoded_tenant));
     }
 }
 

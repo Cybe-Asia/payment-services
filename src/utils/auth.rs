@@ -15,6 +15,13 @@ pub struct AdminAuth {
     pub email: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct StaffAuthorization {
+    roles: Vec<String>,
+    tenant_ids: Vec<String>,
+    school_ids: Vec<String>,
+}
+
 pub async fn require_parent_auth(
     graph: &Graph,
     headers: &HeaderMap,
@@ -43,6 +50,7 @@ pub async fn require_admin(
     graph: &Graph,
     headers: &HeaderMap,
     jwt_secret: &str,
+    tenant_id: &str,
 ) -> Result<AdminAuth, (StatusCode, String)> {
     let claims = claims_from_bearer(headers, jwt_secret)?;
     let email = match claims.email.clone() {
@@ -58,7 +66,12 @@ pub async fn require_admin(
             })?,
     };
 
-    if !is_admin_email(&email) {
+    let authorization = staff_authorization_for_subject(graph, &claims.sub).await?;
+    let fallback = nonprod_admin_email_fallback_enabled() && is_admin_email(&email);
+    if !(payment_admin_roles_allowed(&authorization.roles)
+        && tenant_scope_allowed(&authorization, tenant_id))
+        && !fallback
+    {
         return Err((StatusCode::FORBIDDEN, "Admin access required".to_string()));
     }
 
@@ -67,16 +80,14 @@ pub async fn require_admin(
 
 /// Staff gate for the marketing-assisted payment endpoints.
 ///
-/// Accepts the ADMIN_EMAILS allowlist OR any account with an active staff
-/// role on the shared graph's User node (same lookup admission-services
-/// uses — suspended StaffProfiles resolve to no roles, so deactivation
-/// bites here too). Marketing only *submits* evidence through these
-/// endpoints; approving money stays behind `require_admin` on the
-/// finance review routes.
+/// Accepts an account with at least one active canonical staff role. Marketing
+/// only *submits* evidence through these endpoints; approving money stays
+/// behind the finance review routes.
 pub async fn require_staff(
     graph: &Graph,
     headers: &HeaderMap,
     jwt_secret: &str,
+    tenant_id: &str,
 ) -> Result<AdminAuth, (StatusCode, String)> {
     let claims = claims_from_bearer(headers, jwt_secret)?;
     let email = match claims.email.clone() {
@@ -92,12 +103,11 @@ pub async fn require_staff(
             })?,
     };
 
-    if is_admin_email(&email) {
-        return Ok(AdminAuth { email });
-    }
-
-    let roles = staff_roles_for_email(graph, &email).await?;
-    if roles.iter().any(|r| !r.trim().is_empty()) {
+    let authorization = staff_authorization_for_subject(graph, &claims.sub).await?;
+    if payment_evidence_roles_allowed(&authorization.roles)
+        && tenant_scope_allowed(&authorization, tenant_id)
+        || nonprod_admin_email_fallback_enabled() && is_admin_email(&email)
+    {
         return Ok(AdminAuth { email });
     }
     Err((StatusCode::FORBIDDEN, "Staff access required".to_string()))
@@ -107,6 +117,18 @@ pub async fn require_staff(
 /// Deliberately excludes marketing (any level) and admissions staff — they
 /// can submit evidence via `require_staff`, never confirm it.
 const FINANCE_APPROVE_ROLES: &[&str] = &["finance_admin", "finance_approver", "owner"];
+const PAYMENT_ADMIN_ROLES: &[&str] = &["finance_admin", "owner", "school_admin"];
+const PAYMENT_EVIDENCE_ROLES: &[&str] = &[
+    "admissions_staff",
+    "admissions_manager",
+    "admissions_admin",
+    "marketing_staff",
+    "marketing_manager",
+    "finance_approver",
+    "finance_admin",
+    "owner",
+    "school_admin",
+];
 
 /// Roles allowed to VIEW the payment review queue/detail/proofs. Superset of
 /// the approve roles: admissions managers can look (they track applications
@@ -121,14 +143,13 @@ const FINANCE_VIEW_ROLES: &[&str] = &[
 
 /// Role-aware finance gate. `approve = true` for the money-mutating review
 /// endpoint; `false` for read surfaces (queue, detail, proof download).
-/// Accepts the ADMIN_EMAILS allowlist OR a matching active role from the
-/// shared graph — so finance staff work from their role alone, without
-/// needing an env-var entry per person.
+/// Accepts a matching active role from the shared graph.
 pub async fn require_finance(
     graph: &Graph,
     headers: &HeaderMap,
     jwt_secret: &str,
     approve: bool,
+    tenant_id: &str,
 ) -> Result<AdminAuth, (StatusCode, String)> {
     let claims = claims_from_bearer(headers, jwt_secret)?;
     let email = match claims.email.clone() {
@@ -144,12 +165,11 @@ pub async fn require_finance(
             })?,
     };
 
-    if !approve && is_admin_email(&email) {
-        return Ok(AdminAuth { email });
-    }
-
-    let roles = staff_roles_for_email(graph, &email).await?;
-    if finance_roles_allowed(&roles, approve) {
+    let authorization = staff_authorization_for_subject(graph, &claims.sub).await?;
+    if finance_roles_allowed(&authorization.roles, approve)
+        && tenant_scope_allowed(&authorization, tenant_id)
+        || nonprod_admin_email_fallback_enabled() && is_admin_email(&email)
+    {
         return Ok(AdminAuth { email });
     }
     Err((
@@ -171,27 +191,46 @@ fn finance_roles_allowed(roles: &[String], approve: bool) -> bool {
     roles.iter().any(|role| allowed.contains(&role.as_str()))
 }
 
-/// Active staff roles for an email from the shared graph (empty when the
-/// StaffProfile is suspended — deactivation bites here too).
-async fn staff_roles_for_email(
+fn payment_admin_roles_allowed(roles: &[String]) -> bool {
+    roles
+        .iter()
+        .any(|role| PAYMENT_ADMIN_ROLES.contains(&role.as_str()))
+}
+
+fn payment_evidence_roles_allowed(roles: &[String]) -> bool {
+    roles
+        .iter()
+        .any(|role| PAYMENT_EVIDENCE_ROLES.contains(&role.as_str()))
+}
+
+/// Active staff roles for an email from the shared graph. Auth's canonical
+/// StaffMember projection wins when present; invited, suspended, and
+/// deactivated users all resolve to no roles.
+async fn staff_authorization_for_subject(
     graph: &Graph,
-    email: &str,
-) -> Result<Vec<String>, (StatusCode, String)> {
+    subject: &str,
+) -> Result<StaffAuthorization, (StatusCode, String)> {
     let q = Query::new(
-        "MATCH (u:User) WHERE toLower(u.email) = toLower($email) \
-         OPTIONAL MATCH (u)-[:STAFF_PROFILE]->(s:StaffProfile) \
-         RETURN CASE WHEN s IS NOT NULL AND s.status = 'suspended' THEN [] \
-                     ELSE coalesce(u.marketingRoles, u.roles, []) END AS roles LIMIT 1"
+        "MATCH (u:User {id:$subject}) \
+         OPTIONAL MATCH (u)-[:STAFF_MEMBER]->(member:StaffMember) \
+         OPTIONAL MATCH (u)-[:STAFF_PROFILE]->(profile:StaffProfile) \
+         RETURN CASE \
+           WHEN member IS NOT NULL THEN CASE WHEN member.membershipStatus = 'ACTIVE' THEN coalesce(member.roles,[]) ELSE [] END \
+           WHEN profile IS NOT NULL THEN CASE WHEN toLower(profile.status) = 'active' THEN coalesce(profile.roles,u.roles,[]) ELSE [] END \
+           WHEN toLower(coalesce(u.staffStatus,'')) = 'active' THEN coalesce(u.roles,[]) \
+           ELSE [] END AS roles, \
+           CASE WHEN member IS NOT NULL THEN coalesce(member.tenantIds,[]) ELSE coalesce(profile.tenant_ids,u.staffTenantIds,[]) END AS tenantIds, \
+           CASE WHEN member IS NOT NULL THEN coalesce(member.schoolIds,[]) ELSE coalesce(profile.school_ids,u.staffSchoolIds,[]) END AS schoolIds LIMIT 1"
             .to_string(),
     )
-    .param("email", email.to_string());
+    .param("subject", subject.to_string());
     let mut res = graph.execute(q).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("staff role lookup: {e}"),
         )
     })?;
-    Ok(res
+    let row = res
         .next()
         .await
         .map_err(|e| {
@@ -199,9 +238,23 @@ async fn staff_roles_for_email(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("staff role row: {e}"),
             )
-        })?
-        .and_then(|row| row.get::<Vec<String>>("roles"))
+        })?;
+    Ok(row
+        .map(|row| StaffAuthorization {
+            roles: row.get::<Vec<String>>("roles").unwrap_or_default(),
+            tenant_ids: row.get::<Vec<String>>("tenantIds").unwrap_or_default(),
+            school_ids: row.get::<Vec<String>>("schoolIds").unwrap_or_default(),
+        })
         .unwrap_or_default())
+}
+
+fn tenant_scope_allowed(authorization: &StaffAuthorization, required_tenant: &str) -> bool {
+    authorization.roles.iter().any(|role| role == "owner")
+        || (!authorization.school_ids.is_empty()
+            && authorization
+                .tenant_ids
+                .iter()
+                .any(|tenant| tenant == required_tenant))
 }
 
 pub fn owns_lead(auth: &ParentAuth, lead_id: Option<&str>) -> bool {
@@ -245,6 +298,20 @@ fn is_admin_email(email: &str) -> bool {
         .split(',')
         .map(|s| s.trim().to_lowercase())
         .any(|e| !e.is_empty() && e == requester)
+}
+
+fn nonprod_admin_email_fallback_enabled() -> bool {
+    let enabled = std::env::var("PAYMENT_NONPROD_ADMIN_EMAIL_FALLBACK_ENABLED")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false);
+    enabled
+        && matches!(
+            std::env::var("APP_ENV")
+                .unwrap_or_else(|_| "local".to_string())
+                .as_str(),
+            "local" | "dev" | "test"
+        )
 }
 
 async fn resolve_owned_leads(
@@ -335,7 +402,10 @@ async fn resolve_email_for_subject(graph: &Graph, subject: &str) -> Result<Optio
 
 #[cfg(test)]
 mod tests {
-    use super::finance_roles_allowed;
+    use super::{
+        finance_roles_allowed, payment_admin_roles_allowed, payment_evidence_roles_allowed,
+        tenant_scope_allowed, StaffAuthorization,
+    };
 
     fn roles(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -348,5 +418,39 @@ mod tests {
         assert!(!finance_roles_allowed(&admissions, true));
         assert!(finance_roles_allowed(&roles(&["finance_approver"]), true));
         assert!(finance_roles_allowed(&roles(&["owner"]), true));
+    }
+
+    #[test]
+    fn payment_administration_requires_an_explicit_canonical_role() {
+        assert!(payment_admin_roles_allowed(&roles(&["owner"])));
+        assert!(payment_admin_roles_allowed(&roles(&["finance_admin"])));
+        assert!(payment_admin_roles_allowed(&roles(&["school_admin"])));
+        assert!(!payment_admin_roles_allowed(&roles(&["finance_approver"])));
+        assert!(!payment_admin_roles_allowed(&roles(&[])));
+    }
+
+    #[test]
+    fn payment_evidence_submission_excludes_unrelated_staff_roles() {
+        assert!(payment_evidence_roles_allowed(&roles(&["marketing_staff"])));
+        assert!(payment_evidence_roles_allowed(&roles(&["admissions_staff"])));
+        assert!(payment_evidence_roles_allowed(&roles(&["finance_approver"])));
+        assert!(!payment_evidence_roles_allowed(&roles(&["teacher"])));
+        assert!(!payment_evidence_roles_allowed(&roles(&["attendance_employee"])));
+    }
+
+    #[test]
+    fn tenant_scope_is_explicit_except_for_owner() {
+        let scoped = StaffAuthorization {
+            roles: roles(&["finance_admin"]),
+            tenant_ids: roles(&["tenant-a"]),
+            school_ids: roles(&["school-a"]),
+        };
+        assert!(tenant_scope_allowed(&scoped, "tenant-a"));
+        assert!(!tenant_scope_allowed(&scoped, "tenant-b"));
+        let owner = StaffAuthorization {
+            roles: roles(&["owner"]),
+            ..Default::default()
+        };
+        assert!(tenant_scope_allowed(&owner, "tenant-b"));
     }
 }

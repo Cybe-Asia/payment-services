@@ -74,7 +74,9 @@ pub async fn update_fee_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    if let Err((status, msg)) = auth::require_admin(&graph, &headers, &state.jwt_secret).await {
+    if let Err((status, msg)) =
+        auth::require_admin(&graph, &headers, &state.jwt_secret, &state.tenant_id).await
+    {
         return fail(status, &msg);
     }
     let school_id = match school_repository::find_school_id_by_code(

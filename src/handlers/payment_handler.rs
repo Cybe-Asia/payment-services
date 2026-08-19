@@ -301,7 +301,7 @@ pub async fn reconcile_doku_payment_handler(
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
     if let Err((status, message)) =
-        auth::require_finance(&graph, &headers, &state.jwt_secret, true).await
+        auth::require_finance(&graph, &headers, &state.jwt_secret, true, &state.tenant_id).await
     {
         return fail(status, &message);
     }
@@ -726,7 +726,7 @@ pub async fn admin_assist_manual_payment_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    let staff = match auth::require_staff(&graph, &headers, &state.jwt_secret).await {
+    let staff = match auth::require_staff(&graph, &headers, &state.jwt_secret, &state.tenant_id).await {
         Ok(auth) => auth,
         Err((status, msg)) => return fail(status, &msg),
     };
@@ -799,7 +799,7 @@ pub async fn admin_assist_proof_handler(
             "Object storage not configured",
         );
     };
-    let staff = match auth::require_staff(&graph, &headers, &state.jwt_secret).await {
+    let staff = match auth::require_staff(&graph, &headers, &state.jwt_secret, &state.tenant_id).await {
         Ok(auth) => auth,
         Err((status, msg)) => return fail(status, &msg),
     };
@@ -976,7 +976,9 @@ pub async fn admin_get_payment_settings_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    if let Err((status, msg)) = auth::require_admin(&graph, &headers, &state.jwt_secret).await {
+    if let Err((status, msg)) =
+        auth::require_admin(&graph, &headers, &state.jwt_secret, &state.tenant_id).await
+    {
         return fail(status, &msg);
     }
     match payment_service::get_payment_settings(&graph, &state.payment_settings_seed).await {
@@ -999,7 +1001,7 @@ pub async fn admin_update_payment_settings_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    let admin = match auth::require_admin(&graph, &headers, &state.jwt_secret).await {
+    let admin = match auth::require_admin(&graph, &headers, &state.jwt_secret, &state.tenant_id).await {
         Ok(admin) => admin,
         Err((status, msg)) => return fail(status, &msg),
     };
@@ -1064,7 +1066,7 @@ pub async fn admin_payment_reviews_handler(
     // View gate: finance roles (+ admissions managers) work this queue from
     // their role alone — no ADMIN_EMAILS entry needed.
     if let Err((status, msg)) =
-        auth::require_finance(&graph, &headers, &state.jwt_secret, false).await
+        auth::require_finance(&graph, &headers, &state.jwt_secret, false, &state.tenant_id).await
     {
         return fail(status, &msg);
     }
@@ -1127,7 +1129,7 @@ pub async fn admin_payment_review_detail_handler(
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
     if let Err((status, msg)) =
-        auth::require_finance(&graph, &headers, &state.jwt_secret, false).await
+        auth::require_finance(&graph, &headers, &state.jwt_secret, false, &state.tenant_id).await
     {
         return fail(status, &msg);
     }
@@ -1155,7 +1157,15 @@ pub async fn admin_review_manual_payment_handler(
     };
     // Approve gate: strictly finance + full-admin-like roles. Marketing and
     // admissions staff can submit evidence but never confirm money.
-    let admin = match auth::require_finance(&graph, &headers, &state.jwt_secret, true).await {
+    let admin = match auth::require_finance(
+        &graph,
+        &headers,
+        &state.jwt_secret,
+        true,
+        &state.tenant_id,
+    )
+    .await
+    {
         Ok(admin) => admin,
         Err((status, msg)) => return fail(status, &msg),
     };
@@ -1232,7 +1242,13 @@ pub async fn download_payment_proof_handler(
         }
     };
 
-    let is_finance_viewer = auth::require_finance(&graph, &headers, &state.jwt_secret, false)
+    let is_finance_viewer = auth::require_finance(
+        &graph,
+        &headers,
+        &state.jwt_secret,
+        false,
+        &state.tenant_id,
+    )
         .await
         .is_ok();
     if !is_finance_viewer {

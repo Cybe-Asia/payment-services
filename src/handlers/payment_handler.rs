@@ -410,7 +410,8 @@ pub async fn create_manual_payment_handler(
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
 
-    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+    let parent = match auth::require_parent_payment_auth(&graph, &headers, &state.jwt_secret).await
+    {
         Ok(auth) => auth,
         Err((status, msg)) => return fail(status, &msg),
     };
@@ -492,7 +493,8 @@ pub async fn upload_manual_proof_handler(
         );
     };
 
-    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+    let parent = match auth::require_parent_payment_auth(&graph, &headers, &state.jwt_secret).await
+    {
         Ok(auth) => auth,
         Err((status, msg)) => return fail(status, &msg),
     };
@@ -1252,10 +1254,11 @@ pub async fn download_payment_proof_handler(
         .await
         .is_ok();
     if !is_finance_viewer {
-        let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
-            Ok(parent) => parent,
-            Err((status, msg)) => return fail(status, &msg),
-        };
+        let parent =
+            match auth::require_parent_payment_auth(&graph, &headers, &state.jwt_secret).await {
+                Ok(parent) => parent,
+                Err((status, msg)) => return fail(status, &msg),
+            };
         if !auth::owns_lead(&parent, proof.2.as_deref()) {
             return fail(
                 StatusCode::FORBIDDEN,

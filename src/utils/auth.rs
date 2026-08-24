@@ -1,7 +1,7 @@
 use axum::http::{HeaderMap, StatusCode};
 use neo4rs::{Graph, Query};
 
-use crate::utils::jwt::{decode_session_claims, Claims};
+use crate::utils::jwt::{decode_parent_payment_claims, decode_session_claims, Claims};
 
 #[derive(Debug, Clone)]
 pub struct ParentAuth {
@@ -28,6 +28,24 @@ pub async fn require_parent_auth(
     jwt_secret: &str,
 ) -> Result<ParentAuth, (StatusCode, String)> {
     let claims = claims_from_bearer(headers, jwt_secret)?;
+    resolve_parent_auth(graph, claims).await
+}
+
+/// Parent auth for manual payment and proof endpoints during onboarding.
+/// Accepts the setup-scoped lead tokens in addition to a full parent session.
+pub async fn require_parent_payment_auth(
+    graph: &Graph,
+    headers: &HeaderMap,
+    jwt_secret: &str,
+) -> Result<ParentAuth, (StatusCode, String)> {
+    let claims = parent_payment_claims_from_bearer(headers, jwt_secret)?;
+    resolve_parent_auth(graph, claims).await
+}
+
+async fn resolve_parent_auth(
+    graph: &Graph,
+    claims: Claims,
+) -> Result<ParentAuth, (StatusCode, String)> {
     let (email, lead_ids) = resolve_owned_leads(graph, &claims)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -275,6 +293,24 @@ fn claims_from_bearer(
         ));
     };
     decode_session_claims(&token, jwt_secret).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Invalid or expired token".to_string(),
+        )
+    })
+}
+
+fn parent_payment_claims_from_bearer(
+    headers: &HeaderMap,
+    jwt_secret: &str,
+) -> Result<Claims, (StatusCode, String)> {
+    let Some(token) = bearer_from(headers) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Missing or invalid Authorization header".to_string(),
+        ));
+    };
+    decode_parent_payment_claims(&token, jwt_secret).map_err(|_| {
         (
             StatusCode::UNAUTHORIZED,
             "Invalid or expired token".to_string(),

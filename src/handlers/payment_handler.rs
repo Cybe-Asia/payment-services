@@ -1,7 +1,8 @@
 use axum::body::Bytes;
 use axum::{
     extract::{Multipart, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use bytes::BytesMut;
@@ -328,16 +329,6 @@ pub async fn reconcile_doku_payment_handler(
     }
 }
 
-#[derive(Serialize, ToSchema)]
-pub struct DownloadUrlResponse {
-    #[serde(rename = "presignedUrl")]
-    pub presigned_url: String,
-    #[serde(rename = "fileName")]
-    pub file_name: String,
-    #[serde(rename = "expiresInSeconds")]
-    pub expires_in_seconds: u64,
-}
-
 #[utoipa::path(post, path = "/api/v1/payments/invoice")]
 pub async fn create_invoice_handler(
     State(state): State<AppState>,
@@ -638,7 +629,7 @@ async fn process_manual_proof_upload(
     hasher.update(&bytes);
     let hash = hex::encode(hasher.finalize());
     match crate::repositories::payment_repository::has_duplicate_proof_hash(
-        &graph,
+        graph,
         &payment_id,
         &hash,
     )
@@ -657,8 +648,12 @@ async fn process_manual_proof_upload(
     let proof_id = format!("PPROOF-{}", Uuid::new_v4());
     let file_name = file_name.unwrap_or_else(|| "payment-proof".to_string());
     let object_key = format!("school-test/payments/{}/{}", payment_id, proof_id);
-    if let Err(e) = minio.put_object(&object_key, &mime, bytes).await {
-        return fail(StatusCode::BAD_GATEWAY, &format!("upload failed: {e}"));
+    if minio
+        .put_encrypted_document(&object_key, bytes)
+        .await
+        .is_err()
+    {
+        return fail(StatusCode::BAD_GATEWAY, "Payment proof upload failed");
     }
 
     let input = CreateProofInput {
@@ -679,12 +674,13 @@ async fn process_manual_proof_upload(
         lead_id: payment.lead_id.as_deref().unwrap_or(""),
     };
 
-    match payment_service::record_manual_proof(&graph, input).await {
+    match payment_service::record_manual_proof(graph, input).await {
         Ok(proof) => (
             StatusCode::OK,
             Json(serde_json::to_value(ApiResponse::success(proof)).unwrap()),
         ),
         Err(e) => {
+            let _ = minio.delete_object(&object_key).await;
             error!("record_manual_proof failed: {e}");
             let status = if e.contains("no longer accepts") {
                 StatusCode::CONFLICT
@@ -1204,15 +1200,16 @@ pub async fn download_payment_proof_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(proof_id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
     let Some(graph) = state.graph.clone() else {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
     };
     let Some(minio) = state.minio.clone() else {
         return fail(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Object storage not configured",
-        );
+            "Payment proof storage is unavailable",
+        )
+        .into_response();
     };
 
     let proof = match crate::repositories::payment_repository::find_payment_proof_object(
@@ -1223,12 +1220,13 @@ pub async fn download_payment_proof_handler(
     .await
     {
         Ok(Some(proof)) => proof,
-        Ok(None) => return fail(StatusCode::NOT_FOUND, "Payment proof not found"),
-        Err(e) => {
+        Ok(None) => return fail(StatusCode::NOT_FOUND, "Payment proof not found").into_response(),
+        Err(_) => {
             return fail(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("proof lookup failed: {e}"),
+                "Payment proof could not be loaded",
             )
+            .into_response()
         }
     };
 
@@ -1238,33 +1236,69 @@ pub async fn download_payment_proof_handler(
     if !is_finance_viewer {
         let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
             Ok(parent) => parent,
-            Err((status, msg)) => return fail(status, &msg),
+            Err((status, msg)) => return fail(status, &msg).into_response(),
         };
-        if !auth::owns_lead(&parent, proof.2.as_deref()) {
+        if !auth::owns_lead(&parent, proof.3.as_deref()) {
             return fail(
                 StatusCode::FORBIDDEN,
                 "Payment proof does not belong to the current session",
-            );
+            )
+            .into_response();
         }
     }
 
-    let ttl = 600;
-    match minio.presigned_get(&proof.0, ttl).await {
-        Ok(url) => {
-            let data = DownloadUrlResponse {
-                presigned_url: url,
-                file_name: proof.1,
-                expires_in_seconds: ttl,
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(ApiResponse::success(data)).unwrap()),
+    let bytes = match minio.get_decrypted_document(&proof.0).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Payment proof is temporarily unavailable",
             )
+            .into_response()
         }
-        Err(e) => fail(
-            StatusCode::BAD_GATEWAY,
-            &format!("download url failed: {e}"),
-        ),
+    };
+    let mut response = (StatusCode::OK, bytes).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&proof.2) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        safe_evidence_filename(&proof.1)
+    );
+    if let Ok(value) = HeaderValue::from_str(&disposition) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+fn safe_evidence_filename(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                Some(character)
+            } else if character.is_whitespace() {
+                Some('_')
+            } else {
+                None
+            }
+        })
+        .take(120)
+        .collect();
+    if sanitized.is_empty() {
+        "payment-proof".to_string()
+    } else {
+        sanitized
     }
 }
 

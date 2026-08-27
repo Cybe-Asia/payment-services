@@ -1475,8 +1475,9 @@ async fn set_application_status_for_lead(
 async fn cascade_students_on_enrolment_paid(graph: &Graph, lead_id: &str) {
     let q = Query::new(
         "MATCH (:Lead {lead_id: $lead_id})-[:HAS_STUDENT]->(s:Student) \
-         WHERE coalesce(s.applicantStatus, '') = 'offer_accepted' \
-         OPTIONAL MATCH (s)-[:HAS_OFFER]->(o:Offer) \
+         MATCH (s)-[:HAS_OFFER]->(o:Offer)-[:ACCEPTED_VIA]->(a:OfferAcceptance) \
+         WHERE coalesce(s.applicantStatus, '') IN ['documents_verified','offer_accepted'] \
+           AND o.status='accepted' AND a.status='accepted' \
          WITH s, o, randomUUID() AS uid, toString(date().year) AS yyyy \
          MERGE (e:EnrolledStudent {applicant_student_id: s.studentId}) \
          ON CREATE SET e.student_id = 'STU-' + uid, \

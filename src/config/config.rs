@@ -26,6 +26,10 @@ pub struct Config {
     pub minio_region: String,
     pub minio_access_key: String,
     pub minio_secret_key: String,
+    pub document_encryption_primary_key_id: String,
+    pub document_encryption_keyring: String,
+    pub document_legacy_plaintext_reads_allowed: bool,
+    pub document_encryption_migrate_on_startup: bool,
     pub manual_transfer_bank_name: String,
     pub manual_transfer_account_name: String,
     pub manual_transfer_account_number: String,
@@ -83,6 +87,16 @@ pub fn load() -> Config {
     let minio_region = env::var("MINIO_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let minio_access_key = env::var("MINIO_ACCESS_KEY").unwrap_or_default();
     let minio_secret_key = env::var("MINIO_SECRET_KEY").unwrap_or_default();
+    let document_encryption_primary_key_id =
+        env::var("DOCUMENT_ENCRYPTION_PRIMARY_KEY_ID").unwrap_or_default();
+    let document_encryption_keyring = env::var("DOCUMENT_ENCRYPTION_KEYRING").unwrap_or_default();
+    let document_legacy_plaintext_reads_allowed =
+        env::var("DOCUMENT_LEGACY_PLAINTEXT_READS_ALLOWED")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let document_encryption_migrate_on_startup = env::var("DOCUMENT_ENCRYPTION_MIGRATE_ON_STARTUP")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let manual_transfer_bank_name = env::var("MANUAL_TRANSFER_BANK_NAME").unwrap_or_default();
     let manual_transfer_account_name = env::var("MANUAL_TRANSFER_ACCOUNT_NAME").unwrap_or_default();
     let manual_transfer_account_number =
@@ -119,6 +133,10 @@ pub fn load() -> Config {
         minio_region,
         minio_access_key,
         minio_secret_key,
+        document_encryption_primary_key_id,
+        document_encryption_keyring,
+        document_legacy_plaintext_reads_allowed,
+        document_encryption_migrate_on_startup,
         manual_transfer_bank_name,
         manual_transfer_account_name,
         manual_transfer_account_number,

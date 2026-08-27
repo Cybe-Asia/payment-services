@@ -2016,6 +2016,7 @@ dependencies = [
  "jsonwebtoken",
  "neo4rs",
  "reqwest",
+ "ring 0.17.14",
  "serde",
  "serde_json",
  "sha2 0.10.9",

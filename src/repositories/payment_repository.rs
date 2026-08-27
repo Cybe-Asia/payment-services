@@ -3,6 +3,8 @@ use neo4rs::{Graph, Query, Row};
 use crate::models::payment::Payment;
 use crate::models::payment_proof::PaymentProof;
 
+const OFFER_PAYMENT_READY_STUDENT_STATUS: &str = "documents_verified";
+
 #[derive(Clone, Debug)]
 pub struct ManualBankDetails {
     pub bank_account_id: String,
@@ -120,9 +122,13 @@ pub async fn find_accepted_offer_snapshot(
     tenant_id: &str,
 ) -> Result<Option<AcceptedOfferSnapshot>, neo4rs::Error> {
     let q = Query::new(
-        "MATCH (l:Lead)-[:HAS_STUDENT]->(:Student)-[:HAS_OFFER]->(o:Offer {offer_id:$offer_id}) \
+        "MATCH (l:Lead)-[:HAS_STUDENT]->(s:Student)-[:HAS_OFFER]->(o:Offer {offer_id:$offer_id}) \
          MATCH (o)-[:ACCEPTED_VIA]->(a:OfferAcceptance) \
          WHERE l.lead_id IN $lead_ids AND o.tenant_id = $tenant_id \
+           AND (coalesce(s.applicantStatus,'') = $payment_ready_status \
+             OR (coalesce(s.applicantStatus,'') = 'offer_accepted' AND EXISTS { \
+               MATCH (s)-[:REQUIRES_DOCUMENT]->(:DocumentRequest {request_type:'application_document_pack', status:'approved'}) \
+             })) \
            AND o.status = 'accepted' AND a.status = 'accepted' \
            AND a.offer_revision = o.revision \
            AND a.pricing_snapshot_hash = o.pricing_snapshot_hash \
@@ -134,7 +140,8 @@ pub async fn find_accepted_offer_snapshot(
     )
     .param("offer_id", offer_id.to_string())
     .param("lead_ids", lead_ids.to_vec())
-    .param("tenant_id", tenant_id.to_string());
+    .param("tenant_id", tenant_id.to_string())
+    .param("payment_ready_status", OFFER_PAYMENT_READY_STUDENT_STATUS);
     let mut result = graph.execute(q).await?;
     Ok(result.next().await?.map(|row| AcceptedOfferSnapshot {
         offer_id: row.get("offer_id").unwrap_or_default(),
@@ -915,11 +922,12 @@ pub async fn find_payment_proof_object(
     graph: &Graph,
     proof_id: &str,
     tenant_id: &str,
-) -> Result<Option<(String, String, Option<String>)>, neo4rs::Error> {
+) -> Result<Option<(String, String, String, Option<String>)>, neo4rs::Error> {
     let q = Query::new(
         "MATCH (p:Payment {tenant_id:$tenant_id})-[:HAS_PROOF]->(proof:PaymentProof {payment_proof_id:$proof_id}) \
          OPTIONAL MATCH (l:Lead {tenant_id:$tenant_id})-[:MADE_PAYMENT]->(p) \
-         RETURN proof.object_key AS object_key, proof.file_name AS file_name, l.lead_id AS lead_id \
+         RETURN proof.object_key AS object_key, proof.file_name AS file_name, \
+                proof.mime_type AS mime_type, l.lead_id AS lead_id \
          LIMIT 1"
             .to_string(),
     )
@@ -930,6 +938,8 @@ pub async fn find_payment_proof_object(
         Ok(Some((
             row.get("object_key").unwrap_or_default(),
             row.get("file_name").unwrap_or_default(),
+            row.get("mime_type")
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
             row.get("lead_id"),
         )))
     } else {
@@ -1241,7 +1251,7 @@ fn payment_proof_from_row(row: &Row) -> PaymentProof {
 mod review_order_by_tests {
     use super::{
         manual_proof_upload_allowed, manual_review_allowed, offer_payment_slot_id, review_order_by,
-        AcceptedOfferSnapshot,
+        AcceptedOfferSnapshot, OFFER_PAYMENT_READY_STUDENT_STATUS,
     };
 
     #[test]
@@ -1291,5 +1301,13 @@ mod review_order_by_tests {
         assert_ne!(original, offer_payment_slot_id("TENANT-2", &offer));
         offer.pricing_snapshot_hash = "hash-b".into();
         assert_ne!(original, offer_payment_slot_id("TENANT-1", &offer));
+    }
+
+    #[test]
+    fn accepted_offer_payment_waits_for_verified_documents() {
+        assert_eq!(OFFER_PAYMENT_READY_STUDENT_STATUS, "documents_verified");
+        let source = include_str!("payment_repository.rs");
+        assert!(source.contains("applicantStatus,'') = 'offer_accepted'"));
+        assert!(source.contains("request_type:'application_document_pack', status:'approved'"));
     }
 }

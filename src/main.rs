@@ -27,6 +27,7 @@ use config::config::load;
 use database::neo4j::create_graph;
 use repositories::payment_settings_repository::PaymentSettingsSeed;
 use repositories::seed::seed_fees;
+use services::document_encryption::DocumentCipher;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -120,8 +121,32 @@ async fn main() {
                 && !access.is_empty()
                 && !secret.is_empty() =>
         {
+            let document_cipher = DocumentCipher::from_hex_keyring(
+                &cfg.document_encryption_primary_key_id,
+                &cfg.document_encryption_keyring,
+                cfg.document_legacy_plaintext_reads_allowed,
+            )
+            .unwrap_or_else(|error| {
+                panic!("MinIO is configured but document encryption is invalid: {error}")
+            });
             info!(endpoint=%endpoint, bucket=%bucket, "minio client configured for payment proofs");
-            Some(MinioClient::new(endpoint, &cfg.minio_region, access, secret, bucket).await)
+            let client = MinioClient::new(
+                endpoint,
+                &cfg.minio_region,
+                access,
+                secret,
+                bucket,
+                document_cipher,
+            )
+            .await;
+            if cfg.document_encryption_migrate_on_startup {
+                let migrated = client
+                    .migrate_legacy_documents("school-test/payments/")
+                    .await
+                    .expect("payment evidence encryption migration failed");
+                info!(migrated, "legacy payment evidence encrypted");
+            }
+            Some(client)
         }
         _ => {
             info!("minio client NOT configured (manual proof upload returns 503)");

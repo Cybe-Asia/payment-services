@@ -1478,6 +1478,7 @@ async fn cascade_students_on_enrolment_paid(graph: &Graph, lead_id: &str) {
          MATCH (s)-[:HAS_OFFER]->(o:Offer)-[:ACCEPTED_VIA]->(a:OfferAcceptance) \
          WHERE coalesce(s.applicantStatus, '') IN ['documents_verified','offer_accepted'] \
            AND o.status='accepted' AND a.status='accepted' \
+           AND EXISTS { MATCH (s)-[:REQUIRES_DOCUMENT]->(:DocumentRequest {request_type:'application_document_pack',status:'approved'}) } \
          WITH s, o, randomUUID() AS uid, toString(date().year) AS yyyy \
          MERGE (e:EnrolledStudent {applicant_student_id: s.studentId}) \
          ON CREATE SET e.student_id = 'STU-' + uid, \

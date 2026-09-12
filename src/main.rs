@@ -181,6 +181,10 @@ async fn main() {
         payment_settings_seed,
     };
 
+    if std::env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true") {
+        services::invoice_notification::start_worker(state.clone());
+    }
+
     let app: Router = Router::new()
         .route("/api/v1/payments/health", get(health_check))
         .merge(routes::payment_routes::routes())

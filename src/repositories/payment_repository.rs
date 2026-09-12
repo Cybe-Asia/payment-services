@@ -175,7 +175,7 @@ pub async fn upsert_doku_pending(
          MATCH (o)-[:HAS_PAYMENT_SLOT]->(slot:OfferPaymentSlot {payment_id:$payment_id, payment_method:'doku'}) \
          WHERE slot.pricing_snapshot_hash=$snapshot_hash \
          OPTIONAL MATCH (o)-[:PAID_VIA]->(active:Payment) \
-         WHERE active.status NOT IN ['expired','failed','cancelled'] \
+         WHERE NOT active.status IN ['expired','failed','cancelled'] \
          WITH l, o, [payment IN collect(active) WHERE payment IS NOT NULL] AS active_payments \
          WHERE size(active_payments) = 0 OR all(payment IN active_payments WHERE payment.payment_id = $payment_id) \
          MERGE (f:FeeObligation {offer_id:$offer_id, obligation_type:'offer_due_now'}) \
@@ -183,7 +183,7 @@ pub async fn upsert_doku_pending(
             f.amount_due=$amount, f.currency=$currency, f.status='outstanding', \
             f.pricing_snapshot_hash=$snapshot_hash, f.created_at=datetime() \
          MERGE (p:Payment {payment_id:$payment_id}) \
-         ON CREATE SET p.tenant_id=$tenant_id, p.payment_type='offer_due_now', \
+         ON CREATE SET p.invoice_email_status='queued', p.tenant_id=$tenant_id, p.payment_type='offer_due_now', \
             p.status='pending', p.amount=$amount, p.net_amount=$amount, p.currency=$currency, \
             p.payment_method='doku', p.provider='doku', p.invoice_ref=$invoice_number, \
             p.gateway_ref=$token_id, p.doku_session_id=$session_id, p.doku_request_id=$request_id, \
@@ -241,7 +241,7 @@ pub async fn upsert_offer_manual_pending(
          MATCH (o)-[:HAS_PAYMENT_SLOT]->(slot:OfferPaymentSlot {payment_id:$payment_id, payment_method:'manual_transfer'}) \
          WHERE slot.pricing_snapshot_hash=$snapshot_hash \
          OPTIONAL MATCH (o)-[:PAID_VIA]->(active:Payment) \
-         WHERE active.status NOT IN ['expired','failed','cancelled'] \
+         WHERE NOT active.status IN ['expired','failed','cancelled'] \
          WITH l, o, [candidate IN collect(active) WHERE candidate IS NOT NULL] AS active_payments \
          WHERE size(active_payments) = 0 OR all(candidate IN active_payments WHERE candidate.payment_id=$payment_id) \
          MERGE (f:FeeObligation {offer_id:$offer_id, obligation_type:'offer_due_now'}) \
@@ -249,7 +249,7 @@ pub async fn upsert_offer_manual_pending(
             f.amount_due=$amount, f.currency=$currency, f.status='outstanding', \
             f.pricing_snapshot_hash=$snapshot_hash, f.created_at=datetime() \
          MERGE (p:Payment {payment_id:$payment_id}) \
-         ON CREATE SET p.tenant_id=$tenant_id, p.payment_type='offer_due_now', \
+         ON CREATE SET p.invoice_email_status='queued', p.tenant_id=$tenant_id, p.payment_type='offer_due_now', \
             p.status='awaiting_proof', p.amount=$amount, p.net_amount=$amount, \
             p.currency=$currency, p.payment_method='manual_transfer', p.provider='manual_transfer', \
             p.manual_reference=$manual_reference, \
@@ -479,7 +479,7 @@ pub async fn create_pending(
         "MATCH (l:Lead {lead_id:$lead_id}), (f:FeeObligation {fee_obligation_id:$fid}) \
          CREATE (p:Payment { \
             payment_id:$payment_id, tenant_id:$tenant_id, payment_type:$payment_type, \
-            status:'pending', amount:$amount, currency:$currency, \
+            status:'pending', invoice_email_status:'queued', amount:$amount, currency:$currency, \
             gross_amount:$gross_amount, discount_amount:$discount_amount, net_amount:$amount, \
             promotion_code:$promotion_code, promotion_rule_id:$promotion_rule_id, \
             promotion_snapshot_json:$promotion_snapshot_json, line_items_json:$line_items_json, \
@@ -545,7 +545,7 @@ pub async fn create_manual_pending(
         "MATCH (l:Lead {lead_id:$lead_id}), (f:FeeObligation {fee_obligation_id:$fid}) \
          CREATE (p:Payment { \
             payment_id:$payment_id, tenant_id:$tenant_id, payment_type:$payment_type, \
-            status:'awaiting_proof', amount:$amount, currency:$currency, \
+            status:'awaiting_proof', invoice_email_status:'queued', amount:$amount, currency:$currency, \
             gross_amount:$gross_amount, discount_amount:$discount_amount, net_amount:$amount, \
             promotion_code:$promotion_code, promotion_rule_id:$promotion_rule_id, \
             promotion_snapshot_json:$promotion_snapshot_json, line_items_json:$line_items_json, \

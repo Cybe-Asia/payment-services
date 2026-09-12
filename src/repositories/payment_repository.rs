@@ -35,6 +35,8 @@ pub struct CreateProofInput<'a> {
 
 #[derive(Clone, Debug)]
 pub struct AcceptedOfferSnapshot {
+    pub auto_generated: bool,
+    pub bank_account_id: String,
     pub offer_id: String,
     pub offer_revision: i64,
     pub lead_id: String,
@@ -124,7 +126,7 @@ pub async fn find_accepted_offer_snapshot(
     let q = Query::new(
         "MATCH (l:Lead)-[:HAS_STUDENT]->(s:Student)-[:HAS_OFFER]->(o:Offer {offer_id:$offer_id}) \
          MATCH (o)-[:ACCEPTED_VIA]->(a:OfferAcceptance) \
-         WHERE l.lead_id IN $lead_ids AND o.tenant_id = $tenant_id \
+         WHERE l.lead_id IN $lead_ids AND l.tenant_id = $tenant_id AND o.tenant_id = $tenant_id \
            AND (coalesce(s.applicantStatus,'') = $payment_ready_status \
              OR (coalesce(s.applicantStatus,'') = 'offer_accepted' AND EXISTS { \
                MATCH (s)-[:REQUIRES_DOCUMENT]->(:DocumentRequest {request_type:'application_document_pack', status:'approved'}) \
@@ -135,7 +137,7 @@ pub async fn find_accepted_offer_snapshot(
            AND a.terms_hash = o.terms_hash \
          RETURN o.offer_id AS offer_id, o.revision AS offer_revision, l.lead_id AS lead_id, \
                 o.pricing_snapshot_hash AS pricing_snapshot_hash, \
-                o.pricing_snapshot_json AS pricing_snapshot_json LIMIT 1"
+                o.pricing_snapshot_json AS pricing_snapshot_json, coalesce(o.auto_generated,false) AS auto_generated, coalesce(o.bank_account_id,'') AS bank_account_id LIMIT 1"
             .to_string(),
     )
     .param("offer_id", offer_id.to_string())
@@ -144,6 +146,8 @@ pub async fn find_accepted_offer_snapshot(
     .param("payment_ready_status", OFFER_PAYMENT_READY_STUDENT_STATUS);
     let mut result = graph.execute(q).await?;
     Ok(result.next().await?.map(|row| AcceptedOfferSnapshot {
+        auto_generated: row.get("auto_generated").unwrap_or(false),
+        bank_account_id: row.get("bank_account_id").unwrap_or_default(),
         offer_id: row.get("offer_id").unwrap_or_default(),
         offer_revision: row.get("offer_revision").unwrap_or(1),
         lead_id: row.get("lead_id").unwrap_or_default(),
@@ -1290,6 +1294,8 @@ mod review_order_by_tests {
     #[test]
     fn payment_slot_is_bound_to_tenant_offer_revision_and_snapshot() {
         let mut offer = AcceptedOfferSnapshot {
+            auto_generated: false,
+            bank_account_id: String::new(),
             offer_id: "OFF-1".into(),
             offer_revision: 2,
             lead_id: "LEAD-1".into(),

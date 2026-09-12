@@ -182,6 +182,9 @@ async fn main() {
     };
 
     if std::env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true") {
+        if std::env::var("ADMISSIONS_AUTOMATION_ENABLED").as_deref() == Ok("true") {
+            services::automatic_offer_invoice::start_worker(state.clone());
+        }
         services::invoice_notification::start_worker(state.clone());
         services::receipt_notification::start_worker(state.clone());
     }

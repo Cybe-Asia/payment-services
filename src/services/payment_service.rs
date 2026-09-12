@@ -120,6 +120,9 @@ pub async fn create_doku_checkout(
     }
     let (offer, pricing) =
         accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
+    if offer.auto_generated {
+        return Err("This offer uses its configured automatic bank invoice".into());
+    }
     let settings = get_payment_settings(graph, seed).await?;
     if !settings.doku_enabled {
         return Err("DOKU offer payment is disabled by the school".into());
@@ -328,6 +331,17 @@ pub async fn create_offer_manual_payment(
         });
     }
 
+    let manual_bank_account_id = if offer.auto_generated {
+        if offer.bank_account_id.is_empty() {
+            return Err("Automatic offer bank account is missing".into());
+        }
+        if manual_bank_account_id.is_some_and(|id| id != offer.bank_account_id) {
+            return Err("Bank account does not match this offer".into());
+        }
+        Some(offer.bank_account_id.as_str())
+    } else {
+        manual_bank_account_id
+    };
     let bank = resolve_manual_bank_details(&settings, manual_bank_account_id)?;
     let due_at = Utc::now() + Duration::hours(default_due_hours.max(1));
     let manual_reference = format!("OFFER-{}", &idempotency_hash[..10].to_uppercase());

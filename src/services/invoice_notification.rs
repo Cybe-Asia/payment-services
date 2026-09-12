@@ -89,7 +89,7 @@ async fn deliver_batch(
             payment_repository::find_by_id_for_tenant(graph, &id, &state.tenant_id).await?;
         let sent = if let Some(payment) = payment.filter(|_| !email.trim().is_empty()) {
             let (subject, body) = invoice_content(&payment, &state.frontend_url);
-            let html=crate::utils::branded_email::branded_html(&body,&state.frontend_url);
+            let html = crate::utils::branded_email::branded_html(&body, &state.frontend_url);
             client.post(format!("{}/api/email/v1/send",state.notification_service_url.trim_end_matches('/')))
                 .json(&serde_json::json!({"idempotencyKey":format!("invoice:{}:{}:email",state.tenant_id,id),"email":email,"subject":subject,"body":body,"html":html}))
                 .send().await.map(|r|r.status().is_success()).unwrap_or(false)
@@ -137,6 +137,8 @@ mod tests {
         let invoice_id = format!("invoice-{id}");
         graph.run(query("MATCH (l:Lead {tenant_id:$id}) SET l.lead_id=$id CREATE (o:Offer {offer_id:$offer,tenant_id:$id,status:'accepted',revision:1,pricing_snapshot_hash:'synthetic-hash'})-[:HAS_PAYMENT_SLOT]->(:OfferPaymentSlot {payment_id:$payment,payment_method:'manual_transfer',pricing_snapshot_hash:'synthetic-hash',tenant_id:$id})").param("id",id.clone()).param("offer",offer_id.clone()).param("payment",invoice_id.clone())).await.unwrap();
         let offer = payment_repository::AcceptedOfferSnapshot {
+            auto_generated: false,
+            bank_account_id: String::new(),
             offer_id,
             offer_revision: 1,
             lead_id: id.clone(),

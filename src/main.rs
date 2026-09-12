@@ -183,6 +183,7 @@ async fn main() {
 
     if std::env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true") {
         services::invoice_notification::start_worker(state.clone());
+        services::receipt_notification::start_worker(state.clone());
     }
 
     let app: Router = Router::new()

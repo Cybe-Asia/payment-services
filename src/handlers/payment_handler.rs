@@ -1507,6 +1507,12 @@ async fn queue_payment_status_notification(
         };
 
     for channel in channels {
+        // The durable paid receipt replaces the old fire-and-forget approval email.
+        if event == "payment_approved" && payment.payment_type == "application_fee"
+            && channel == payment_service::NOTIFICATION_CHANNEL_EMAIL
+            && std::env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true") {
+            continue;
+        }
         if channel == payment_service::NOTIFICATION_CHANNEL_EMAIL && context.email.trim().is_empty()
         {
             warn!(

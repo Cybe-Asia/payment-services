@@ -1,3 +1,5 @@
 pub mod auth;
 pub mod jwt;
 pub mod response;
+
+pub mod branded_email;

@@ -89,8 +89,9 @@ async fn deliver_batch(
             payment_repository::find_by_id_for_tenant(graph, &id, &state.tenant_id).await?;
         let sent = if let Some(payment) = payment.filter(|_| !email.trim().is_empty()) {
             let (subject, body) = invoice_content(&payment, &state.frontend_url);
+            let html=crate::utils::branded_email::branded_html(&body,&state.frontend_url);
             client.post(format!("{}/api/email/v1/send",state.notification_service_url.trim_end_matches('/')))
-                .json(&serde_json::json!({"idempotencyKey":format!("invoice:{}:{}:email",state.tenant_id,id),"email":email,"subject":subject,"body":body}))
+                .json(&serde_json::json!({"idempotencyKey":format!("invoice:{}:{}:email",state.tenant_id,id),"email":email,"subject":subject,"body":body,"html":html}))
                 .send().await.map(|r|r.status().is_success()).unwrap_or(false)
         } else {
             false

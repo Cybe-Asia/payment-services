@@ -334,7 +334,8 @@ pub async fn apply_doku_webhook(
          SET p.status = CASE WHEN $status='paid' AND p.status='pending' THEN 'paid' \
                              WHEN $status IN ['expired','failed','cancelled'] AND p.status='pending' THEN $status \
                              ELSE p.status END, \
-             p.paid_at = CASE WHEN $status='paid' AND p.status='pending' THEN datetime() ELSE p.paid_at END, \
+             p.receipt_email_status = CASE WHEN $status='paid' AND previous_status='pending' AND p.payment_type='application_fee' THEN coalesce(p.receipt_email_status,'queued') ELSE p.receipt_email_status END, \
+             p.paid_at = CASE WHEN $status='paid' AND previous_status='pending' THEN datetime() ELSE p.paid_at END, \
              p.receipt_ref = coalesce($provider_reference, p.receipt_ref), p.updated_at=datetime(), \
              r.processed=true, r.processed_at=datetime() \
          WITH p, r, previous_status \
@@ -777,7 +778,9 @@ pub async fn mark_paid(
 ) -> Result<(), neo4rs::Error> {
     let q = Query::new(
         "MATCH (p:Payment {payment_id:$payment_id}) \
-         SET p.status = 'paid', p.paid_at = datetime(), \
+         WITH p, p.status AS previous_status \
+         SET p.status = 'paid', p.paid_at = CASE WHEN previous_status='paid' THEN p.paid_at ELSE datetime() END, \
+             p.receipt_email_status = CASE WHEN previous_status='pending' AND p.payment_type='application_fee' THEN coalesce(p.receipt_email_status,'queued') ELSE p.receipt_email_status END, \
              p.payment_method = coalesce($method, p.payment_method), \
              p.receipt_ref = coalesce($receipt, p.receipt_ref) \
          WITH p \
@@ -1126,7 +1129,7 @@ pub async fn review_manual_payment(
              p.payment_method = 'manual_transfer', \
              p.receipt_ref = CASE WHEN $receipt_ref = '' THEN p.receipt_ref ELSE $receipt_ref END \
          FOREACH (_ IN CASE WHEN $payment_status = 'paid' THEN [1] ELSE [] END | \
-             SET p.paid_at = datetime() \
+             SET p.paid_at = datetime(), p.receipt_email_status = CASE WHEN p.payment_type='application_fee' THEN coalesce(p.receipt_email_status,'queued') ELSE p.receipt_email_status END \
          ) \
          WITH p \
          OPTIONAL MATCH (l:Lead)-[:MADE_PAYMENT]->(p) \

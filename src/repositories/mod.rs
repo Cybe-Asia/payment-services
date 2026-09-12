@@ -7,3 +7,5 @@ pub mod school_repository;
 pub mod seed;
 
 pub mod canonical_staff_repository;
+
+pub mod receipt_notification_repository;

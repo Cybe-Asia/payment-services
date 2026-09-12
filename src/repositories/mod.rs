@@ -5,3 +5,5 @@ pub mod payment_settings_repository;
 pub mod promotion_repository;
 pub mod school_repository;
 pub mod seed;
+
+pub mod canonical_staff_repository;

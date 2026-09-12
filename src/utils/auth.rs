@@ -58,6 +58,13 @@ pub async fn require_admin(
             })?,
     };
 
+    use crate::repositories::canonical_staff_repository::{resolve_admin, CanonicalAdmin};
+    match resolve_admin(graph, &claims.sub).await.map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))? {
+        CanonicalAdmin::Owner(_) => return Ok(AdminAuth { email }),
+        CanonicalAdmin::Denied => return Err((StatusCode::FORBIDDEN, "Admin access required".to_string())),
+        CanonicalAdmin::NotLinked => {}
+    }
+
     if !is_admin_email(&email) {
         return Err((StatusCode::FORBIDDEN, "Admin access required".to_string()));
     }

@@ -1021,6 +1021,8 @@ pub async fn admin_update_payment_settings_handler(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewQueueQuery {
+    #[serde(default)]
+    pub payment_type: String,
     #[serde(default = "default_review_status")]
     pub status: String,
     #[serde(default)]
@@ -1081,7 +1083,11 @@ pub async fn admin_payment_reviews_handler(
             "dateFrom and dateTo must be provided together",
         );
     }
+    if !matches!(q.payment_type.as_str(), "" | "application_fee" | "capital_levy") {
+        return fail(StatusCode::BAD_REQUEST, "Invalid paymentType");
+    }
     let filters = payment_service::PaymentReviewFilters {
+        payment_type: &q.payment_type,
         status: &q.status,
         school: &q.school,
         search: &q.search,

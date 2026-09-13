@@ -425,6 +425,7 @@ pub struct PaymentReviewDetail {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PaymentReviewFilters<'a> {
+    pub payment_type: &'a str,
     pub status: &'a str,
     pub school: &'a str,
     pub search: &'a str,
@@ -437,6 +438,7 @@ pub struct PaymentReviewFilters<'a> {
 
 /// Sortable columns for the manual payment review queue (key → RETURN alias).
 const REVIEW_SORT_COLUMNS: &[(&str, &str)] = &[
+    ("newest", "activity_at"),
     ("parent", "parent_name"),
     ("payment", "payment_type"),
     ("due", "amount"),
@@ -453,9 +455,9 @@ fn review_order_by(sort: &str, dir: &str) -> String {
     match REVIEW_SORT_COLUMNS.iter().find(|(key, _)| *key == sort) {
         Some((_, expr)) => {
             let direction = if dir == "asc" { "ASC" } else { "DESC" };
-            format!("ORDER BY {} {}", expr, direction)
+            if sort == "newest" { format!("ORDER BY {} {}, payment_id DESC", expr, direction) } else { format!("ORDER BY {} {}", expr, direction) }
         }
-        None => "ORDER BY activity_at ASC".to_string(),
+        None => "ORDER BY activity_at DESC, payment_id DESC".to_string(),
     }
 }
 
@@ -966,6 +968,7 @@ pub async fn list_review_rows(
         "MATCH (l:Lead {{tenant_id:$tenant_id}})-[:MADE_PAYMENT]->(p:Payment {{tenant_id:$tenant_id}}) \
          WHERE p.payment_method = 'manual_transfer' \
            AND ($status = '' OR p.status = $status) \
+           AND ($payment_type = '' OR ($payment_type = 'application_fee' AND p.payment_type = 'application_fee') OR ($payment_type = 'capital_levy' AND p.payment_type IN ['offer_due_now', 'enrolment_fee'])) \
            AND ($school = '' OR toLower(coalesce(l.target_school_preference, '')) = toLower($school)) \
            AND ( \
              $search = '' OR \
@@ -996,6 +999,7 @@ pub async fn list_review_rows(
     ))
     .param("tenant_id", tenant_id.to_string())
     .param("status", filters.status.to_string())
+    .param("payment_type", filters.payment_type.to_string())
     .param("school", filters.school.to_string())
     .param("search", filters.search.to_string())
     .param("date_from", filters.date_from.to_string())
@@ -1043,6 +1047,7 @@ pub async fn count_review_rows(
         "MATCH (l:Lead {tenant_id:$tenant_id})-[:MADE_PAYMENT]->(p:Payment {tenant_id:$tenant_id}) \
          WHERE p.payment_method = 'manual_transfer' \
            AND ($status = '' OR p.status = $status) \
+           AND ($payment_type = '' OR ($payment_type = 'application_fee' AND p.payment_type = 'application_fee') OR ($payment_type = 'capital_levy' AND p.payment_type IN ['offer_due_now', 'enrolment_fee'])) \
            AND ($school = '' OR toLower(coalesce(l.target_school_preference, '')) = toLower($school)) \
            AND ( \
              $search = '' OR \
@@ -1060,6 +1065,7 @@ pub async fn count_review_rows(
     )
     .param("tenant_id", tenant_id.to_string())
     .param("status", filters.status.to_string())
+    .param("payment_type", filters.payment_type.to_string())
     .param("school", filters.school.to_string())
     .param("search", filters.search.to_string())
     .param("date_from", filters.date_from.to_string())
@@ -1263,11 +1269,11 @@ mod review_order_by_tests {
 
     #[test]
     fn absent_or_unknown_preserves_default() {
-        assert_eq!(review_order_by("", ""), "ORDER BY activity_at ASC");
+        assert_eq!(review_order_by("", ""), "ORDER BY activity_at DESC, payment_id DESC");
         // Injection attempt is not in the whitelist → default preserved.
         assert_eq!(
             review_order_by("p.x DESC //", "'; DROP"),
-            "ORDER BY activity_at ASC"
+            "ORDER BY activity_at DESC, payment_id DESC"
         );
     }
 
@@ -1318,5 +1324,28 @@ mod review_order_by_tests {
         let source = include_str!("payment_repository.rs");
         assert!(source.contains("applicantStatus,'') = 'offer_accepted'"));
         assert!(source.contains("request_type:'application_document_pack', status:'approved'"));
+    }
+}
+
+#[cfg(test)]
+mod review_queue_contract_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "requires disposable ADMISSIONS_TEST_NEO4J_URI"]
+    async fn review_filters_count_and_newest_order_are_tenant_scoped() {
+        let graph = Graph::new(&std::env::var("ADMISSIONS_TEST_NEO4J_URI").unwrap(), "neo4j", "test").await.unwrap();
+        let tenant = format!("queue-test-{}", uuid::Uuid::new_v4());
+        graph.run(Query::new("UNWIND [{id:'app',kind:'application_fee',day:1},{id:'capital',kind:'offer_due_now',day:3},{id:'legacy',kind:'enrolment_fee',day:2}] AS item CREATE (l:Lead {tenant_id:$tenant,lead_id:item.id,parent_name:'Synthetic',email:'test@example.test'})-[:MADE_PAYMENT]->(:Payment {tenant_id:$tenant,payment_id:item.id,payment_type:item.kind,payment_method:'manual_transfer',status:'pending_verification',amount:1,currency:'IDR',created_at:datetime({year:2026,month:9,day:item.day})})".into()).param("tenant",tenant.clone())).await.unwrap();
+        let filters = PaymentReviewFilters { payment_type:"",status:"pending_verification",school:"",search:"",date_from:"",date_to:"",sort:"newest",sort_dir:"desc" };
+        let all = list_review_rows(&graph,&tenant,filters,50,0).await.unwrap();
+        assert_eq!(all.iter().map(|r| r.payment_id.as_str()).collect::<Vec<_>>(),vec!["capital","legacy","app"]);
+        let capital = PaymentReviewFilters { payment_type:"capital_levy",..filters };
+        assert_eq!(count_review_rows(&graph,&tenant,capital).await.unwrap(),2);
+        assert_eq!(list_review_rows(&graph,&tenant,capital,1,1).await.unwrap()[0].payment_id,"legacy");
+        let app = PaymentReviewFilters { payment_type:"application_fee",..filters };
+        assert_eq!(count_review_rows(&graph,&tenant,app).await.unwrap(),1);
+        assert_eq!(list_review_rows(&graph,&tenant,app,50,0).await.unwrap()[0].payment_id,"app");
+        assert!(list_review_rows(&graph,"other-test-tenant",filters,50,0).await.unwrap().is_empty());
+        graph.run(Query::new("MATCH (n {tenant_id:$tenant}) DETACH DELETE n".into()).param("tenant",tenant)).await.unwrap();
     }
 }

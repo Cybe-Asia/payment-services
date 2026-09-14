@@ -77,6 +77,38 @@ async fn main() {
 
     let cfg = load();
 
+    // Read-only audit exits before graph initialization, seeding or notification workers.
+    if std::env::args().any(|arg| arg == "--audit-document-encryption") {
+        assert!(
+            !cfg.minio_endpoint.is_empty()
+                && !cfg.minio_bucket.is_empty()
+                && !cfg.minio_access_key.is_empty()
+                && !cfg.minio_secret_key.is_empty(),
+            "payment evidence storage is not configured"
+        );
+        let cipher = DocumentCipher::from_hex_keyring(
+            &cfg.document_encryption_primary_key_id,
+            &cfg.document_encryption_keyring,
+            false,
+        )
+        .expect("invalid encryption configuration");
+        let client = MinioClient::new(
+            &cfg.minio_endpoint,
+            &cfg.minio_region,
+            &cfg.minio_access_key,
+            &cfg.minio_secret_key,
+            &cfg.minio_bucket,
+            cipher,
+        )
+        .await;
+        let (verified, _) = client
+            .audit_documents(false)
+            .await
+            .expect("payment evidence audit failed");
+        info!(verified, "payment evidence audit complete");
+        return;
+    }
+
     let graph = match create_graph(&cfg.neo4j_uri, &cfg.neo4j_user, &cfg.neo4j_password).await {
         Ok(g) => {
             let arc = Arc::new(g);
@@ -140,11 +172,11 @@ async fn main() {
             )
             .await;
             if cfg.document_encryption_migrate_on_startup {
-                let migrated = client
-                    .migrate_legacy_documents("school-test/payments/")
+                let (verified, migrated) = client
+                    .audit_documents(true)
                     .await
                     .expect("payment evidence encryption migration failed");
-                info!(migrated, "legacy payment evidence encrypted");
+                info!(verified, migrated, "legacy payment evidence encrypted");
             }
             Some(client)
         }

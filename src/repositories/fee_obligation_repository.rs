@@ -5,6 +5,7 @@ use crate::models::fee::FeeObligation;
 /// Create (or find existing pending) FeeObligation for a lead × obligation_type.
 /// Idempotent: if one already exists with status=pending, return it.
 pub struct FeeObligationUpsert<'a> {
+    pub applicant_student_id: Option<&'a str>,
     pub tenant_id: &'a str,
     pub lead_id: &'a str,
     pub obligation_type: &'a str,
@@ -27,11 +28,11 @@ pub async fn upsert_for_lead(
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$lead_id}) \
          OPTIONAL MATCH (l)-[:OWES]->(existing:FeeObligation { \
-            tenant_id:$tenant_id, obligation_type:$obligation_type, status:'pending' }) \
+            tenant_id:$tenant_id, obligation_type:$obligation_type, status:'pending' }) WHERE coalesce(existing.applicant_student_id,'')=$student \
          WITH l, existing \
          FOREACH (_ IN CASE WHEN existing IS NULL THEN [1] ELSE [] END | \
             CREATE (l)-[:OWES]->(f:FeeObligation { \
-              fee_obligation_id:$new_id, tenant_id:$tenant_id, obligation_type:$obligation_type, \
+              fee_obligation_id:$new_id, applicant_student_id:$student, tenant_id:$tenant_id, obligation_type:$obligation_type, \
               amount_due:$amount_due, gross_amount:$gross_amount, discount_amount:$discount_amount, \
               net_amount:$amount_due, currency:$currency, status:'pending', \
               promotion_code:$promotion_code, promotion_rule_id:$promotion_rule_id, \
@@ -40,7 +41,7 @@ pub async fn upsert_for_lead(
             })) \
          WITH l \
          MATCH (l)-[:OWES]->(f:FeeObligation { \
-            tenant_id:$tenant_id, obligation_type:$obligation_type, status:'pending' }) \
+            tenant_id:$tenant_id, obligation_type:$obligation_type, status:'pending' }) WHERE coalesce(f.applicant_student_id,'')=$student \
          SET f.amount_due = $amount_due, f.gross_amount = $gross_amount, \
              f.discount_amount = $discount_amount, f.net_amount = $amount_due, \
              f.currency = $currency, f.promotion_code = $promotion_code, \
@@ -53,6 +54,7 @@ pub async fn upsert_for_lead(
                 toString(f.due_at) AS due_at \
          LIMIT 1".to_string(),
     )
+    .param("student", input.applicant_student_id.unwrap_or("").to_string())
     .param("lead_id", input.lead_id.to_string())
     .param("tenant_id", input.tenant_id.to_string())
     .param("obligation_type", input.obligation_type.to_string())

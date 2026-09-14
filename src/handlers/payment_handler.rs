@@ -332,6 +332,7 @@ pub async fn reconcile_doku_payment_handler(
 #[utoipa::path(post, path = "/api/v1/payments/invoice")]
 pub async fn create_invoice_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<CreateInvoiceRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if !state.legacy_parent_payments_enabled {
@@ -343,6 +344,13 @@ pub async fn create_invoice_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
+    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+        Ok(parent) => parent,
+        Err((status, msg)) => return fail(status, &msg),
+    };
+    if !auth::owns_admission_target(&graph, &parent, &payload.admission_id, &state.tenant_id).await.unwrap_or(false) {
+        return fail(StatusCode::FORBIDDEN, "Admission does not belong to the current session");
+    }
     let ctx = PaymentContext {
         graph,
         xendit: &state.xendit,
@@ -391,7 +399,7 @@ pub async fn create_manual_payment_handler(
     headers: HeaderMap,
     Json(payload): Json<CreateInvoiceRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !state.legacy_parent_payments_enabled {
+    if !state.legacy_parent_payments_enabled && payload.payment_type != "application_fee" {
         return fail(
             StatusCode::SERVICE_UNAVAILABLE,
             "Legacy parent payment providers are disabled; use an accepted-offer DOKU checkout",
@@ -405,12 +413,7 @@ pub async fn create_manual_payment_handler(
         Ok(auth) => auth,
         Err((status, msg)) => return fail(status, &msg),
     };
-    if payload.admission_id.starts_with("LEAD-")
-        && !parent
-            .lead_ids
-            .iter()
-            .any(|lead_id| lead_id == &payload.admission_id)
-    {
+    if !auth::owns_admission_target(&graph, &parent, &payload.admission_id, &state.tenant_id).await.unwrap_or(false) {
         return fail(
             StatusCode::FORBIDDEN,
             "Admission does not belong to the current session",
@@ -703,6 +706,8 @@ async fn process_manual_proof_upload(
 
 #[derive(Deserialize, ToSchema)]
 pub struct AssistManualPaymentRequest {
+    #[serde(rename = "studentId")]
+    pub student_id: Option<String>,
     #[serde(rename = "paymentType", default = "default_payment_type")]
     pub payment_type: String,
     #[serde(rename = "manualBankAccountId")]
@@ -722,11 +727,17 @@ pub async fn admin_assist_manual_payment_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    let staff = match auth::require_staff(&graph, &headers, &state.jwt_secret).await {
+    let staff = match auth::require_assist_target(&graph, &headers, &state.jwt_secret, &state.tenant_id, &lead_id).await {
         Ok(auth) => auth,
         Err((status, msg)) => return fail(status, &msg),
     };
 
+    if let Some(student) = &payload.student_id {
+        let target = auth::ParentAuth { subject: String::new(), email: None, lead_ids: vec![lead_id.clone()] };
+        if student == &lead_id || !auth::owns_admission_target(&graph,&target,student,&state.tenant_id).await.unwrap_or(false) {
+            return fail(StatusCode::FORBIDDEN,"Student outside assisted lead");
+        }
+    }
     let ctx = PaymentContext {
         graph: graph.clone(),
         xendit: &state.xendit,
@@ -736,7 +747,7 @@ pub async fn admin_assist_manual_payment_handler(
     };
     match payment_service::create_manual_payment(
         ctx,
-        &lead_id,
+        payload.student_id.as_deref().unwrap_or(&lead_id),
         &payload.payment_type,
         payload.manual_bank_account_id.as_deref(),
     )
@@ -809,6 +820,12 @@ pub async fn admin_assist_proof_handler(
         return fail(StatusCode::NOT_FOUND, "Payment not found");
     }
     let lead_id = payment.lead_id.clone().unwrap_or_default();
+    if let Err((status, message)) = auth::require_assist_target(
+        &graph, &headers, &state.jwt_secret, &state.tenant_id, &lead_id,
+    ).await {
+        return fail(status, &message);
+    }
+
 
     let response = process_manual_proof_upload(
         &graph,
@@ -948,10 +965,8 @@ pub async fn get_payment_settings_handler(
         Ok(mut settings) => {
             if !state.legacy_parent_payments_enabled {
                 settings.xendit_enabled = false;
-                settings.manual_transfer_enabled = false;
-                settings.qris_enabled = false;
-                settings.qris_image_url.clear();
-                settings.manual_bank_accounts.clear();
+                // Native application-fee proof submission remains available.
+                // Only the deprecated online provider is controlled here.
             }
             (
                 StatusCode::OK,

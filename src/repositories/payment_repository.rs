@@ -44,6 +44,10 @@ pub struct AcceptedOfferSnapshot {
     pub pricing_snapshot_json: String,
 }
 
+pub async fn init_manual_creation_index(graph: &Graph) -> Result<(), neo4rs::Error> {
+    graph.run(neo4rs::query("CREATE CONSTRAINT payment_creation_lock_unique IF NOT EXISTS FOR (n:PaymentCreationLock) REQUIRE n.key IS UNIQUE")).await
+}
+
 pub async fn init_doku_indexes(graph: &Graph) -> Result<(), neo4rs::Error> {
     graph
         .run(Query::new(
@@ -481,11 +485,12 @@ pub async fn create_pending(
     promotion_rule_id: Option<&str>,
     promotion_snapshot_json: Option<&str>,
     line_items_json: &str,
+    applicant_student_id: Option<&str>,
 ) -> Result<(), neo4rs::Error> {
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$lead_id}), (f:FeeObligation {fee_obligation_id:$fid}) \
          CREATE (p:Payment { \
-            payment_id:$payment_id, tenant_id:$tenant_id, payment_type:$payment_type, \
+            payment_id:$payment_id, applicant_student_id:$student, tenant_id:$tenant_id, payment_type:$payment_type, \
             status:'pending', invoice_email_status:'queued', amount:$amount, currency:$currency, \
             gross_amount:$gross_amount, discount_amount:$discount_amount, net_amount:$amount, \
             promotion_code:$promotion_code, promotion_rule_id:$promotion_rule_id, \
@@ -499,6 +504,7 @@ pub async fn create_pending(
          RETURN p"
             .to_string(),
     )
+    .param("student", applicant_student_id.unwrap_or("").to_string())
     .param("payment_id", payment_id.to_string())
     .param("tenant_id", tenant_id.to_string())
     .param("payment_type", payment_type.to_string())
@@ -547,11 +553,12 @@ pub async fn create_manual_pending(
     promotion_rule_id: Option<&str>,
     promotion_snapshot_json: Option<&str>,
     line_items_json: &str,
+    applicant_student_id: Option<&str>,
 ) -> Result<(), neo4rs::Error> {
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$lead_id}), (f:FeeObligation {fee_obligation_id:$fid}) \
          CREATE (p:Payment { \
-            payment_id:$payment_id, tenant_id:$tenant_id, payment_type:$payment_type, \
+            payment_id:$payment_id, applicant_student_id:$student, tenant_id:$tenant_id, payment_type:$payment_type, \
             status:'awaiting_proof', invoice_email_status:'queued', amount:$amount, currency:$currency, \
             gross_amount:$gross_amount, discount_amount:$discount_amount, net_amount:$amount, \
             promotion_code:$promotion_code, promotion_rule_id:$promotion_rule_id, \
@@ -568,6 +575,7 @@ pub async fn create_manual_pending(
          RETURN p"
             .to_string(),
     )
+    .param("student", applicant_student_id.unwrap_or("").to_string())
     .param("payment_id", payment_id.to_string())
     .param("tenant_id", tenant_id.to_string())
     .param("payment_type", payment_type.to_string())
@@ -634,11 +642,16 @@ pub async fn find_active_manual_for_lead(
     graph: &Graph,
     lead_id: &str,
     payment_type: &str,
+    applicant_student_id: Option<&str>,
 ) -> Result<Option<Payment>, neo4rs::Error> {
     let q = Query::new(
         "MATCH (:Lead {lead_id:$lead_id})-[:MADE_PAYMENT]->(p:Payment {payment_type:$payment_type}) \
          WHERE p.payment_method = 'manual_transfer' \
-           AND NOT coalesce(p.status, '') IN ['paid', 'expired', 'failed', 'cancelled'] \
+           AND (coalesce(p.applicant_student_id,'')=$student \
+             OR ($student<>'' AND $payment_type='application_fee' AND coalesce(p.applicant_student_id,'')='' \
+               AND EXISTS { MATCH (:Lead {lead_id:$lead_id})-[:HAS_STUDENT]->(s:Student {studentId:$student}) WHERE s.createdAt<=p.created_at })) \
+           AND NOT coalesce(p.status, '') IN ['expired', 'failed', 'cancelled'] \
+           AND (p.status<>'paid' OR ($student<>'' AND $payment_type='application_fee')) \
          OPTIONAL MATCH (l:Lead)-[:MADE_PAYMENT]->(p) \
          RETURN p.payment_id AS payment_id, p.tenant_id AS tenant_id, \
                 p.payment_type AS payment_type, p.status AS status, \
@@ -663,6 +676,7 @@ pub async fn find_active_manual_for_lead(
          ORDER BY p.created_at DESC \
          LIMIT 1".to_string(),
     )
+    .param("student", applicant_student_id.unwrap_or("").to_string())
     .param("lead_id", lead_id.to_string())
     .param("payment_type", payment_type.to_string());
 

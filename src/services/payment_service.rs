@@ -650,6 +650,10 @@ pub async fn create_invoice(
     admission_id: &str,
     payment_type: &str,
 ) -> Result<CreateInvoiceOutcome, String> {
+    if payment_type == "enrolment_fee" {
+        return Err("Legacy enrolment billing is disabled; use the accepted offer payment".into());
+    }
+
     let settings = get_payment_settings(&ctx.graph, &ctx.settings_seed).await?;
     if !settings.xendit_enabled {
         return Err("xendit payment method is disabled".to_string());
@@ -694,7 +698,7 @@ pub async fn create_invoice(
     //                      admissionId here is the Student id itself.
     //     Detect by prefix — STU- means we treat it as a single-student
     //     invoice; anything else is the Lead-wide application fee.
-    let is_student_scoped = admission_id.starts_with("STU-") || payment_type == "enrolment_fee";
+    let is_student_scoped = admission_id != lead.lead_id || payment_type == "enrolment_fee";
     let student_count = if is_student_scoped {
         1_i64
     } else {
@@ -724,6 +728,7 @@ pub async fn create_invoice(
     let obligation = fee_obligation_repository::upsert_for_lead(
         &ctx.graph,
         fee_obligation_repository::FeeObligationUpsert {
+            applicant_student_id: (admission_id != lead.lead_id).then_some(admission_id),
             tenant_id: ctx.tenant_id,
             lead_id: &lead.lead_id,
             obligation_type: payment_type,
@@ -787,6 +792,7 @@ pub async fn create_invoice(
         calculation.promotion_rule_id.as_deref(),
         calculation.promotion_snapshot_json.as_deref(),
         &calculation.line_items_json,
+        (admission_id != lead.lead_id).then_some(admission_id),
     )
     .await
     .map_err(|e| format!("payment persist failed: {e}"))?;
@@ -826,12 +832,42 @@ pub async fn create_invoice(
     })
 }
 
+/// Serialize invoice creation across parent and Assist requests, including
+/// different children sharing a historical family invoice. The dedicated lock
+/// node avoids holding a Lead lock while the repository updates that Lead.
 pub async fn create_manual_payment(
     ctx: PaymentContext<'_>,
     admission_id: &str,
     payment_type: &str,
     manual_bank_account_id: Option<&str>,
 ) -> Result<ManualPaymentOutcome, String> {
+    // Only one local request may hold the distributed lock connection. This
+    // reserves pool capacity for the repository queries that run under it.
+    static CREATION_LANE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _lane = CREATION_LANE.lock().await;
+    let lead = fetch_lead(&ctx.graph, admission_id).await?
+        .ok_or_else(|| "Lead not found".to_string())?;
+    let transaction = ctx.graph.start_txn().await.map_err(|_| "Payment serialization unavailable")?;
+    transaction.run(neo4rs::query("MERGE (n:PaymentCreationLock {key:$key}) SET n.lock=true")
+        .param("key",format!("{}:{}",ctx.tenant_id,lead.lead_id)))
+        .await.map_err(|_| "Payment serialization unavailable")?;
+    let result = create_manual_payment_locked(ctx, admission_id, payment_type, manual_bank_account_id).await;
+    // Repository writes have committed independently. A retry finds their
+    // existing invoice even if the caller disconnects before this response.
+    transaction.commit().await.map_err(|_| "Payment serialization unavailable")?;
+    result
+}
+
+async fn create_manual_payment_locked(
+    ctx: PaymentContext<'_>,
+    admission_id: &str,
+    payment_type: &str,
+    manual_bank_account_id: Option<&str>,
+) -> Result<ManualPaymentOutcome, String> {
+    if payment_type == "enrolment_fee" {
+        return Err("Legacy enrolment billing is disabled; use the accepted offer payment".into());
+    }
+
     let settings = get_payment_settings(&ctx.graph, &ctx.settings_seed).await?;
     if !settings.manual_transfer_enabled && !settings.qris_enabled {
         return Err("proof-based payment methods are disabled".to_string());
@@ -842,7 +878,7 @@ pub async fn create_manual_payment(
         .ok_or_else(|| "Lead not found".to_string())?;
 
     if let Some(existing) =
-        payment_repository::find_active_manual_for_lead(&ctx.graph, &lead.lead_id, payment_type)
+        payment_repository::find_active_manual_for_lead(&ctx.graph, &lead.lead_id, payment_type, (admission_id != lead.lead_id).then_some(admission_id))
             .await
             .map_err(|e| format!("manual payment lookup failed: {e}"))?
     {
@@ -902,7 +938,7 @@ pub async fn create_manual_payment(
                 )
             })?;
 
-    let is_student_scoped = admission_id.starts_with("STU-") || payment_type == "enrolment_fee";
+    let is_student_scoped = admission_id != lead.lead_id || payment_type == "enrolment_fee";
     let student_count = if is_student_scoped {
         1_i64
     } else {
@@ -931,6 +967,7 @@ pub async fn create_manual_payment(
     let obligation = fee_obligation_repository::upsert_for_lead(
         &ctx.graph,
         fee_obligation_repository::FeeObligationUpsert {
+            applicant_student_id: (admission_id != lead.lead_id).then_some(admission_id),
             tenant_id: ctx.tenant_id,
             lead_id: &lead.lead_id,
             obligation_type: payment_type,
@@ -971,6 +1008,7 @@ pub async fn create_manual_payment(
         calculation.promotion_rule_id.as_deref(),
         calculation.promotion_snapshot_json.as_deref(),
         &calculation.line_items_json,
+        (admission_id != lead.lead_id).then_some(admission_id),
     )
     .await
     .map_err(|e| format!("manual payment persist failed: {e}"))?;
@@ -1025,7 +1063,7 @@ pub async fn preview_invoice(
 
     // Same per-student-scope rule as create_invoice: Student id or
     // enrolment_fee → always 1; Lead id + application_fee → count kids.
-    let is_student_scoped = admission_id.starts_with("STU-") || payment_type == "enrolment_fee";
+    let is_student_scoped = admission_id != lead.lead_id || payment_type == "enrolment_fee";
     let student_count = if is_student_scoped {
         1_i64
     } else {
@@ -1486,53 +1524,15 @@ async fn set_application_status_for_lead(
 ///
 /// Idempotent via MERGE; if the kid is already enrolled the query
 /// no-ops.
-async fn cascade_students_on_enrolment_paid(graph: &Graph, lead_id: &str) {
+async fn cascade_students_to_test_pending(graph: &Graph, payment_id: &str) {
     let q = Query::new(
-        "MATCH (:Lead {lead_id: $lead_id})-[:HAS_STUDENT]->(s:Student) \
-         MATCH (s)-[:HAS_OFFER]->(o:Offer)-[:ACCEPTED_VIA]->(a:OfferAcceptance) \
-         WHERE coalesce(s.applicantStatus, '') IN ['documents_verified','offer_accepted'] \
-           AND o.status='accepted' AND a.status='accepted' \
-           AND EXISTS { MATCH (s)-[:REQUIRES_DOCUMENT]->(:DocumentRequest {request_type:'application_document_pack',status:'approved'}) } \
-         WITH s, o, randomUUID() AS uid, toString(date().year) AS yyyy \
-         MERGE (e:EnrolledStudent {applicant_student_id: s.studentId}) \
-         ON CREATE SET e.student_id = 'STU-' + uid, \
-                       e.student_number = coalesce(replace(o.target_school_id, 'SCH-', ''), 'DS') + yyyy + '-' + toUpper(substring(uid, 0, 4)), \
-                       e.tenant_id = 'TENANT-001', \
-                       e.school_id = coalesce(o.target_school_id, ''), \
-                       e.year_group = coalesce(o.target_year_group, ''), \
-                       e.status = 'active', \
-                       e.enrolment_date = toString(date()), \
-                       e.created_at = datetime(), e.updated_at = datetime() \
-         ON MATCH SET e.updated_at = datetime() \
-         MERGE (s)-[:ENROLLED_AS]->(e) \
-         SET s.applicantStatus = 'handed_to_sis', s.updatedAt = datetime() \
-         RETURN count(s) AS enrolled_count".to_string(),
-    )
-    .param("lead_id", lead_id.to_string());
-    match graph.execute(q).await {
-        Ok(mut res) => {
-            let _ = res.next().await;
-            info!(lead_id=%lead_id, "students cascaded → handed_to_sis (EnrolledStudent created)");
-        }
-        Err(e) => {
-            warn!(lead_id=%lead_id, error=%e, "failed to enrol students on enrolment_paid");
-        }
-    }
-}
-
-async fn cascade_students_to_test_pending(graph: &Graph, lead_id: &str) {
-    let q = Query::new(
-        "MATCH (:Lead {lead_id:$lead_id})-[:HAS_STUDENT]->(s:Student) \
-         WHERE coalesce(s.applicantStatus, 'submitted') = 'submitted' \
-         SET s.applicantStatus = 'test_pending', s.updatedAt = datetime()"
-            .to_string(),
-    )
-    .param("lead_id", lead_id.to_string());
-    if let Err(e) = graph.run(q).await {
-        warn!(lead_id=%lead_id, error=%e, "failed to cascade students to test_pending");
-    } else {
-        info!(lead_id=%lead_id, "students cascaded → test_pending");
-    }
+        "MATCH (l:Lead)-[:MADE_PAYMENT]->(p:Payment {payment_id:$payment,status:'paid',payment_type:'application_fee'}) \
+         MATCH (l)-[:HAS_STUDENT]->(s:Student) \
+         WHERE coalesce(s.applicantStatus,'submitted')='submitted' AND l.tenant_id=p.tenant_id \
+           AND (p.applicant_student_id=s.studentId OR (coalesce(p.applicant_student_id,'')='' AND s.createdAt<=p.created_at)) \
+         SET s.applicantStatus='test_pending',s.application_fee_payment_id=p.payment_id,s.updatedAt=datetime()".into()
+    ).param("payment",payment_id.to_string());
+    if graph.run(q).await.is_err() { warn!("Application fee child transition unavailable"); }
 }
 
 async fn count_students_for_lead(graph: &Graph, admission_id: &str) -> Result<i64, String> {
@@ -1768,7 +1768,7 @@ pub async fn fetch_payment_refreshed(
                                         "application_fee_paid",
                                     )
                                     .await;
-                                    cascade_students_to_test_pending(graph, lead_id).await;
+                                    cascade_students_to_test_pending(graph, payment_id).await;
                                 }
                                 "enrolment_fee" => {
                                     set_application_status_for_lead(
@@ -1778,7 +1778,7 @@ pub async fn fetch_payment_refreshed(
                                         "completed",
                                     )
                                     .await;
-                                    cascade_students_on_enrolment_paid(graph, lead_id).await;
+                // Legacy receipts do not authorize SIS activation; accepted-offer handoff owns it.
                                 }
                                 _ => {
                                     // term_fee, capital_levy etc. — no
@@ -1853,12 +1853,12 @@ pub async fn handle_webhook(
                             "application_fee_paid",
                         )
                         .await;
-                        cascade_students_to_test_pending(graph, lead_id).await;
+                        cascade_students_to_test_pending(graph, payment_id).await;
                     }
                     "enrolment_fee" => {
                         set_application_status_for_lead(graph, lead_id, "offer_stage", "completed")
                             .await;
-                        cascade_students_on_enrolment_paid(graph, lead_id).await;
+                // Legacy receipts do not authorize SIS activation; accepted-offer handoff owns it.
                     }
                     _ => {}
                 }
@@ -1899,11 +1899,11 @@ async fn apply_paid_side_effects(graph: &Graph, payment: &Payment) -> Result<(),
                     "application_fee_paid",
                 )
                 .await;
-                cascade_students_to_test_pending(graph, lead_id).await;
+                cascade_students_to_test_pending(graph, &payment.payment_id).await;
             }
             "enrolment_fee" => {
                 set_application_status_for_lead(graph, lead_id, "offer_stage", "completed").await;
-                cascade_students_on_enrolment_paid(graph, lead_id).await;
+                // Legacy receipts do not authorize SIS activation; accepted-offer handoff owns it.
             }
             "offer_due_now" => {
                 // Confirm the admissions payment gate, but do not create an
@@ -1918,7 +1918,7 @@ async fn apply_paid_side_effects(graph: &Graph, payment: &Payment) -> Result<(),
                        AND o.revision = p.offer_revision \
                        AND o.pricing_snapshot_hash = p.pricing_snapshot_hash \
                      SET o.payment_status='paid', o.paid_at=datetime(), o.updated_at=datetime(), \
-                         s.applicantStatus='enrolment_paid', s.updatedAt=datetime()"
+                         s.applicantStatus=CASE WHEN s.applicantStatus='handed_to_sis' THEN s.applicantStatus ELSE 'enrolment_paid' END, s.updatedAt=datetime()"
                         .to_string(),
                 )
                 .param("payment_id", payment.payment_id.clone());
@@ -2112,10 +2112,10 @@ async fn fetch_lead(graph: &Graph, admission_id: &str) -> Result<Option<LeadSnap
     // Enrolment-fee flow passes the student id because the Offer is
     // per-kid, not per-application.
     let q = Query::new(
-        "MATCH (l:Lead)-[:HAS_STUDENT]->(Student {studentId:$id}) \
+        "MATCH (l:Lead)-[:HAS_STUDENT]->(s:Student {studentId:$id}) \
          RETURN l.lead_id AS lead_id, l.parent_name AS parent_name, l.email AS email, \
                 coalesce(l.whatsapp, l.mobile, '') AS whatsapp, \
-                l.target_school_preference AS school \
+                replace(coalesce(s.targetSchool,l.target_school_preference),'SCH-','') AS school \
          LIMIT 1"
             .to_string(),
     )
@@ -2138,5 +2138,52 @@ async fn fetch_lead(graph: &Graph, admission_id: &str) -> Result<Option<LeadSnap
         }))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod child_payment_concurrency_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "requires disposable ADMISSIONS_TEST_NEO4J_URI"]
+    async fn concurrent_child_manual_requests_create_one_invoice() {
+        let graph = Arc::new(Graph::new(&std::env::var("ADMISSIONS_TEST_NEO4J_URI").unwrap(), "neo4j", &std::env::var("ADMISSIONS_TEST_NEO4J_PASSWORD").unwrap()).await.unwrap());
+        payment_repository::init_manual_creation_index(&graph).await.unwrap();
+        let id = format!("manual-concurrency-{}",Uuid::new_v4());
+        graph.run(neo4rs::query("CREATE (l:Lead {lead_id:$id,tenant_id:$id,target_school_preference:'IISS',email:'parent@example.invalid'})-[:HAS_STUDENT]->(:Student {studentId:$child,createdAt:datetime(),applicantStatus:'submitted'}) CREATE (:School {school_id:$id,tenant_id:$id,school_code:'IISS'})-[:HAS_FEE_STRUCTURE]->(:FeeStructure {fee_structure_id:$id,tenant_id:$id,school_id:$id,payment_type:'application_fee',status:'active',amount:1000,currency:'IDR'}) CREATE (:PaymentSettings {tenant_id:$id,manual_transfer_enabled:true,manual_bank_accounts_json:$banks})")
+            .param("id",id.clone()).param("child",format!("{id}-child")).param("banks",r#"[{"id":"bank","bankName":"Test Bank","accountName":"School","accountNumber":"12345","enabled":true,"instructions":"Fixture"}]"#)).await.unwrap();
+        let parent=crate::utils::auth::ParentAuth {subject:id.clone(),email:None,lead_ids:vec![id.clone()]};
+        assert!(crate::utils::auth::owns_admission_target(&graph,&parent,&format!("{id}-child"),&id).await.unwrap());
+        assert!(!crate::utils::auth::owns_admission_target(&graph,&parent,&format!("{id}-child"),"other-tenant").await.unwrap());
+        graph.run(neo4rs::query("MATCH (l:Lead {lead_id:$id}) CREATE (l)-[:HAS_STUDENT]->(:Student {studentId:$sibling,createdAt:datetime(),applicantStatus:'submitted'})").param("id",id.clone()).param("sibling",format!("{id}-sibling"))).await.unwrap();
+        let mut tasks=tokio::task::JoinSet::new();
+        for _ in 0..24 {
+            let graph=graph.clone(); let id=id.clone();
+            tasks.spawn(async move {
+                let xendit=XenditClient::new("http://127.0.0.1:1","","","");
+                let seed=PaymentSettingsSeed {tenant_id:id.clone(),bank_name:String::new(),bank_account_name:String::new(),bank_account_number:String::new(),instructions:String::new()};
+                create_manual_payment(PaymentContext {graph,xendit:&xendit,tenant_id:&id,default_due_hours:24,settings_seed:seed}, &format!("{id}-child"),"application_fee",Some("bank")).await.map(|out|out.payment.payment_id)
+            });
+        }
+        let ids=tokio::time::timeout(std::time::Duration::from_secs(20),async {
+            let mut ids=std::collections::HashSet::new();
+            while let Some(result)=tasks.join_next().await {ids.insert(result.unwrap().unwrap());}
+            ids
+        }).await.expect("Concurrent invoice creation must not starve the pool");
+        assert_eq!(ids.len(),1);
+        let mut rows=graph.execute(neo4rs::query("MATCH (p:Payment {tenant_id:$id}) RETURN count(p) AS n,collect(p.applicant_student_id) AS children").param("id",id.clone())).await.unwrap();
+        let row=rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>("n"),Some(1));
+        assert_eq!(row.get::<Vec<String>>("children"),Some(vec![format!("{id}-child")]));
+        let payment_id=ids.iter().next().unwrap();
+        graph.run(neo4rs::query("MATCH (p:Payment {payment_id:$payment}) SET p.status='paid'").param("payment",payment_id.clone())).await.unwrap();
+        cascade_students_to_test_pending(&graph,payment_id).await;
+        let mut rows=graph.execute(neo4rs::query("MATCH (l:Lead {lead_id:$id})-[:HAS_STUDENT]->(s) RETURN s.studentId AS id,s.applicantStatus AS status").param("id",id.clone())).await.unwrap();
+        while let Some(row)=rows.next().await.unwrap() {
+            let student=row.get::<String>("id").unwrap();
+            assert_eq!(row.get::<String>("status").unwrap(),if student.ends_with("-child") {"test_pending"} else {"submitted"});
+        }
+        graph.run(neo4rs::query("MATCH (s:Student {studentId:$sibling}) DETACH DELETE s").param("sibling",format!("{id}-sibling"))).await.unwrap();
+        graph.run(neo4rs::query("MATCH (n) WHERE n.tenant_id=$id OR n.studentId=$child OR (n:PaymentCreationLock AND n.key=$key) DETACH DELETE n").param("id",id.clone()).param("child",format!("{id}-child")).param("key",format!("{id}:{id}"))).await.unwrap();
     }
 }

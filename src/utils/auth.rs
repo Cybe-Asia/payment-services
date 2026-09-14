@@ -134,6 +134,7 @@ pub async fn require_staff(
                 [
                     "owner",
                     "marketing_staff",
+                    "teacher",
                     "marketing_manager",
                     "admissions_staff",
                     "admissions_manager",
@@ -165,6 +166,39 @@ pub async fn require_staff(
         return Ok(AdminAuth { email });
     }
     Err((StatusCode::FORBIDDEN, "Staff access required".to_string()))
+}
+
+/// Sensitive assistance requires an explicit lead assignment, or owner authority.
+/// Queue visibility alone does not authorize uploading a family's evidence.
+pub async fn require_assist_target(
+    graph: &Graph,
+    headers: &HeaderMap,
+    jwt_secret: &str,
+    tenant_id: &str,
+    lead_id: &str,
+) -> Result<AdminAuth, (StatusCode, String)> {
+    let staff = require_staff(graph, headers, jwt_secret).await?;
+    let owner = require_admin(graph, headers, jwt_secret).await.is_ok();
+    let mut rows = graph.execute(Query::new(
+        "MATCH (l:Lead {lead_id:$lead, tenant_id:$tenant}) RETURN \
+         ($owner OR toLower(coalesce(l.assigned_admin_email,''))=$email) AS allowed".into()
+    ).param("lead", lead_id.to_string()).param("tenant", tenant_id.to_string())
+     .param("owner", owner).param("email", staff.email.to_lowercase()))
+     .await.map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Assistance authorization unavailable".into()))?;
+    let allowed = rows.next().await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Assistance authorization unavailable".into()))?
+        .and_then(|row| row.get::<bool>("allowed")).unwrap_or(false);
+    if !allowed {
+        return Err((StatusCode::FORBIDDEN, "Assigned staff required for payment assistance".into()));
+    }
+    Ok(staff)
+}
+
+pub async fn owns_admission_target(graph: &Graph, parent: &ParentAuth, target: &str, tenant: &str) -> Result<bool, String> {
+    let mut rows=graph.execute(Query::new(
+        "MATCH (l:Lead {tenant_id:$tenant}) WHERE l.lead_id IN $leads AND (l.lead_id=$target OR EXISTS { MATCH (l)-[:HAS_STUDENT]->(:Student {studentId:$target}) }) RETURN count(l)>0 AS owned".into()
+    ).param("tenant",tenant.to_string()).param("leads",parent.lead_ids.clone()).param("target",target.to_string())).await.map_err(|_| "Ownership lookup unavailable")?;
+    Ok(rows.next().await.map_err(|_| "Ownership lookup unavailable")?.and_then(|r|r.get::<bool>("owned")).unwrap_or(false))
 }
 
 /// Roles allowed to APPROVE money: finance plus the full-admin-like roles.

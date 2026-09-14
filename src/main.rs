@@ -118,6 +118,8 @@ async fn main() {
             if let Err(e) = repositories::payment_repository::init_doku_indexes(&arc).await {
                 warn!("DOKU idempotency index initialization failed (continuing): {e}");
             }
+            repositories::payment_repository::init_manual_creation_index(&arc).await
+                .expect("Manual payment idempotency index initialization failed");
             Some(arc)
         }
         Err(e) => {

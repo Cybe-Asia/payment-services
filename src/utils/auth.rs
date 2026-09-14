@@ -44,7 +44,7 @@ pub async fn require_admin(
     headers: &HeaderMap,
     jwt_secret: &str,
 ) -> Result<AdminAuth, (StatusCode, String)> {
-    let claims = claims_from_bearer(headers, jwt_secret)?;
+    let claims = staff_claims_from_bearer(headers, jwt_secret)?;
     let email = match claims.email.clone() {
         Some(email) if !email.trim().is_empty() => email,
         _ => resolve_email_for_subject(graph, &claims.sub)
@@ -59,9 +59,27 @@ pub async fn require_admin(
     };
 
     use crate::repositories::canonical_staff_repository::{resolve_admin, CanonicalAdmin};
-    match resolve_admin(graph, &claims.sub).await.map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))? {
-        CanonicalAdmin::Owner(_) => return Ok(AdminAuth { email }),
-        CanonicalAdmin::Denied => return Err((StatusCode::FORBIDDEN, "Admin access required".to_string())),
+    match resolve_admin(graph, &claims.sub)
+        .await
+        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?
+    {
+        CanonicalAdmin::Owner(id)
+            if claims
+                .staff_member_id
+                .as_ref()
+                .is_none_or(|expected| expected == &id) =>
+        {
+            return Ok(AdminAuth { email })
+        }
+        CanonicalAdmin::Owner(_) => {
+            return Err((StatusCode::FORBIDDEN, "Staff identity mismatch".into()))
+        }
+        CanonicalAdmin::Denied => {
+            return Err((StatusCode::FORBIDDEN, "Admin access required".to_string()))
+        }
+        CanonicalAdmin::NotLinked if claims.staff_member_id.is_some() => {
+            return Err((StatusCode::FORBIDDEN, "Staff identity unavailable".into()))
+        }
         CanonicalAdmin::NotLinked => {}
     }
 
@@ -85,7 +103,7 @@ pub async fn require_staff(
     headers: &HeaderMap,
     jwt_secret: &str,
 ) -> Result<AdminAuth, (StatusCode, String)> {
-    let claims = claims_from_bearer(headers, jwt_secret)?;
+    let claims = staff_claims_from_bearer(headers, jwt_secret)?;
     let email = match claims.email.clone() {
         Some(email) if !email.trim().is_empty() => email,
         _ => resolve_email_for_subject(graph, &claims.sub)
@@ -98,6 +116,45 @@ pub async fn require_staff(
                 )
             })?,
     };
+
+    use crate::repositories::canonical_staff_repository::{resolve_staff, CanonicalStaff};
+    match resolve_staff(graph, &claims.sub)
+        .await
+        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?
+    {
+        CanonicalStaff::Active { id, roles } => {
+            if claims
+                .staff_member_id
+                .as_ref()
+                .is_some_and(|expected| expected != &id)
+            {
+                return Err((StatusCode::FORBIDDEN, "Staff identity mismatch".into()));
+            }
+            if roles.iter().any(|role| {
+                [
+                    "owner",
+                    "marketing_staff",
+                    "marketing_manager",
+                    "admissions_staff",
+                    "admissions_manager",
+                    "admissions_admin",
+                    "finance_admin",
+                    "finance_approver",
+                ]
+                .contains(&role.as_str())
+            }) {
+                return Ok(AdminAuth { email });
+            }
+            return Err((StatusCode::FORBIDDEN, "Staff access required".into()));
+        }
+        CanonicalStaff::Denied => {
+            return Err((StatusCode::FORBIDDEN, "Staff access required".into()))
+        }
+        CanonicalStaff::NotLinked if claims.staff_member_id.is_some() => {
+            return Err((StatusCode::FORBIDDEN, "Staff identity unavailable".into()))
+        }
+        CanonicalStaff::NotLinked => {}
+    }
 
     if is_admin_email(&email) {
         return Ok(AdminAuth { email });
@@ -137,7 +194,7 @@ pub async fn require_finance(
     jwt_secret: &str,
     approve: bool,
 ) -> Result<AdminAuth, (StatusCode, String)> {
-    let claims = claims_from_bearer(headers, jwt_secret)?;
+    let claims = staff_claims_from_bearer(headers, jwt_secret)?;
     let email = match claims.email.clone() {
         Some(email) if !email.trim().is_empty() => email,
         _ => resolve_email_for_subject(graph, &claims.sub)
@@ -150,6 +207,34 @@ pub async fn require_finance(
                 )
             })?,
     };
+
+    use crate::repositories::canonical_staff_repository::{resolve_staff, CanonicalStaff};
+    match resolve_staff(graph, &claims.sub)
+        .await
+        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?
+    {
+        CanonicalStaff::Active { id, roles } => {
+            if claims
+                .staff_member_id
+                .as_ref()
+                .is_some_and(|expected| expected != &id)
+            {
+                return Err((StatusCode::FORBIDDEN, "Staff identity mismatch".into()));
+            }
+            return if finance_roles_allowed(&roles, approve) {
+                Ok(AdminAuth { email })
+            } else {
+                Err((StatusCode::FORBIDDEN, "Finance access required".into()))
+            };
+        }
+        CanonicalStaff::Denied => {
+            return Err((StatusCode::FORBIDDEN, "Finance access required".into()))
+        }
+        CanonicalStaff::NotLinked if claims.staff_member_id.is_some() => {
+            return Err((StatusCode::FORBIDDEN, "Staff identity unavailable".into()))
+        }
+        CanonicalStaff::NotLinked => {}
+    }
 
     if !approve && is_admin_email(&email) {
         return Ok(AdminAuth { email });
@@ -216,6 +301,29 @@ pub fn owns_lead(auth: &ParentAuth, lead_id: Option<&str>) -> bool {
         return false;
     };
     auth.lead_ids.iter().any(|id| id == lead_id)
+}
+
+fn staff_claims_from_bearer(
+    headers: &HeaderMap,
+    parent_secret: &str,
+) -> Result<Claims, (StatusCode, String)> {
+    let token = bearer_from(headers).ok_or((StatusCode::UNAUTHORIZED, "Missing bearer".into()))?;
+    let header = jsonwebtoken::decode_header(&token)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid bearer".into()))?;
+    if header.typ.as_deref() != Some("staff-api+jwt") {
+        return claims_from_bearer(headers, parent_secret);
+    }
+    let (key, issuer) = crate::config::config::staff_downstream_settings(parent_secret)
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let typed = crate::utils::jwt::decode_staff_api_claims(&token, &key, &issuer)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid staff credential".into()))?;
+    Ok(Claims {
+        sub: typed.sub,
+        staff_member_id: Some(typed.staff_member_id),
+        _exp: typed.exp as usize,
+        email: None,
+        scope: Some(typed.scope),
+    })
 }
 
 fn claims_from_bearer(

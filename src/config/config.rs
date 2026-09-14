@@ -145,3 +145,16 @@ pub fn load() -> Config {
         frontend_url,
     }
 }
+
+/// Staff credentials use a key distinct from legacy parent sessions. Missing
+/// configuration disables the new family; never fall back to the parent key.
+pub fn staff_downstream_settings(parent_secret: &str) -> Result<(String, String), String> {
+    let key = env::var("STAFF_DOWNSTREAM_JWT_SECRET")
+        .map_err(|_| "Staff API authorization unavailable")?;
+    let issuer = env::var("STAFF_DOWNSTREAM_JWT_ISSUER")
+        .map_err(|_| "Staff API authorization unavailable")?;
+    if key.len() < 32 || key == parent_secret || !issuer.starts_with("https://") {
+        return Err("Staff API authorization unavailable".into());
+    }
+    Ok((key, issuer))
+}

@@ -193,7 +193,7 @@ pub async fn upsert_doku_pending(
             p.gateway_ref=$token_id, p.doku_session_id=$session_id, p.doku_request_id=$request_id, \
             p.provider_attempt=$attempt, \
             p.hosted_invoice_url=$checkout_url, p.offer_id=$offer_id, \
-            p.offer_revision=$offer_revision, p.pricing_snapshot_hash=$snapshot_hash, \
+            p.offer_revision=$offer_revision, p.pricing_snapshot_hash=$snapshot_hash, p.pricing_snapshot_json=o.pricing_snapshot_json, \
             p.created_at=datetime(), p.updated_at=datetime() \
          MERGE (l)-[:MADE_PAYMENT]->(p) \
          MERGE (o)-[:PAID_VIA]->(p) \
@@ -262,7 +262,7 @@ pub async fn upsert_offer_manual_pending(
             p.manual_instructions=$instructions, p.amount_submitted=0, p.amount_verified=0, \
             p.short_amount=$amount, p.overpaid_amount=0, p.expires_at=datetime($expires_iso), \
             p.offer_id=$offer_id, p.offer_revision=$offer_revision, \
-            p.pricing_snapshot_hash=$snapshot_hash, p.created_at=datetime(), p.updated_at=datetime() \
+            p.pricing_snapshot_hash=$snapshot_hash, p.pricing_snapshot_json=o.pricing_snapshot_json, p.created_at=datetime(), p.updated_at=datetime() \
          MERGE (l)-[:MADE_PAYMENT]->(p) \
          MERGE (o)-[:PAID_VIA]->(p) \
          MERGE (f)-[:SETTLED_BY]->(p) \
@@ -421,6 +421,80 @@ pub struct PaymentReviewDetail {
     pub payment: Payment,
     pub lead: PaymentReviewLead,
     pub proofs: Vec<PaymentProof>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PaymentDocumentContext {
+    pub payment: Payment,
+    pub pricing_snapshot_json: Option<String>,
+    pub parent_name: String,
+    pub parent_email: String,
+    pub parent_location: Option<String>,
+    pub school_code: String,
+    pub student_names: Vec<String>,
+    pub created_at: Option<String>,
+}
+
+/// Loads the immutable money snapshot plus the minimum parent/student identity
+/// needed to render a parent-facing invoice or receipt. Authorization is
+/// deliberately enforced by the handler after this lookup and before bytes are
+/// returned; callers must never expose this context directly.
+pub async fn find_document_context(
+    graph: &Graph,
+    tenant_id: &str,
+    payment_id: &str,
+) -> Result<Option<PaymentDocumentContext>, neo4rs::Error> {
+    let q = Query::new(
+        "MATCH (l:Lead {tenant_id:$tenant_id})-[:MADE_PAYMENT]->(p:Payment {payment_id:$payment_id, tenant_id:$tenant_id}) \
+         OPTIONAL MATCH (l)-[:HAS_STUDENT]->(student:Student) \
+         WITH l, p, [name IN collect(DISTINCT student.fullName) WHERE name IS NOT NULL AND trim(name) <> ''] AS lead_student_names \
+         OPTIONAL MATCH (l)-[:HAS_STUDENT]->(offer_student:Student)-[:HAS_OFFER]->(offer:Offer {tenant_id:$tenant_id}) \
+         WHERE offer.offer_id = p.offer_id AND offer.pricing_snapshot_hash = p.pricing_snapshot_hash \
+         RETURN p.payment_id AS payment_id, p.tenant_id AS tenant_id, \
+                p.payment_type AS payment_type, p.status AS status, \
+                p.amount AS amount, p.currency AS currency, \
+                p.gross_amount AS gross_amount, p.discount_amount AS discount_amount, \
+                p.net_amount AS net_amount, p.promotion_code AS promotion_code, \
+                p.promotion_rule_id AS promotion_rule_id, \
+                p.promotion_snapshot_json AS promotion_snapshot_json, \
+                p.line_items_json AS line_items_json, \
+                p.payment_method AS payment_method, p.gateway_ref AS gateway_ref, \
+                p.invoice_ref AS invoice_ref, p.hosted_invoice_url AS hosted_invoice_url, \
+                p.receipt_ref AS receipt_ref, p.manual_reference AS manual_reference, \
+                p.amount_submitted AS amount_submitted, p.amount_verified AS amount_verified, \
+                p.short_amount AS short_amount, p.overpaid_amount AS overpaid_amount, \
+                p.manual_bank_account_id AS manual_bank_account_id, \
+                p.bank_name AS bank_name, p.bank_account_name AS bank_account_name, \
+                p.bank_account_number AS bank_account_number, p.review_note AS review_note, \
+                p.rejection_reason AS rejection_reason, p.reviewed_by AS reviewed_by, \
+                toString(p.reviewed_at) AS reviewed_at, \
+                toString(p.paid_at) AS paid_at, toString(p.expires_at) AS expires_at, \
+                l.lead_id AS lead_id, l.parent_name AS parent_name, \
+                l.email AS parent_email, l.location_suburb AS parent_location, \
+                coalesce(offer_student.targetSchool, l.target_school_preference, 'IISS') AS school_code, \
+                CASE WHEN offer_student IS NULL THEN lead_student_names ELSE [offer_student.fullName] END AS student_names, \
+                coalesce(p.pricing_snapshot_json,offer.pricing_snapshot_json) AS pricing_snapshot_json, \
+                toString(p.created_at) AS created_at \
+         LIMIT 1"
+            .to_string(),
+    )
+    .param("tenant_id", tenant_id.to_string())
+    .param("payment_id", payment_id.to_string());
+
+    let mut result = graph.execute(q).await?;
+    let Some(row) = result.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(PaymentDocumentContext {
+        payment: payment_from_row(&row),
+        pricing_snapshot_json: row.get("pricing_snapshot_json"),
+        parent_name: row.get("parent_name").unwrap_or_default(),
+        parent_email: row.get("parent_email").unwrap_or_default(),
+        parent_location: row.get("parent_location"),
+        school_code: row.get("school_code").unwrap_or_else(|| "IISS".to_string()),
+        student_names: row.get("student_names").unwrap_or_default(),
+        created_at: row.get("created_at"),
+    }))
 }
 
 #[derive(Clone, Copy, Debug)]

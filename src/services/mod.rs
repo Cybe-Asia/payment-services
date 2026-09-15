@@ -1,4 +1,5 @@
 pub mod document_encryption;
+pub mod payment_document;
 pub mod payment_service;
 
 pub mod invoice_notification;

@@ -19,6 +19,9 @@ use crate::dto::create_invoice_request::CreateInvoiceRequest;
 use crate::dto::webhook::XenditInvoiceWebhook;
 use crate::repositories::payment_repository::CreateProofInput;
 use crate::repositories::payment_settings_repository::UpdatePaymentSettings;
+use crate::services::payment_document::{
+    is_document_available, render_payment_document, PaymentDocumentKind,
+};
 use crate::services::payment_service::{self, PaymentContext, ReviewManualPaymentRequest};
 use crate::utils::auth;
 use crate::utils::response::ApiResponse;
@@ -938,6 +941,103 @@ pub async fn get_payment_handler(
     }
 }
 
+pub async fn download_invoice_document_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(payment_id): Path<String>,
+) -> Response {
+    download_payment_document(state, headers, payment_id, PaymentDocumentKind::Invoice).await
+}
+
+pub async fn download_receipt_document_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(payment_id): Path<String>,
+) -> Response {
+    download_payment_document(state, headers, payment_id, PaymentDocumentKind::Receipt).await
+}
+
+async fn download_payment_document(
+    state: AppState,
+    headers: HeaderMap,
+    payment_id: String,
+    kind: PaymentDocumentKind,
+) -> Response {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
+    };
+    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+        Ok(value) => value,
+        Err((status, message)) => return fail(status, &message).into_response(),
+    };
+    let context = match crate::repositories::payment_repository::find_document_context(
+        &graph,
+        &state.tenant_id,
+        &payment_id,
+    )
+    .await
+    {
+        Ok(Some(value)) => value,
+        Ok(None) => return fail(StatusCode::NOT_FOUND, "Payment not found").into_response(),
+        Err(error) => {
+            error!("payment document lookup failed: {error}");
+            return fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Payment document unavailable",
+            )
+            .into_response();
+        }
+    };
+    if !auth::owns_lead(&parent, context.payment.lead_id.as_deref()) {
+        return fail(StatusCode::NOT_FOUND, "Payment not found").into_response();
+    }
+    if !is_document_available(kind, &context.payment.status) {
+        return fail(
+            StatusCode::CONFLICT,
+            "Receipt is available only after payment verification",
+        )
+        .into_response();
+    }
+
+    let bytes = render_payment_document(&context, kind);
+    let prefix = match kind {
+        PaymentDocumentKind::Invoice => "invoice",
+        PaymentDocumentKind::Receipt => "receipt",
+    };
+    let safe_id: String = payment_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(80)
+        .collect();
+    let filename = format!(
+        "{prefix}-{}.pdf",
+        if safe_id.is_empty() {
+            "payment"
+        } else {
+            &safe_id
+        }
+    );
+    let mut response = Bytes::from(bytes).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/pdf"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"payment.pdf\"")),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 pub async fn get_payment_settings_handler(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -1083,7 +1183,10 @@ pub async fn admin_payment_reviews_handler(
             "dateFrom and dateTo must be provided together",
         );
     }
-    if !matches!(q.payment_type.as_str(), "" | "application_fee" | "capital_levy") {
+    if !matches!(
+        q.payment_type.as_str(),
+        "" | "application_fee" | "capital_levy"
+    ) {
         return fail(StatusCode::BAD_REQUEST, "Invalid paymentType");
     }
     let filters = payment_service::PaymentReviewFilters {
@@ -1514,9 +1617,11 @@ async fn queue_payment_status_notification(
 
     for channel in channels {
         // The durable paid receipt replaces the old fire-and-forget approval email.
-        if event == "payment_approved" && payment.payment_type == "application_fee"
+        if event == "payment_approved"
+            && payment.payment_type == "application_fee"
             && channel == payment_service::NOTIFICATION_CHANNEL_EMAIL
-            && std::env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true") {
+            && std::env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true")
+        {
             continue;
         }
         if channel == payment_service::NOTIFICATION_CHANNEL_EMAIL && context.email.trim().is_empty()

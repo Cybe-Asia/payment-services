@@ -97,6 +97,14 @@ pub fn routes() -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(PROOF_UPLOAD_MAX_BYTES)),
         )
         .route(
+            "/api/v1/payments/:payment_id/invoice.pdf",
+            get(payment_handler::download_invoice_document_handler),
+        )
+        .route(
+            "/api/v1/payments/:payment_id/receipt.pdf",
+            get(payment_handler::download_receipt_document_handler),
+        )
+        .route(
             "/api/v1/payments/:payment_id",
             get(payment_handler::get_payment_handler),
         )

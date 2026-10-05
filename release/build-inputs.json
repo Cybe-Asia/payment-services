@@ -59,8 +59,12 @@
     "src/services/payment_document.rs": "ff039af21746d49d0a4a1f4fe16e08938dc5a8d360ef7d3fb3397634c3849e74",
     "Cargo.toml": "a66f489ed416971f6a7e9c8b491e3fc4dac5f2d3a0e35293e9d49536a9729243",
     "Cargo.lock": "25e364c461252a083ef95d323643e8db6af2b6122c3c92b658a4305090c59211",
-    "Dockerfile": "43f7dae84620916674d4ee449457f975f975ac8e9308cd33bc4846626c6db057",
-    ".dockerignore": "31bd6a1b28b121c9add152ddbca41c3b6a9c6d4e8cab6c499ee1f5a1c0e3486d"
+    "Dockerfile": "5b596bc696ce20dada33f8178b6b47d6e0e89fa65aeecb44cf72300de2824aac",
+    ".dockerignore": "31bd6a1b28b121c9add152ddbca41c3b6a9c6d4e8cab6c499ee1f5a1c0e3486d",
+    "assets/payment-documents/iihs-invoice.jpg": "baada0c471abb60594e10af0a811bf68d1ac5944bf9de0757e894bf4ba935bfc",
+    "assets/payment-documents/iihs-receipt.jpg": "0435ad38f901ac6a4d07970df61d0ee7410d9d8abff43bf0a8f6c08207c755ce",
+    "assets/payment-documents/iiss-invoice.jpg": "1d3530b74b3d35fca0ffc7776bd4db54e3bd98533713902749bb74c285531a80",
+    "assets/payment-documents/iiss-receipt.jpg": "15ea81bc9eff650df84b844f1aef0a01adfeaafcd8e3a4870c14d79e2cc03b38"
   },
   "scope": "approved current web integration; school-staging; no automatic GitOps or production promotion"
 }

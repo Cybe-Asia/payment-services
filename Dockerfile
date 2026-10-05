@@ -2,6 +2,7 @@ FROM rust:1.95-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY assets ./assets
 RUN cargo build --release --locked --bin payment-service
 FROM debian:bookworm-slim
 ARG SOURCE_REPOSITORY

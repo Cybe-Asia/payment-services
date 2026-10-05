@@ -25,7 +25,7 @@ use clients::doku::DokuClient;
 use clients::minio::MinioClient;
 use clients::xendit::XenditClient;
 use config::config::load;
-use database::neo4j::create_graph;
+use database::neo4j::{check_configured_graph_connection, create_graph};
 use repositories::payment_settings_repository::PaymentSettingsSeed;
 use repositories::seed::seed_fees;
 use services::document_encryption::DocumentCipher;
@@ -84,6 +84,22 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
 
+    // Read-only connection diagnosis takes precedence over every other run mode.
+    if std::env::args().any(|arg| arg == "--check-graph-connection") {
+        match check_configured_graph_connection().await {
+            Ok(()) => info!("payment graph connection check complete"),
+            Err(error) => {
+                tracing::error!(
+                    stage = error.stage,
+                    category = error.category,
+                    io_kind = ?error.io_kind,
+                    "payment graph connection check failed"
+                );
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let cfg = load();
     let bootstrap = bootstrap_enabled(std::env::var("PAYMENT_BOOTSTRAP_ENABLED").ok().as_deref())
         .expect("invalid payment bootstrap configuration");

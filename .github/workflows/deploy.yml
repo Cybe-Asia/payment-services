@@ -1,130 +1,88 @@
-name: Build & Deploy
-
-# Mirrors the golden-path workflow used by admission-services /
-# auth-services / otp-services / notification-services.
-# See Cybe-Asia/digital-school-gitops/docs/ci-golden-path.md
-
+name: Build staging payment container
 on:
-  push:
-    branches:
-      - main
-      - "qa/**"
-      - "staging/**"
-      - "release-*"
   workflow_dispatch:
-
-env:
-  SERVICE_NAME: payment-services
-  # Kustomize `images:` key — must match the image name in the BASE
-  # manifest (digital-school-gitops/base/payment/deployment.yaml), which
-  # still says ghcr.io/ariefnugrahaaa/... from before the repo moved to
-  # the Cybe-Asia org. New builds publish under ghcr.io/cybe-asia/* (the
-  # image_ref derives from the repo owner), and the bump step rewrites
-  # each overlay's newName to it on that environment's next deploy — so
-  # every env migrates namespace naturally, prod included, with no manual
-  # gitops flip. Only change this key if the base manifest image changes.
-  KUSTOMIZE_IMAGE_KEY: ghcr.io/ariefnugrahaaa/payment-services
-
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: staging-payment-container
+  cancel-in-progress: false
 jobs:
-  build-scan-push:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    env:
-      GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+    timeout-minutes: 45
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Compute tag + overlay
-        id: vars
-        run: |
-          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
-          IMAGE_TAG="sha-${SHORT_SHA}"
-          IMAGE_NAME=$(echo "ghcr.io/${{ github.repository_owner }}/${SERVICE_NAME}" | tr '[:upper:]' '[:lower:]')
-          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
-          echo "image_ref=${IMAGE_NAME}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          case "${GITHUB_REF}" in
-            refs/heads/main)         OVERLAY="lab/dev" ;;
-            refs/heads/qa/*)         OVERLAY="lab/test" ;;
-            refs/heads/staging/*)    OVERLAY="lab/staging" ;;
-            refs/heads/release-*)    OVERLAY="lab/staging" ;;
-            *)                       OVERLAY="" ;;
-          esac
-          echo "overlay_path=${OVERLAY}" >> "$GITHUB_OUTPUT"
-
-      # Fail LOUDLY when a deployable branch has no gitops credential.
-      # The bump step below is conditioned on GITOPS_TOKEN, which once
-      # made it skip silently for months (the repo predated the org and
-      # the org secret never reached it) — every deploy looked green
-      # while staging never moved. Never let that be quiet again.
-      - name: Guard — gitops token present for mapped branch
-        if: steps.vars.outputs.overlay_path != '' && env.GITOPS_TOKEN == ''
-        run: |
-          echo "::error::GITOPS_TOKEN is empty, so the ${{ steps.vars.outputs.overlay_path }} auto-bump would be silently skipped. Grant this repo access to the org GITOPS_TOKEN secret (org Settings → Secrets and variables → Actions), then re-run."
-          exit 1
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          # Personal repo: GITHUB_TOKEN is sufficient (permissions: packages: write above).
-          # The Cybe-Asia-owned services use a scoped GHCR_TOKEN because the
-          # shared cross-repo CI template came first. Both work.
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build image
-        run: docker build -t "${{ steps.vars.outputs.image_ref }}" .
-
-      - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@master
+          lfs: false
+      - name: Freeze source and release identity
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-evidence
+          python3 scripts/export-staging-container.py /tmp/payment-container release-evidence/source.json
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          source = json.loads(Path('release-evidence/source.json').read_text())
+          image = 'ghcr.io/' + os.environ['GITHUB_REPOSITORY'].lower() + ':sha-' + source['revision']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('image=' + image + '\n')
+              output.write('revision=' + source['revision'] + '\n')
+              output.write('source_hash=' + source['source_snapshot_sha256'] + '\n')
+          PYTHON
+      - name: Build Linux image
+        env:
+          RELEASE_IMAGE: ${{ steps.release.outputs.image }}
+          RELEASE_REVISION: ${{ steps.release.outputs.revision }}
+          RELEASE_SOURCE_HASH: ${{ steps.release.outputs.source_hash }}
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg SOURCE_REPOSITORY="https://github.com/$GITHUB_REPOSITORY" \
+            --build-arg SOURCE_REVISION="$RELEASE_REVISION" \
+            --build-arg SOURCE_TREE_SHA256="$RELEASE_SOURCE_HASH" \
+            -t "$RELEASE_IMAGE" /tmp/payment-container
+      - name: Release generated build storage
+        run: |
+          rm -rf /tmp/payment-container
+          docker builder prune --all --force
+          df -h /
+      - name: Required vulnerability gate
+        uses: aquasecurity/trivy-action@c03d123cb480c08c69b054af418ea5e69fe6e57e
         with:
-          image-ref: ${{ steps.vars.outputs.image_ref }}
-          format: table
+          version: v0.72.0
+          image-ref: ${{ steps.release.outputs.image }}
+          scanners: vuln,secret
           severity: CRITICAL
-          exit-code: "1"
           ignore-unfixed: true
-          vuln-type: os,library
-
+          exit-code: '1'
+          format: json
+          output: release-evidence/scan.json
+          timeout: 15m
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0.17.4
+        uses: aquasecurity/trivy-action@c03d123cb480c08c69b054af418ea5e69fe6e57e
         with:
-          image: ${{ steps.vars.outputs.image_ref }}
+          version: v0.72.0
+          skip-setup-trivy: true
+          image-ref: ${{ steps.release.outputs.image }}
           format: spdx-json
-          artifact-name: ${{ env.SERVICE_NAME }}-sbom-${{ steps.vars.outputs.image_tag }}.spdx.json
-          output-file: sbom.spdx.json
-          upload-artifact: true
-          upload-artifact-retention: 90
-
-      - name: Push image
-        run: docker push "${{ steps.vars.outputs.image_ref }}"
-
-      - name: Setup kustomize
-        if: steps.vars.outputs.overlay_path != '' && env.GITOPS_TOKEN != ''
-        uses: imranismail/setup-kustomize@v2
-
-      - name: Auto-bump gitops overlay
-        if: steps.vars.outputs.overlay_path != '' && env.GITOPS_TOKEN != ''
+          output: release-evidence/sbom.spdx.json
+          timeout: 15m
+      - name: Publish scanned image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_IMAGE: ${{ steps.release.outputs.image }}
         run: |
-          set -e
-          git config --global user.email "ci-bot@cybe-asia.github"
-          git config --global user.name "CI Bot"
-          git clone --branch main --depth 1 "https://x-access-token:${GITOPS_TOKEN}@github.com/Cybe-Asia/digital-school-gitops.git" gitops-repo
-          cd gitops-repo
-          cd "${{ steps.vars.outputs.overlay_path }}"
-          kustomize edit set image "${{ env.KUSTOMIZE_IMAGE_KEY }}=${{ steps.vars.outputs.image_ref }}"
-          if git diff --quiet kustomization.yaml; then
-            echo "no changes to ${{ steps.vars.outputs.overlay_path }}/kustomization.yaml"
-            exit 0
-          fi
-          git add kustomization.yaml
-          MSG="chore(${{ env.SERVICE_NAME }}): bump ${{ steps.vars.outputs.overlay_path }} to ${{ steps.vars.outputs.image_tag }} [skip ci]"
-          case "${GITHUB_REF}" in
-            refs/heads/qa/*)       MSG="${MSG} [skip promote] (qa branch)" ;;
-            refs/heads/staging/*)  MSG="${MSG} [skip promote] (staging branch — manual promote required)" ;;
-          esac
-          git commit -m "${MSG}"
-          git push origin main
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$RELEASE_IMAGE"
+          docker image inspect "$RELEASE_IMAGE" > release-evidence/image.json
+          docker logout ghcr.io
+      - name: Save release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: payment-staging-release-${{ github.sha }}
+          path: release-evidence/
+          retention-days: 30

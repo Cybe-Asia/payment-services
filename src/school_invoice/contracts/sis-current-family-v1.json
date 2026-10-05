@@ -1,0 +1,8 @@
+{
+  "contractVersion": 1,
+  "owner": "sis-services",
+  "source": "src/billing_owner/current_family.cypher",
+  "sha256": "d5ba482d88137bb9a3de65eef2709a51a5701aa628b33cac164fa3a2305694c6",
+  "consumption": "read-only shared graph guard; no SIS-owned writes",
+  "historicalAccessPolicy": "unconfigured"
+}

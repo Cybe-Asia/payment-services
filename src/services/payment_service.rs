@@ -656,7 +656,7 @@ pub async fn create_invoice(
     }
 
     // 1) Look up the Lead (parent contact info + school selection).
-    let lead = fetch_lead(&ctx.graph, admission_id)
+    let lead = fetch_lead(&ctx.graph, admission_id, ctx.tenant_id)
         .await?
         .ok_or_else(|| "Lead not found".to_string())?;
 
@@ -837,14 +837,18 @@ pub async fn create_manual_payment(
         return Err("proof-based payment methods are disabled".to_string());
     }
 
-    let lead = fetch_lead(&ctx.graph, admission_id)
+    let lead = fetch_lead(&ctx.graph, admission_id, ctx.tenant_id)
         .await?
         .ok_or_else(|| "Lead not found".to_string())?;
 
-    if let Some(existing) =
-        payment_repository::find_active_manual_for_lead(&ctx.graph, &lead.lead_id, payment_type)
-            .await
-            .map_err(|e| format!("manual payment lookup failed: {e}"))?
+    if let Some(existing) = payment_repository::find_active_manual_for_lead(
+        &ctx.graph,
+        &lead.lead_id,
+        ctx.tenant_id,
+        payment_type,
+    )
+    .await
+    .map_err(|e| format!("manual payment lookup failed: {e}"))?
     {
         if let Some(selected_id) = manual_bank_account_id {
             if can_update_manual_destination(&existing) {
@@ -995,7 +999,7 @@ pub async fn preview_invoice(
     admission_id: &str,
     payment_type: &str,
 ) -> Result<InvoicePreview, String> {
-    let lead = fetch_lead(graph, admission_id)
+    let lead = fetch_lead(graph, admission_id, tenant_id)
         .await?
         .ok_or_else(|| "Lead not found".to_string())?;
 
@@ -1568,7 +1572,7 @@ pub async fn payment_notification_context(
     let Some(lead_id) = payment.lead_id.as_deref() else {
         return Ok(None);
     };
-    let Some(lead) = fetch_lead(graph, lead_id).await? else {
+    let Some(lead) = fetch_lead(graph, lead_id, &payment.tenant_id).await? else {
         return Ok(None);
     };
     Ok(Some(PaymentNotificationContext {
@@ -2079,17 +2083,22 @@ struct LeadSnapshot {
 /// we walk back through the `HAS_STUDENT` edge to the parent Lead.
 /// This lets the enrolment_fee flow (where the offer is per-student)
 /// reuse the same `/invoice` endpoint as the application_fee flow.
-async fn fetch_lead(graph: &Graph, admission_id: &str) -> Result<Option<LeadSnapshot>, String> {
+async fn fetch_lead(
+    graph: &Graph,
+    admission_id: &str,
+    tenant_id: &str,
+) -> Result<Option<LeadSnapshot>, String> {
     // Try it as a Lead id first — the common case for application_fee.
     let q = Query::new(
-        "MATCH (l:Lead {lead_id:$id}) \
+        "MATCH (l:Lead {lead_id:$id, tenant_id:$tenant_id}) \
          RETURN l.lead_id AS lead_id, l.parent_name AS parent_name, l.email AS email, \
                 coalesce(l.whatsapp, l.mobile, '') AS whatsapp, \
                 l.target_school_preference AS school \
          LIMIT 1"
             .to_string(),
     )
-    .param("id", admission_id.to_string());
+    .param("id", admission_id.to_string())
+    .param("tenant_id", tenant_id.to_string());
     let mut result = graph
         .execute(q)
         .await
@@ -2112,14 +2121,15 @@ async fn fetch_lead(graph: &Graph, admission_id: &str) -> Result<Option<LeadSnap
     // Enrolment-fee flow passes the student id because the Offer is
     // per-kid, not per-application.
     let q = Query::new(
-        "MATCH (l:Lead)-[:HAS_STUDENT]->(Student {studentId:$id}) \
+        "MATCH (l:Lead {tenant_id:$tenant_id})-[:HAS_STUDENT]->(Student {studentId:$id}) \
          RETURN l.lead_id AS lead_id, l.parent_name AS parent_name, l.email AS email, \
                 coalesce(l.whatsapp, l.mobile, '') AS whatsapp, \
                 l.target_school_preference AS school \
          LIMIT 1"
             .to_string(),
     )
-    .param("id", admission_id.to_string());
+    .param("id", admission_id.to_string())
+    .param("tenant_id", tenant_id.to_string());
     let mut result = graph
         .execute(q)
         .await

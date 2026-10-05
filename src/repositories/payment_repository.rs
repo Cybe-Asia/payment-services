@@ -529,7 +529,11 @@ fn review_order_by(sort: &str, dir: &str) -> String {
     match REVIEW_SORT_COLUMNS.iter().find(|(key, _)| *key == sort) {
         Some((_, expr)) => {
             let direction = if dir == "asc" { "ASC" } else { "DESC" };
-            if sort == "newest" { format!("ORDER BY {} {}, payment_id DESC", expr, direction) } else { format!("ORDER BY {} {}", expr, direction) }
+            if sort == "newest" {
+                format!("ORDER BY {} {}, payment_id DESC", expr, direction)
+            } else {
+                format!("ORDER BY {} {}", expr, direction)
+            }
         }
         None => "ORDER BY activity_at DESC, payment_id DESC".to_string(),
     }
@@ -707,13 +711,13 @@ pub async fn update_manual_bank_details(
 pub async fn find_active_manual_for_lead(
     graph: &Graph,
     lead_id: &str,
+    tenant_id: &str,
     payment_type: &str,
 ) -> Result<Option<Payment>, neo4rs::Error> {
     let q = Query::new(
-        "MATCH (:Lead {lead_id:$lead_id})-[:MADE_PAYMENT]->(p:Payment {payment_type:$payment_type}) \
+        "MATCH (l:Lead {lead_id:$lead_id, tenant_id:$tenant_id})-[:MADE_PAYMENT]->(p:Payment {payment_type:$payment_type, tenant_id:$tenant_id}) \
          WHERE p.payment_method = 'manual_transfer' \
            AND NOT coalesce(p.status, '') IN ['paid', 'expired', 'failed', 'cancelled'] \
-         OPTIONAL MATCH (l:Lead)-[:MADE_PAYMENT]->(p) \
          RETURN p.payment_id AS payment_id, p.tenant_id AS tenant_id, \
                 p.payment_type AS payment_type, p.status AS status, \
                 p.amount AS amount, p.currency AS currency, \
@@ -738,6 +742,7 @@ pub async fn find_active_manual_for_lead(
          LIMIT 1".to_string(),
     )
     .param("lead_id", lead_id.to_string())
+    .param("tenant_id", tenant_id.to_string())
     .param("payment_type", payment_type.to_string());
 
     let mut result = graph.execute(q).await?;
@@ -1343,7 +1348,10 @@ mod review_order_by_tests {
 
     #[test]
     fn absent_or_unknown_preserves_default() {
-        assert_eq!(review_order_by("", ""), "ORDER BY activity_at DESC, payment_id DESC");
+        assert_eq!(
+            review_order_by("", ""),
+            "ORDER BY activity_at DESC, payment_id DESC"
+        );
         // Injection attempt is not in the whitelist → default preserved.
         assert_eq!(
             review_order_by("p.x DESC //", "'; DROP"),
@@ -1407,19 +1415,70 @@ mod review_queue_contract_tests {
     #[tokio::test]
     #[ignore = "requires disposable ADMISSIONS_TEST_NEO4J_URI"]
     async fn review_filters_count_and_newest_order_are_tenant_scoped() {
-        let graph = Graph::new(&std::env::var("ADMISSIONS_TEST_NEO4J_URI").unwrap(), "neo4j", "test").await.unwrap();
+        let graph = Graph::new(
+            &std::env::var("ADMISSIONS_TEST_NEO4J_URI").unwrap(),
+            "neo4j",
+            "test",
+        )
+        .await
+        .unwrap();
         let tenant = format!("queue-test-{}", uuid::Uuid::new_v4());
         graph.run(Query::new("UNWIND [{id:'app',kind:'application_fee',day:1},{id:'capital',kind:'offer_due_now',day:3},{id:'legacy',kind:'enrolment_fee',day:2}] AS item CREATE (l:Lead {tenant_id:$tenant,lead_id:item.id,parent_name:'Synthetic',email:'test@example.test'})-[:MADE_PAYMENT]->(:Payment {tenant_id:$tenant,payment_id:item.id,payment_type:item.kind,payment_method:'manual_transfer',status:'pending_verification',amount:1,currency:'IDR',created_at:datetime({year:2026,month:9,day:item.day})})".into()).param("tenant",tenant.clone())).await.unwrap();
-        let filters = PaymentReviewFilters { payment_type:"",status:"pending_verification",school:"",search:"",date_from:"",date_to:"",sort:"newest",sort_dir:"desc" };
-        let all = list_review_rows(&graph,&tenant,filters,50,0).await.unwrap();
-        assert_eq!(all.iter().map(|r| r.payment_id.as_str()).collect::<Vec<_>>(),vec!["capital","legacy","app"]);
-        let capital = PaymentReviewFilters { payment_type:"capital_levy",..filters };
-        assert_eq!(count_review_rows(&graph,&tenant,capital).await.unwrap(),2);
-        assert_eq!(list_review_rows(&graph,&tenant,capital,1,1).await.unwrap()[0].payment_id,"legacy");
-        let app = PaymentReviewFilters { payment_type:"application_fee",..filters };
-        assert_eq!(count_review_rows(&graph,&tenant,app).await.unwrap(),1);
-        assert_eq!(list_review_rows(&graph,&tenant,app,50,0).await.unwrap()[0].payment_id,"app");
-        assert!(list_review_rows(&graph,"other-test-tenant",filters,50,0).await.unwrap().is_empty());
-        graph.run(Query::new("MATCH (n {tenant_id:$tenant}) DETACH DELETE n".into()).param("tenant",tenant)).await.unwrap();
+        let filters = PaymentReviewFilters {
+            payment_type: "",
+            status: "pending_verification",
+            school: "",
+            search: "",
+            date_from: "",
+            date_to: "",
+            sort: "newest",
+            sort_dir: "desc",
+        };
+        let all = list_review_rows(&graph, &tenant, filters, 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|r| r.payment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["capital", "legacy", "app"]
+        );
+        let capital = PaymentReviewFilters {
+            payment_type: "capital_levy",
+            ..filters
+        };
+        assert_eq!(
+            count_review_rows(&graph, &tenant, capital).await.unwrap(),
+            2
+        );
+        assert_eq!(
+            list_review_rows(&graph, &tenant, capital, 1, 1)
+                .await
+                .unwrap()[0]
+                .payment_id,
+            "legacy"
+        );
+        let app = PaymentReviewFilters {
+            payment_type: "application_fee",
+            ..filters
+        };
+        assert_eq!(count_review_rows(&graph, &tenant, app).await.unwrap(), 1);
+        assert_eq!(
+            list_review_rows(&graph, &tenant, app, 50, 0).await.unwrap()[0].payment_id,
+            "app"
+        );
+        assert!(
+            list_review_rows(&graph, "other-test-tenant", filters, 50, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        graph
+            .run(
+                Query::new("MATCH (n {tenant_id:$tenant}) DETACH DELETE n".into())
+                    .param("tenant", tenant),
+            )
+            .await
+            .unwrap();
     }
 }

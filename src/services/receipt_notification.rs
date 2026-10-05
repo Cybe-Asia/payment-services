@@ -49,10 +49,19 @@ async fn deliver_batch(
 }
 
 fn money(currency: &str, amount: i64) -> String {
-    let digits=amount.to_string();
-    let mut grouped=String::new();
-    for (i,c) in digits.chars().rev().enumerate() { if i>0 && i%3==0 { grouped.push('.'); } grouped.push(c); }
-    format!("{} {}",if currency=="IDR" {"Rp"} else {currency},grouped.chars().rev().collect::<String>())
+    let digits = amount.to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            grouped.push('.');
+        }
+        grouped.push(c);
+    }
+    format!(
+        "{} {}",
+        if currency == "IDR" { "Rp" } else { currency },
+        grouped.chars().rev().collect::<String>()
+    )
 }
 
 fn receipt_content(payment: &Payment, frontend: &str) -> (String, String, String) {
@@ -67,7 +76,13 @@ fn receipt_content(payment: &Payment, frontend: &str) -> (String, String, String
         .as_deref()
         .or(payment.reviewed_at.as_deref())
         .unwrap_or("Terverifikasi");
-    let paid_at=chrono::DateTime::parse_from_rfc3339(paid_at).map(|date| date.with_timezone(&chrono::FixedOffset::east_opt(7*3600).unwrap()).format("%d %b %Y, %H:%M WIB").to_string()).unwrap_or_else(|_| paid_at.to_string());
+    let paid_at = chrono::DateTime::parse_from_rfc3339(paid_at)
+        .map(|date| {
+            date.with_timezone(&chrono::FixedOffset::east_opt(7 * 3600).unwrap())
+                .format("%d %b %Y, %H:%M WIB")
+                .to_string()
+        })
+        .unwrap_or_else(|_| paid_at.to_string());
     let verified = payment.amount_verified.unwrap_or(payment.amount);
     let body = format!("IIEC School\nPEMBAYARAN TERVERIFIKASI — INVOICE LUNAS\n\nPembayaran application fee (biaya pendaftaran) telah terverifikasi.\n\nNomor invoice/referensi: {reference}\nID pembayaran: {}\nTotal tagihan: {}\nJumlah terverifikasi: {}\nTanggal verifikasi/pembayaran: {paid_at}\nStatus: LUNAS\n\nKode tes untuk setiap anak akan dikirim dalam email terpisah ketika akses tes siap. Anda juga dapat membuka atau memilih tes melalui portal parent.\n\nBuka portal: {portal}\n\nSimpan email ini sebagai catatan pembayaran application fee IIEC.", payment.payment_id,money(&payment.currency,payment.amount),money(&payment.currency,verified));
     let html = crate::utils::branded_email::branded_html(&body, frontend);

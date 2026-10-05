@@ -296,6 +296,41 @@ async fn staff_roles_for_email(
         .unwrap_or_default())
 }
 
+/// Resolve legacy Lead or Student request identifiers before any payment mutation.
+pub async fn owns_admission(
+    graph: &Graph,
+    parent: &ParentAuth,
+    id: &str,
+    tenant_id: &str,
+) -> Result<bool, String> {
+    let mut rows = graph
+        .execute(
+            Query::new(
+                "MATCH (l:Lead {tenant_id:$tenant_id}) WHERE l.lead_id IN $owned \
+         OPTIONAL MATCH (l)-[:HAS_STUDENT]->(s:Student) \
+         WITH l, collect(s.studentId) AS children \
+         WHERE l.lead_id = $id OR $id IN children RETURN l.lead_id AS id LIMIT 2"
+                    .into(),
+            )
+            .param("owned", parent.lead_ids.clone())
+            .param("tenant_id", tenant_id.to_string())
+            .param("id", id.to_string()),
+        )
+        .await
+        .map_err(|_| "Payment authorization unavailable".to_string())?;
+    let found = rows
+        .next()
+        .await
+        .map_err(|_| "Payment authorization unavailable".to_string())?
+        .is_some();
+    let duplicate = rows
+        .next()
+        .await
+        .map_err(|_| "Payment authorization unavailable".to_string())?
+        .is_some();
+    Ok(found && !duplicate)
+}
+
 pub fn owns_lead(auth: &ParentAuth, lead_id: Option<&str>) -> bool {
     let Some(lead_id) = lead_id else {
         return false;

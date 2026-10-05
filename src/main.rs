@@ -17,6 +17,7 @@ mod handlers;
 mod models;
 mod repositories;
 mod routes;
+mod school_invoice;
 mod services;
 mod utils;
 
@@ -64,6 +65,14 @@ fn load_env() {
     }
 }
 
+fn bootstrap_enabled(value: Option<&str>) -> Result<bool, &'static str> {
+    match value {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        _ => Err("PAYMENT_BOOTSTRAP_ENABLED must be true or false"),
+    }
+}
+
 async fn health_check() -> axum::response::Json<serde_json::Value> {
     axum::response::Json(json!({ "status": "ok" }))
 }
@@ -76,6 +85,8 @@ async fn main() {
         .init();
 
     let cfg = load();
+    let bootstrap = bootstrap_enabled(std::env::var("PAYMENT_BOOTSTRAP_ENABLED").ok().as_deref())
+        .expect("invalid payment bootstrap configuration");
 
     // Read-only audit exits before graph initialization, seeding or notification workers.
     if std::env::args().any(|arg| arg == "--audit-document-encryption") {
@@ -109,14 +120,30 @@ async fn main() {
         return;
     }
 
+    // Explicit, additive schema migration; no fee seed, provider or worker startup.
+    if std::env::args().any(|arg| arg == "--migrate-school-invoices") {
+        let graph = create_graph(&cfg.neo4j_uri, &cfg.neo4j_user, &cfg.neo4j_password)
+            .await
+            .expect("school invoice graph unavailable");
+        school_invoice::repository::init(&graph)
+            .await
+            .expect("school invoice schema migration failed");
+        info!("school invoice schema migration complete");
+        return;
+    }
+
     let graph = match create_graph(&cfg.neo4j_uri, &cfg.neo4j_user, &cfg.neo4j_password).await {
         Ok(g) => {
             let arc = Arc::new(g);
-            if let Err(e) = seed_fees(&arc, &cfg.tenant_id).await {
-                warn!("seed failed (continuing): {e}");
-            }
-            if let Err(e) = repositories::payment_repository::init_doku_indexes(&arc).await {
-                warn!("DOKU idempotency index initialization failed (continuing): {e}");
+            if bootstrap {
+                if let Err(e) = seed_fees(&arc, &cfg.tenant_id).await {
+                    warn!("seed failed (continuing): {e}");
+                }
+                if let Err(e) = repositories::payment_repository::init_doku_indexes(&arc).await {
+                    warn!("DOKU idempotency index initialization failed (continuing): {e}");
+                }
+            } else {
+                info!("payment startup bootstrap disabled; existing graph retained");
             }
             Some(arc)
         }
@@ -224,11 +251,27 @@ async fn main() {
     let app: Router = Router::new()
         .route("/api/v1/payments/health", get(health_check))
         .merge(routes::payment_routes::routes())
+        .merge(school_invoice::router())
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
-    let addr = format!("0.0.0.0:{}", cfg.server_port);
+    let server_host = std::env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".into());
+    let addr = format!("{}:{}", server_host, cfg.server_port);
     info!("starting payment-service on {}", addr);
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::bootstrap_enabled;
+
+    #[test]
+    fn bootstrap_requires_explicit_valid_opt_out() {
+        assert_eq!(bootstrap_enabled(None), Ok(true));
+        assert_eq!(bootstrap_enabled(Some("true")), Ok(true));
+        assert_eq!(bootstrap_enabled(Some("false")), Ok(false));
+        assert!(bootstrap_enabled(Some("flase")).is_err());
+        assert!(bootstrap_enabled(Some("")).is_err());
+    }
 }

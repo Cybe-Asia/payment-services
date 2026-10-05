@@ -335,6 +335,7 @@ pub async fn reconcile_doku_payment_handler(
 #[utoipa::path(post, path = "/api/v1/payments/invoice")]
 pub async fn create_invoice_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<CreateInvoiceRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if !state.legacy_parent_payments_enabled {
@@ -346,6 +347,20 @@ pub async fn create_invoice_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
+    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+        Ok(parent) => parent,
+        Err((status, message)) => return fail(status, &message),
+    };
+    match auth::owns_admission(&graph, &parent, &payload.admission_id, &state.tenant_id).await {
+        Ok(true) => {}
+        Ok(false) => return fail(StatusCode::NOT_FOUND, "Admission not found"),
+        Err(_) => {
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Payment authorization unavailable",
+            )
+        }
+    }
     let ctx = PaymentContext {
         graph,
         xendit: &state.xendit,
@@ -408,16 +423,15 @@ pub async fn create_manual_payment_handler(
         Ok(auth) => auth,
         Err((status, msg)) => return fail(status, &msg),
     };
-    if payload.admission_id.starts_with("LEAD-")
-        && !parent
-            .lead_ids
-            .iter()
-            .any(|lead_id| lead_id == &payload.admission_id)
-    {
-        return fail(
-            StatusCode::FORBIDDEN,
-            "Admission does not belong to the current session",
-        );
+    match auth::owns_admission(&graph, &parent, &payload.admission_id, &state.tenant_id).await {
+        Ok(true) => {}
+        Ok(false) => return fail(StatusCode::NOT_FOUND, "Admission not found"),
+        Err(_) => {
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Payment authorization unavailable",
+            )
+        }
     }
 
     let ctx = PaymentContext {
@@ -886,11 +900,26 @@ fn is_allowed_proof_mime(mime: &str) -> bool {
 #[utoipa::path(get, path = "/api/v1/payments/preview")]
 pub async fn preview_invoice_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<PreviewQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
+    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+        Ok(parent) => parent,
+        Err((status, message)) => return fail(status, &message),
+    };
+    match auth::owns_admission(&graph, &parent, &q.admission_id, &state.tenant_id).await {
+        Ok(true) => {}
+        Ok(false) => return fail(StatusCode::NOT_FOUND, "Admission not found"),
+        Err(_) => {
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Payment authorization unavailable",
+            )
+        }
+    }
     match payment_service::preview_invoice(
         &graph,
         &state.tenant_id,
@@ -918,13 +947,30 @@ pub async fn preview_invoice_handler(
 #[utoipa::path(get, path = "/api/v1/payments/{payment_id}")]
 pub async fn get_payment_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(payment_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let Some(graph) = state.graph.clone() else {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Payment unavailable");
+    };
+    let parent = match auth::require_parent_auth(&graph, &headers, &state.jwt_secret).await {
+        Ok(parent) => parent,
+        Err((status, message)) => return fail(status, &message),
+    };
+    // Authorize before refresh: a status read may contact the provider and reconcile a payment.
+    let current = match crate::repositories::payment_repository::find_by_id_for_tenant(
+        &graph,
+        &payment_id,
+        &state.tenant_id,
+    )
+    .await
+    {
+        Ok(Some(payment)) if auth::owns_lead(&parent, payment.lead_id.as_deref()) => payment,
+        Ok(_) => return fail(StatusCode::NOT_FOUND, "Payment not found"),
+        Err(_) => return fail(StatusCode::SERVICE_UNAVAILABLE, "Payment unavailable"),
     };
     match payment_service::fetch_payment_refreshed(&graph, &state.xendit, &payment_id).await {
-        Ok(Some(p)) => {
+        Ok(Some(p)) if p.tenant_id == current.tenant_id && p.lead_id == current.lead_id => {
             if p.status == "paid" {
                 queue_payment_status_notification(&state, &graph, &p, "payment_approved").await;
             }
@@ -933,11 +979,8 @@ pub async fn get_payment_handler(
                 Json(serde_json::to_value(ApiResponse::success(p)).unwrap()),
             )
         }
-        Ok(None) => fail(StatusCode::NOT_FOUND, "Payment not found"),
-        Err(e) => {
-            error!("fetch_payment failed: {e}");
-            fail(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Ok(_) => fail(StatusCode::NOT_FOUND, "Payment not found"),
+        Err(_) => fail(StatusCode::SERVICE_UNAVAILABLE, "Payment unavailable"),
     }
 }
 
@@ -1905,3 +1948,7 @@ fn school_label(school: &str) -> String {
         format!("({})", label)
     }
 }
+
+#[cfg(test)]
+#[path = "payment_parent_acceptance.rs"]
+mod parent_acceptance;

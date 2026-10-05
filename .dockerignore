@@ -1,6 +1,9 @@
-target
 .git
 .github
 .env*
-*.md
-Dockerfile
+target
+output
+*.log
+*.key
+*.pem
+__pycache__

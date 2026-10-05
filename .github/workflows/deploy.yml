@@ -26,7 +26,7 @@ jobs:
           import json, os
           from pathlib import Path
           source = json.loads(Path('release-evidence/source.json').read_text())
-          image = 'ghcr.io/' + os.environ['GITHUB_REPOSITORY'].lower() + ':sha-' + source['revision']
+          image = 'ghcr.io/cybe-asia/payment-services-staging' + ':sha-' + source['revision']
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('image=' + image + '\n')
               output.write('revision=' + source['revision'] + '\n')

@@ -92,6 +92,14 @@ pub fn routes() -> Router<AppState> {
             post(payment_handler::admin_assist_manual_payment_handler),
         )
         .route(
+            "/api/v1/payments/admin/leads/:lead_id/payable-offers",
+            get(payment_handler::admin_payable_offers_handler),
+        )
+        .route(
+            "/api/v1/payments/admin/offers/:offer_id/manual",
+            post(payment_handler::admin_assist_offer_manual_payment_handler),
+        )
+        .route(
             "/api/v1/payments/admin/payments/:payment_id/proofs",
             post(payment_handler::admin_assist_proof_handler)
                 .layer(DefaultBodyLimit::max(PROOF_UPLOAD_MAX_BYTES)),

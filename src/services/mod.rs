@@ -9,3 +9,6 @@ pub mod notification_guard;
 pub mod receipt_notification;
 
 pub mod automatic_offer_invoice;
+
+#[cfg(test)]
+mod payable_offers_tests;

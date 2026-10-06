@@ -283,6 +283,45 @@ pub async fn offer_payment_settings(
     Ok(settings)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayableOffer {
+    pub offer_id: String,
+    pub student_name: String,
+    pub amount_due_now: i64,
+    pub currency: String,
+    pub payment_id: Option<String>,
+    pub payment_status: Option<String>,
+}
+
+/// Enrolment (offer due-now) obligations staff can record a desk payment
+/// for: offers the parent already accepted and that are not paid yet.
+pub async fn list_payable_offers(
+    graph: &Graph,
+    tenant_id: &str,
+    lead_id: &str,
+) -> Result<Vec<PayableOffer>, String> {
+    let rows = payment_repository::list_accepted_unpaid_offers(graph, lead_id, tenant_id)
+        .await
+        .map_err(|e| format!("payable offers lookup failed: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(
+            |(offer_id, student_name, pricing, payment_id, payment_status)| {
+                let pricing: AcceptedPricingSnapshot = serde_json::from_str(&pricing).ok()?;
+                (pricing.amount_due_now > 0).then_some(PayableOffer {
+                    offer_id,
+                    student_name,
+                    amount_due_now: pricing.amount_due_now,
+                    currency: pricing.currency,
+                    payment_id,
+                    payment_status,
+                })
+            },
+        )
+        .collect())
+}
+
 pub async fn create_offer_manual_payment(
     graph: &Graph,
     tenant_id: &str,

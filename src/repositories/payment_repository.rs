@@ -1006,6 +1006,62 @@ pub async fn create_payment_proof(
     Ok(payment_proof_from_row(&row))
 }
 
+/// Lead that owns an offer (tenant-scoped), for staff scope checks.
+pub async fn find_offer_lead_id(
+    graph: &Graph,
+    offer_id: &str,
+    tenant_id: &str,
+) -> Result<Option<String>, neo4rs::Error> {
+    let q = Query::new(
+        "MATCH (l:Lead {tenant_id:$tenant_id})-[:HAS_STUDENT]->(:Student)-[:HAS_OFFER]->(o:Offer {offer_id:$offer_id}) \
+         RETURN l.lead_id AS lead_id LIMIT 1"
+            .to_string(),
+    )
+    .param("offer_id", offer_id.to_string())
+    .param("tenant_id", tenant_id.to_string());
+    let mut rows = graph.execute(q).await?;
+    Ok(rows
+        .next()
+        .await?
+        .and_then(|row| row.get::<String>("lead_id")))
+}
+
+/// Parent-accepted, not yet paid offers of a lead with their latest payment.
+/// Rows: (offer id, child name, pricing snapshot json, payment id, payment status).
+pub async fn list_accepted_unpaid_offers(
+    graph: &Graph,
+    lead_id: &str,
+    tenant_id: &str,
+) -> Result<Vec<(String, String, String, Option<String>, Option<String>)>, neo4rs::Error> {
+    let q = Query::new(
+        "MATCH (l:Lead {lead_id:$lead_id, tenant_id:$tenant_id})-[:HAS_STUDENT]->(s:Student)-[:HAS_OFFER]->(o:Offer {tenant_id:$tenant_id}) \
+         MATCH (o)-[:ACCEPTED_VIA]->(:OfferAcceptance) \
+         WHERE coalesce(o.payment_status, '') <> 'paid' \
+         OPTIONAL MATCH (o)-[:PAID_VIA]->(p:Payment) \
+         WITH s, o, p ORDER BY p.created_at DESC \
+         WITH s, o, head(collect(p)) AS p \
+         RETURN o.offer_id AS offer_id, coalesce(s.fullName, '') AS child, \
+                coalesce(o.pricing_snapshot_json, '') AS pricing, \
+                p.payment_id AS payment_id, p.status AS payment_status \
+         ORDER BY child"
+            .to_string(),
+    )
+    .param("lead_id", lead_id.to_string())
+    .param("tenant_id", tenant_id.to_string());
+    let mut rows = graph.execute(q).await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        out.push((
+            row.get::<String>("offer_id").unwrap_or_default(),
+            row.get::<String>("child").unwrap_or_default(),
+            row.get::<String>("pricing").unwrap_or_default(),
+            row.get::<String>("payment_id"),
+            row.get::<String>("payment_status"),
+        ));
+    }
+    Ok(out)
+}
+
 /// Segregation of duties: true when `actor` uploaded live (non-rejected)
 /// evidence on this payment, so they must not also approve it.
 pub async fn actor_uploaded_live_proof(

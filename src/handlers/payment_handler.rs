@@ -726,6 +726,133 @@ pub struct AssistManualPaymentRequest {
     pub manual_bank_account_id: Option<String>,
 }
 
+fn offer_payment_error_status(message: &str) -> StatusCode {
+    if message.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("disabled") || message.contains("not configured") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if message.contains("snapshot")
+        || message.contains("payment method")
+        || message.contains("terminal")
+    {
+        StatusCode::CONFLICT
+    } else if message.contains("bank account") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+/// GET /api/v1/payments/admin/leads/{lead_id}/payable-offers — offers the
+/// parent accepted that still await the enrolment (due-now) payment, so
+/// staff can record a desk payment. Staff role + lead scope.
+pub async fn admin_payable_offers_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(lead_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    let staff = match auth::require_staff(&graph, &headers, &state.jwt_secret).await {
+        Ok(auth) => auth,
+        Err((status, msg)) => return fail(status, &msg),
+    };
+    match auth::staff_can_reach_lead(&graph, &staff, &lead_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return fail(
+                StatusCode::FORBIDDEN,
+                "Lead is outside your staff visibility scope",
+            )
+        }
+        Err((status, msg)) => return fail(status, &msg),
+    }
+    match payment_service::list_payable_offers(&graph, &state.tenant_id, &lead_id).await {
+        Ok(offers) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(ApiResponse::success(offers)).unwrap()),
+        ),
+        Err(e) => {
+            error!("admin_payable_offers failed: {e}");
+            fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Payable offers unavailable",
+            )
+        }
+    }
+}
+
+/// POST /api/v1/payments/admin/offers/{offer_id}/manual — staff opens (or
+/// resumes) the manual-transfer payment for a parent-accepted offer, using
+/// the accepted pricing snapshot (same as the parent flow). Staff never
+/// accept offers; an offer the parent has not accepted is a 409/404.
+pub async fn admin_assist_offer_manual_payment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(offer_id): Path<String>,
+    Json(payload): Json<CreateOfferManualPaymentBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(graph) = state.graph.clone() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    };
+    let staff = match auth::require_staff(&graph, &headers, &state.jwt_secret).await {
+        Ok(auth) => auth,
+        Err((status, msg)) => return fail(status, &msg),
+    };
+    let lead_id = match crate::repositories::payment_repository::find_offer_lead_id(
+        &graph,
+        &offer_id,
+        &state.tenant_id,
+    )
+    .await
+    {
+        Ok(Some(lead_id)) => lead_id,
+        Ok(None) => return fail(StatusCode::NOT_FOUND, "Offer not found"),
+        Err(_) => return fail(StatusCode::SERVICE_UNAVAILABLE, "Offer lookup unavailable"),
+    };
+    match auth::staff_can_reach_lead(&graph, &staff, &lead_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return fail(
+                StatusCode::FORBIDDEN,
+                "Lead is outside your staff visibility scope",
+            )
+        }
+        Err((status, msg)) => return fail(status, &msg),
+    }
+    match payment_service::create_offer_manual_payment(
+        &graph,
+        &state.tenant_id,
+        &offer_id,
+        std::slice::from_ref(&lead_id),
+        payload.manual_bank_account_id.as_deref(),
+        state.default_due_hours,
+        &state.payment_settings_seed,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            emit_staff_audit(
+                graph,
+                staff.email,
+                "payment.offer_manual.assisted",
+                "lead",
+                lead_id,
+            );
+            let data = ManualPaymentResponseData {
+                payment: outcome.payment,
+                settings: outcome.settings,
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(ApiResponse::success(data)).unwrap()),
+            )
+        }
+        Err(message) => fail(offer_payment_error_status(&message), &message),
+    }
+}
+
 /// POST /api/v1/payments/admin/leads/{lead_id}/manual — staff opens (or
 /// resumes) a manual-transfer payment for a lead, mirroring what the parent's
 /// own "pay by bank transfer" click does.

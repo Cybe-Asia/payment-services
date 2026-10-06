@@ -1,6 +1,6 @@
 {
   "files": {
-    "src/main.rs": "9b774ba370ef8e78bb3173fab18088c8557b679e56c383b24382a3d79eadc094",
+    "src/main.rs": "b7de541f666896c13a29402f1140c37fb890d2ce61b6ae13928d65b00b8a36ab",
     "src/dto/webhook.rs": "fd0ecc055cc9ae238377a61b68dad79b21fda7ce0e5cf48360d741334822ed34",
     "src/dto/update_fee_request.rs": "1259cccea40f2dfd65b36984b9f799f456caeffe041144ede8766c0dd4709304",
     "src/dto/mod.rs": "87db35353025e58794a8a9bd53425cefc7efca351e6f943a578610ebc1e03192",
@@ -24,7 +24,7 @@
     "src/repositories/school_repository.rs": "d554b659e625b0935a84f07a2bb683af060d018f39e0627cadaf4ba8db34849f",
     "src/repositories/promotion_repository.rs": "efdba529ee474652a4564a09319b15fd0f28187bd7ae3fca4738cb9ccde04a09",
     "src/repositories/mod.rs": "5e8a52ae6ad038292026ebf81007c60edab2fa29257557954e7266d2d0217850",
-    "src/repositories/receipt_notification_repository.rs": "fb05d397b27c8f55af021eeed61fd3f320a4420fd262802842c1400ea7230d77",
+    "src/repositories/receipt_notification_repository.rs": "f3a52733fc0462c2f425a3544f084aba40a154b12a06dee7a1b71bc8eedd39b4",
     "src/repositories/fee_obligation_repository.rs": "29d811f5455a9c2c2d176d3411acb3168dfe43647add47c4221e2a49adfb120d",
     "src/repositories/payment_settings_repository.rs": "971c5a83c3e0750471fe3886dd1b2d8c055a35e2d095890976b688eb0435f167",
     "src/repositories/seed.rs": "dfee77be64a71019e3e3885351fc675c6deabe4529beceb69282fe4f5d729c03",
@@ -51,20 +51,21 @@
     "src/handlers/fee_handler.rs": "e911a8919a0d70ce067bbdc8df970d97d7913d03d07bb0f74e4c3c6060a0f855",
     "src/handlers/payment_parent_acceptance.rs": "9c6a888ee76d9500b91d71aebb1ce13726f5ced6edf4f6480552425c65c8cd6b",
     "src/services/payment_service.rs": "c2523195307bbf78092729e3fc1c972a898a774a099a05969823db893df9d288",
-    "src/services/invoice_notification.rs": "a4b21e05716dc03d384aba93ec2600b0f1bdafc1fd37f86185a67ea09dc56c42",
-    "src/services/automatic_offer_invoice.rs": "e39f17d9a7ebb2f23d0c406f602933afada5104bf777d08a17cd9b59f9c7ec1b",
+    "src/services/invoice_notification.rs": "24712570cc0449739ef10626e1f5ea4dcc82d6c8def165cf20ece146c2aba0b9",
+    "src/services/automatic_offer_invoice.rs": "3ede4de63130f421d525ca249fd15f4302d53ae29a14cf18379a42e7297fa3b9",
     "src/services/document_encryption.rs": "a5331158667a189b638357fb487e74cb25125bc5871dba0f8d815b25b88d8a37",
-    "src/services/mod.rs": "8ff3f52ee3243b43d324e03e4226d1dd4210405b592c727c290322ec0b382117",
-    "src/services/receipt_notification.rs": "17914c17ad76b60473f2d854c7fbec405cdbb3ec19e7ab4378e54c79c1c739ba",
+    "src/services/mod.rs": "b2ae3d35ce501498ca0c3396cc025f7d1a8d8d1a8e4271e71bbcc4ca5801f368",
+    "src/services/receipt_notification.rs": "b83b6051d45373250a94b15b70f40392ce4e234fea1bd9cd77f32cc97feecfee",
     "src/services/payment_document.rs": "ff039af21746d49d0a4a1f4fe16e08938dc5a8d360ef7d3fb3397634c3849e74",
     "Cargo.toml": "a66f489ed416971f6a7e9c8b491e3fc4dac5f2d3a0e35293e9d49536a9729243",
     "Cargo.lock": "25e364c461252a083ef95d323643e8db6af2b6122c3c92b658a4305090c59211",
-    "Dockerfile": "5b596bc696ce20dada33f8178b6b47d6e0e89fa65aeecb44cf72300de2824aac",
+    "Dockerfile": "9d3ffba9e7ad6065b7aa860ef4d9294f3b357d561145d69f71fa472d7cf29c73",
     ".dockerignore": "31bd6a1b28b121c9add152ddbca41c3b6a9c6d4e8cab6c499ee1f5a1c0e3486d",
     "assets/payment-documents/iihs-invoice.jpg": "baada0c471abb60594e10af0a811bf68d1ac5944bf9de0757e894bf4ba935bfc",
     "assets/payment-documents/iihs-receipt.jpg": "0435ad38f901ac6a4d07970df61d0ee7410d9d8abff43bf0a8f6c08207c755ce",
     "assets/payment-documents/iiss-invoice.jpg": "1d3530b74b3d35fca0ffc7776bd4db54e3bd98533713902749bb74c285531a80",
-    "assets/payment-documents/iiss-receipt.jpg": "15ea81bc9eff650df84b844f1aef0a01adfeaafcd8e3a4870c14d79e2cc03b38"
+    "assets/payment-documents/iiss-receipt.jpg": "15ea81bc9eff650df84b844f1aef0a01adfeaafcd8e3a4870c14d79e2cc03b38",
+    "src/services/notification_guard.rs": "682e37ea74955ab8e54eabdacbdf40c40c9c5a8219fa751099c94e1d4bedb13f"
   },
   "scope": "approved current web integration; school-staging; no automatic GitOps or production promotion"
 }

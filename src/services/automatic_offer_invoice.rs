@@ -1,5 +1,7 @@
 //! Creates exactly one manual-transfer invoice from a newly accepted immutable offer.
-//! It never charges a gateway or infers a bank account.
+//! It never charges a gateway or infers a bank account. Offers accepted before the
+//! activation guard instant, or for recipients outside its allowlist, stay queued.
+use crate::services::notification_guard::ActivationGuard;
 use crate::{services::payment_service, AppState};
 use neo4rs::{query, Graph};
 struct Work {
@@ -9,10 +11,14 @@ struct Work {
     nonce: String,
     attempts: i64,
 }
-async fn claim(graph: &Graph, tenant: &str) -> Result<Option<Work>, neo4rs::Error> {
+async fn claim(
+    graph: &Graph,
+    tenant: &str,
+    guard: &ActivationGuard,
+) -> Result<Option<Work>, neo4rs::Error> {
     graph.run(query("MATCH (o:Offer {tenant_id:$tenant,auto_generated:true,invoice_creation_status:'sending'}) WHERE o.invoice_creation_attempts>=5 AND o.invoice_creation_next<=datetime() SET o.invoice_creation_status='failed' REMOVE o.invoice_creation_nonce").param("tenant",tenant)).await?;
     let nonce = uuid::Uuid::new_v4().to_string();
-    let mut rows=graph.execute(query("MATCH (l:Lead {tenant_id:$tenant})-[:HAS_STUDENT]->(:Student)-[:HAS_OFFER]->(o:Offer {tenant_id:$tenant,auto_generated:true,status:'accepted'}) WHERE o.invoice_creation_status IN ['queued','retry','sending'] AND coalesce(o.invoice_creation_attempts,0)<5 AND (o.invoice_creation_next IS NULL OR o.invoice_creation_next<=datetime()) WITH l,o LIMIT 1 SET o.invoice_creation_lock=coalesce(o.invoice_creation_lock,0)+1 WITH l,o WHERE o.invoice_creation_status IN ['queued','retry','sending'] AND coalesce(o.invoice_creation_attempts,0)<5 AND (o.invoice_creation_next IS NULL OR o.invoice_creation_next<=datetime()) SET o.invoice_creation_status='sending',o.invoice_creation_nonce=$nonce,o.invoice_creation_next=datetime()+duration('PT120S'),o.invoice_creation_attempts=coalesce(o.invoice_creation_attempts,0)+1 RETURN l.lead_id AS lead,o.offer_id AS offer,o.bank_account_id AS bank,o.invoice_creation_attempts AS attempts").param("tenant",tenant).param("nonce",nonce.clone())).await?;
+    let mut rows=graph.execute(query("MATCH (l:Lead {tenant_id:$tenant})-[:HAS_STUDENT]->(:Student)-[:HAS_OFFER]->(o:Offer {tenant_id:$tenant,auto_generated:true,status:'accepted'}) WHERE o.invoice_creation_status IN ['queued','retry','sending'] AND coalesce(o.invoice_creation_attempts,0)<5 AND (o.invoice_creation_next IS NULL OR o.invoice_creation_next<=datetime()) AND EXISTS { MATCH (o)-[:ACCEPTED_VIA]->(a:OfferAcceptance {status:'accepted'}) WHERE a.responded_at>=datetime($activated_at) } AND ($all_recipients OR toLower(trim(l.email)) IN $recipients) WITH l,o ORDER BY o.updated_at LIMIT 1 SET o.invoice_creation_lock=coalesce(o.invoice_creation_lock,0)+1 WITH l,o WHERE o.invoice_creation_status IN ['queued','retry','sending'] AND coalesce(o.invoice_creation_attempts,0)<5 AND (o.invoice_creation_next IS NULL OR o.invoice_creation_next<=datetime()) SET o.invoice_creation_status='sending',o.invoice_creation_nonce=$nonce,o.invoice_creation_next=datetime()+duration('PT120S'),o.invoice_creation_attempts=coalesce(o.invoice_creation_attempts,0)+1 RETURN l.lead_id AS lead,o.offer_id AS offer,o.bank_account_id AS bank,o.invoice_creation_attempts AS attempts").param("tenant",tenant).param("nonce",nonce.clone()).param("activated_at",guard.activated_at.clone()).param("all_recipients",guard.all_recipients()).param("recipients",guard.recipient_list())).await?;
     Ok(rows.next().await?.map(|r| Work {
         offer: r.get("offer").unwrap_or_default(),
         lead: r.get("lead").unwrap_or_default(),
@@ -21,12 +27,12 @@ async fn claim(graph: &Graph, tenant: &str) -> Result<Option<Work>, neo4rs::Erro
         nonce,
     }))
 }
-pub fn start_worker(state: AppState) {
+pub fn start_worker(state: AppState, guard: ActivationGuard) {
     tokio::spawn(async move {
         loop {
             if let Some(graph) = state.graph.as_ref() {
                 for _ in 0..20 {
-                    let w = match claim(graph, &state.tenant_id).await {
+                    let w = match claim(graph, &state.tenant_id, &guard).await {
                         Ok(Some(w)) => w,
                         _ => break,
                     };
@@ -76,14 +82,15 @@ mod tests {
         .unwrap();
         payment_repository::init_doku_indexes(&graph).await.unwrap();
         let id = format!("auto-invoice-test-{}", uuid::Uuid::new_v4());
+        let guard = ActivationGuard::parse(Some("2000-01-01T00:00:00Z"), Some("*")).unwrap();
         let json =
             r#"{"snapshotVersion":"offer-pricing-v1","currency":"IDR","amountDueNow":9000000}"#;
         let hash = hex::encode(Sha256::digest(json.as_bytes()));
-        graph.run(query("CREATE (l:Lead {tenant_id:$id,lead_id:$id,email:'parent@example.invalid'})-[:HAS_STUDENT]->(s:Student {studentId:$id,applicantStatus:'offer_accepted'}) CREATE (s)-[:REQUIRES_DOCUMENT]->(:DocumentRequest {request_type:'application_document_pack',status:'approved'}) CREATE (s)-[:HAS_OFFER]->(o:Offer {offer_id:$id,tenant_id:$id,status:'accepted',auto_generated:true,bank_account_id:'BANK-A',invoice_creation_status:'queued',revision:1,pricing_snapshot_json:$json,pricing_snapshot_hash:$hash,terms_hash:'terms'}) CREATE (o)-[:ACCEPTED_VIA]->(:OfferAcceptance {status:'accepted',offer_revision:1,pricing_snapshot_hash:$hash,terms_hash:'terms'}) CREATE (:PaymentSettings {tenant_id:$id,manual_transfer_enabled:true,manual_bank_accounts_json:$banks})").param("id",id.clone()).param("json",json).param("hash",hash).param("banks",r#"[{"id":"BANK-A","bankName":"Test Bank","accountName":"Test School","accountNumber":"12345","enabled":true,"instructions":"Synthetic only"}]"#)).await.unwrap();
-        assert!(claim(&graph, "other-tenant").await.unwrap().is_none());
-        let w = claim(&graph, &id).await.unwrap().unwrap();
+        graph.run(query("CREATE (l:Lead {tenant_id:$id,lead_id:$id,email:'parent@example.invalid'})-[:HAS_STUDENT]->(s:Student {studentId:$id,applicantStatus:'offer_accepted'}) CREATE (s)-[:REQUIRES_DOCUMENT]->(:DocumentRequest {request_type:'application_document_pack',status:'approved'}) CREATE (s)-[:HAS_OFFER]->(o:Offer {offer_id:$id,tenant_id:$id,status:'accepted',auto_generated:true,bank_account_id:'BANK-A',invoice_creation_status:'queued',revision:1,pricing_snapshot_json:$json,pricing_snapshot_hash:$hash,terms_hash:'terms'}) CREATE (o)-[:ACCEPTED_VIA]->(:OfferAcceptance {status:'accepted',responded_at:datetime(),offer_revision:1,pricing_snapshot_hash:$hash,terms_hash:'terms'}) CREATE (:PaymentSettings {tenant_id:$id,manual_transfer_enabled:true,manual_bank_accounts_json:$banks})").param("id",id.clone()).param("json",json).param("hash",hash).param("banks",r#"[{"id":"BANK-A","bankName":"Test Bank","accountName":"Test School","accountNumber":"12345","enabled":true,"instructions":"Synthetic only"}]"#)).await.unwrap();
+        assert!(claim(&graph, "other-tenant", &guard).await.unwrap().is_none());
+        let w = claim(&graph, &id, &guard).await.unwrap().unwrap();
         assert_eq!(w.bank, "BANK-A");
-        assert!(claim(&graph, &id).await.unwrap().is_none());
+        assert!(claim(&graph, &id, &guard).await.unwrap().is_none());
         let seed = PaymentSettingsSeed {
             tenant_id: id.clone(),
             bank_name: String::new(),

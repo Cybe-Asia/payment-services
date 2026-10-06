@@ -1,8 +1,10 @@
+use crate::services::notification_guard::ActivationGuard;
 use neo4rs::{query, Graph};
 const MAX_ATTEMPTS: i64 = 5;
 pub async fn claim(
     graph: &Graph,
     tenant: &str,
+    guard: &ActivationGuard,
     id: &str,
     nonce: &str,
 ) -> Result<Option<String>, neo4rs::Error> {
@@ -13,11 +15,14 @@ pub async fn claim(
            AND coalesce(p.receipt_email_attempts,0)<$max
            AND (p.receipt_email_next_at IS NULL OR p.receipt_email_next_at<=datetime())
            AND p.status='paid' AND p.payment_type='application_fee'
+           AND p.paid_at>=datetime($activated_at)
+           AND ($all_recipients OR toLower(trim(l.email)) IN $recipients)
          SET p.receipt_email_status='sending',p.receipt_email_nonce=$nonce,
              p.receipt_email_attempts=coalesce(p.receipt_email_attempts,0)+1,
              p.receipt_email_next_at=datetime()+duration({seconds:120})
          RETURN l.email AS email")
-        .param("tenant",tenant).param("id",id).param("nonce",nonce).param("max",MAX_ATTEMPTS)).await?;
+        .param("tenant",tenant).param("id",id).param("nonce",nonce).param("max",MAX_ATTEMPTS)
+        .param("activated_at",guard.activated_at.clone()).param("all_recipients",guard.all_recipients()).param("recipients",guard.recipient_list())).await?;
     Ok(rows
         .next()
         .await?
@@ -38,16 +43,24 @@ pub async fn complete(
         .param("tenant",tenant).param("id",id).param("nonce",nonce).param("sent",sent).param("max",MAX_ATTEMPTS)).await
 }
 
-pub async fn pending_ids(graph: &Graph, tenant: &str) -> Result<Vec<String>, neo4rs::Error> {
+pub async fn pending_ids(
+    graph: &Graph,
+    tenant: &str,
+    guard: &ActivationGuard,
+) -> Result<Vec<String>, neo4rs::Error> {
     graph.run(query("MATCH (p:Payment {tenant_id:$tenant,receipt_email_status:'sending'}) WHERE p.receipt_email_attempts >= $max AND p.receipt_email_next_at<=datetime() SET p.receipt_email_status='failed',p.receipt_email_updated_at=datetime()")
         .param("tenant",tenant.to_string()).param("max",MAX_ATTEMPTS)).await?;
     let mut rows = graph.execute(query(
-        "MATCH (p:Payment {tenant_id:$tenant}) WHERE p.receipt_email_status IN ['queued','retry','sending']
+        "MATCH (l:Lead {tenant_id:$tenant})-[:MADE_PAYMENT]->(p:Payment {tenant_id:$tenant}) WHERE p.receipt_email_status IN ['queued','retry','sending']
          AND coalesce(p.receipt_email_attempts,0)<$max
          AND (p.receipt_email_next_at IS NULL OR p.receipt_email_next_at<=datetime())
          AND p.status='paid' AND p.payment_type='application_fee'
+         AND p.paid_at>=datetime($activated_at)
+         AND ($all_recipients OR toLower(trim(l.email)) IN $recipients)
+         WITH DISTINCT p ORDER BY p.paid_at
          RETURN p.payment_id AS id LIMIT 20")
-        .param("tenant",tenant.to_string()).param("max",MAX_ATTEMPTS)).await?;
+        .param("tenant",tenant.to_string()).param("max",MAX_ATTEMPTS)
+        .param("activated_at",guard.activated_at.clone()).param("all_recipients",guard.all_recipients()).param("recipients",guard.recipient_list())).await?;
     let mut ids = Vec::new();
     while let Some(row) = rows.next().await? {
         if let Some(id) = row.get::<String>("id") {

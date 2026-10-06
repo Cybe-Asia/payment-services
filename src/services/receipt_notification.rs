@@ -1,12 +1,13 @@
 //! Durable IIEC paid application-fee receipts. Enqueued atomically at verification.
 use crate::models::payment::Payment;
 use crate::repositories::receipt_notification_repository::{self, claim, complete};
+use crate::services::notification_guard::ActivationGuard;
 use crate::{repositories::payment_repository, AppState};
 #[cfg(test)]
 use neo4rs::query;
 use neo4rs::Graph;
 
-pub fn start_worker(state: AppState) {
+pub fn start_worker(state: AppState, guard: ActivationGuard) {
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -15,7 +16,7 @@ pub fn start_worker(state: AppState) {
             .expect("invoice HTTP client");
         loop {
             if let Some(graph) = state.graph.as_ref() {
-                let _ = deliver_batch(graph, &state, &client).await;
+                let _ = deliver_batch(graph, &state, &guard, &client).await;
             }
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
@@ -25,12 +26,13 @@ pub fn start_worker(state: AppState) {
 async fn deliver_batch(
     graph: &Graph,
     state: &AppState,
+    guard: &ActivationGuard,
     client: &reqwest::Client,
 ) -> Result<(), neo4rs::Error> {
-    let ids = receipt_notification_repository::pending_ids(graph, &state.tenant_id).await?;
+    let ids = receipt_notification_repository::pending_ids(graph, &state.tenant_id, guard).await?;
     for id in ids {
         let nonce = uuid::Uuid::new_v4().to_string();
-        let Some(email) = claim(graph, &state.tenant_id, &id, &nonce).await? else {
+        let Some(email) = claim(graph, &state.tenant_id, guard, &id, &nonce).await? else {
             continue;
         };
         let payment =
@@ -107,33 +109,34 @@ mod tests {
         .await
         .unwrap();
         let id = format!("receipt-{}", uuid::Uuid::new_v4());
+        let guard = ActivationGuard::parse(Some("2000-01-01T00:00:00Z"), Some("*")).unwrap();
         graph.run(query("CREATE (l:Lead {tenant_id:$id,lead_id:$id,email:'parent@example.invalid'})-[:MADE_PAYMENT]->(:Payment {tenant_id:$id,payment_id:$id,status:'pending',payment_type:'application_fee'})").param("id",id.clone())).await.unwrap();
-        assert!(claim(&graph, &id, &id, "unpaid").await.unwrap().is_none());
+        assert!(claim(&graph, &id, &guard, &id, "unpaid").await.unwrap().is_none());
         payment_repository::mark_paid(&graph, &id, None, None)
             .await
             .unwrap();
-        assert!(claim(&graph, "wrong-tenant", &id, "wrong")
+        assert!(claim(&graph, "wrong-tenant", &guard, &id, "wrong")
             .await
             .unwrap()
             .is_none());
         let (first, second) = tokio::join!(
-            claim(&graph, &id, &id, "first"),
-            claim(&graph, &id, &id, "second")
+            claim(&graph, &id, &guard, &id, "first"),
+            claim(&graph, &id, &guard, &id, "second")
         );
         let first = first.unwrap();
         let second = second.unwrap();
         assert_ne!(first.is_some(), second.is_some());
         let winner = if first.is_some() { "first" } else { "second" };
         complete(&graph, &id, &id, winner, false).await.unwrap();
-        assert!(claim(&graph, &id, &id, "early").await.unwrap().is_none());
+        assert!(claim(&graph, &id, &guard, &id, "early").await.unwrap().is_none());
         graph.run(query("MATCH (p:Payment {payment_id:$id}) SET p.receipt_email_next_at=datetime()-duration({seconds:1})").param("id",id.clone())).await.unwrap();
-        assert!(claim(&graph, &id, &id, "retry").await.unwrap().is_some());
+        assert!(claim(&graph, &id, &guard, &id, "retry").await.unwrap().is_some());
         complete(&graph, &id, &id, winner, true).await.unwrap();
         complete(&graph, &id, &id, "retry", true).await.unwrap();
         payment_repository::mark_paid(&graph, &id, None, None)
             .await
             .unwrap();
-        assert!(claim(&graph, &id, &id, "duplicate")
+        assert!(claim(&graph, &id, &guard, &id, "duplicate")
             .await
             .unwrap()
             .is_none());
@@ -165,21 +168,21 @@ mod tests {
         )
         .await
         .unwrap());
-        assert!(claim(&graph, &id, &id, "manual").await.unwrap().is_some());
+        assert!(claim(&graph, &id, &guard, &id, "manual").await.unwrap().is_some());
         graph.run(query("MATCH (p:Payment {payment_id:$id}) SET p.status='pending',p.provider='doku',p.receipt_email_status=null,p.receipt_email_next_at=null,p.receipt_email_attempts=0").param("id",id.clone())).await.unwrap();
         assert!(
             payment_repository::apply_doku_webhook(&graph, &id, &id, "paid", None)
                 .await
                 .unwrap()
         );
-        assert!(claim(&graph, &id, &id, "doku").await.unwrap().is_some());
+        assert!(claim(&graph, &id, &guard, &id, "doku").await.unwrap().is_some());
         complete(&graph, &id, &id, "doku", true).await.unwrap();
         assert!(
             !payment_repository::apply_doku_webhook(&graph, &id, &id, "paid", None)
                 .await
                 .unwrap()
         );
-        assert!(claim(&graph, &id, &id, "doku-replay")
+        assert!(claim(&graph, &id, &guard, &id, "doku-replay")
             .await
             .unwrap()
             .is_none());

@@ -257,11 +257,24 @@ async fn main() {
     };
 
     if std::env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true") {
-        if std::env::var("ADMISSIONS_AUTOMATION_ENABLED").as_deref() == Ok("true") {
-            services::automatic_offer_invoice::start_worker(state.clone());
+        // Fail closed: without an explicit activation instant and recipient scope,
+        // queued backlog would be sent on first enable, so no worker starts.
+        match services::notification_guard::ActivationGuard::from_env() {
+            Ok(guard) => {
+                info!(
+                    activated_at = %guard.activated_at,
+                    all_recipients = guard.all_recipients(),
+                    allowlisted = guard.recipient_list().len(),
+                    "payment notification workers enabled"
+                );
+                if std::env::var("ADMISSIONS_AUTOMATION_ENABLED").as_deref() == Ok("true") {
+                    services::automatic_offer_invoice::start_worker(state.clone(), guard.clone());
+                }
+                services::invoice_notification::start_worker(state.clone(), guard.clone());
+                services::receipt_notification::start_worker(state.clone(), guard);
+            }
+            Err(reason) => tracing::error!(reason, "payment notification workers not started"),
         }
-        services::invoice_notification::start_worker(state.clone());
-        services::receipt_notification::start_worker(state.clone());
     }
 
     let app: Router = Router::new()

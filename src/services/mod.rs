@@ -4,6 +4,8 @@ pub mod payment_service;
 
 pub mod invoice_notification;
 
+pub mod notification_guard;
+
 pub mod receipt_notification;
 
 pub mod automatic_offer_invoice;

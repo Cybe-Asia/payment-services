@@ -233,7 +233,8 @@ pub async fn staff_can_reach_lead(
               OR (size(teams) > 0 AND any(t IN coalesce(lo.team_ids, []) WHERE t IN teams)) \
               OR (size(teams) > 0 AND any(t IN coalesce(au.staffTeamIds, []) WHERE t IN teams)) \
               OR (coalesce(l.reference_code, l.referral_code, '') = '' \
-                  AND coalesce(l.reference_owner_id, '') = '') \
+                  AND coalesce(l.reference_owner_id, '') = '' \
+                  AND coalesce(l.assigned_admin_email, '') = '') \
               THEN 1 ELSE 0 END) = 1 AS allowed"
             .to_string(),
     )

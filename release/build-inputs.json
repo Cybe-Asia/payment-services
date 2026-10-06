@@ -14,7 +14,7 @@
     "src/config/config.rs": "d9a199f092fccec926bcf2c81c837818257ff37b920dc3ad90c1984308966f2f",
     "src/config/mod.rs": "0dfdf3576e5863e271920d685e5521538a6354de939a5449f2b3cf2a5d4d14ea",
     "src/utils/response.rs": "c71da56f58005f81dc9c28706a424a558eb748890722a10ce818fe5ec7424fa4",
-    "src/utils/auth.rs": "ad78f3c83a07e4c02b9391df60f585bcf9a02efc0ed309c24100a9c18bfbac48",
+    "src/utils/auth.rs": "7719bd31e80e575573fce51d936dd5d81e2a6315c87bff414bbdf50e63239aff",
     "src/utils/mod.rs": "f3354e852860a9fa45c9890f6a58b843292d1834c8f012bdbe9ea5b3c44fda9e",
     "src/utils/jwt.rs": "339648ea9b22e5e8433f2118ad029b3f10e521a9dd831806077fda6c43d35d7f",
     "src/utils/branded_email.rs": "9b9e4687c9aae55c0f2c85a413550f882889f7d7d6bfa380d70997a884fc1da8",
@@ -66,7 +66,7 @@
     "assets/payment-documents/iiss-invoice.jpg": "1d3530b74b3d35fca0ffc7776bd4db54e3bd98533713902749bb74c285531a80",
     "assets/payment-documents/iiss-receipt.jpg": "15ea81bc9eff650df84b844f1aef0a01adfeaafcd8e3a4870c14d79e2cc03b38",
     "src/services/notification_guard.rs": "682e37ea74955ab8e54eabdacbdf40c40c9c5a8219fa751099c94e1d4bedb13f",
-    "src/utils/auth_scope_tests.rs": "ca218f1f77fdf309a97c745ca8cbb6e26d194e2fd92aac8e356b1ba122736a93"
+    "src/utils/auth_scope_tests.rs": "a6b639fd35c6beadf75127c2775155c0e1bf343ade479672d2e3947a551562d4"
   },
   "scope": "approved current web integration; school-staging; no automatic GitOps or production promotion"
 }

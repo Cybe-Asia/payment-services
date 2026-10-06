@@ -52,6 +52,7 @@ async fn staff_guards_scope_and_segregation_of_duties() {
                  CREATE (:Lead {lead_id:$tag+'-assigned', assigned_admin_email:$mine, reference_code:'REF-X'}) \
                  CREATE (:Lead {lead_id:$tag+'-foreign', assigned_admin_email:$other, reference_code:'REF-Y'})-[:HAS_STUDENT]->(:Student {studentId:$tag+'-stu'}) \
                  CREATE (:Lead {lead_id:$tag+'-pool'}) \
+                 CREATE (:Lead {lead_id:$tag+'-claimed', assigned_admin_email:$other}) \
                  CREATE (p:Payment {payment_id:$tag+'-pay'})-[:HAS_PROOF]->(:PaymentProof {payment_proof_id:$tag+'-p1', uploaded_by:$mine, status:'uploaded'}) \
                  CREATE (p)-[:HAS_PROOF]->(:PaymentProof {payment_proof_id:$tag+'-p0', uploaded_by:$other, status:'rejected'})",
             )
@@ -86,6 +87,7 @@ async fn staff_guards_scope_and_segregation_of_duties() {
     for (lead, want) in [
         (format!("{tag}-assigned"), true),
         (format!("{tag}-pool"), true),
+        (format!("{tag}-claimed"), false),
         (format!("{tag}-foreign"), false),
         (format!("{tag}-stu"), false),
         (format!("{tag}-missing"), false),

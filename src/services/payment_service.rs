@@ -1269,6 +1269,10 @@ pub async fn get_manual_review_detail(
         .map_err(|e| format!("payment review detail failed: {e}"))
 }
 
+/// Returned when the reviewer uploaded the evidence they are reviewing.
+pub const SEGREGATION_OF_DUTIES: &str =
+    "segregation of duties: you uploaded this payment's proof, another approver must review it";
+
 pub async fn review_manual_payment(
     graph: &Graph,
     tenant_id: &str,
@@ -1290,6 +1294,12 @@ pub async fn review_manual_payment(
     }
     if !payment_repository::manual_review_allowed(&payment.status) {
         return Err("payment is not waiting for finance review".to_string());
+    }
+    if payment_repository::actor_uploaded_live_proof(graph, payment_id, actor)
+        .await
+        .map_err(|e| format!("proof lookup failed: {e}"))?
+    {
+        return Err(SEGREGATION_OF_DUTIES.to_string());
     }
 
     let due = payment.amount.max(0);

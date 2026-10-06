@@ -743,6 +743,16 @@ pub async fn admin_assist_manual_payment_handler(
         Ok(auth) => auth,
         Err((status, msg)) => return fail(status, &msg),
     };
+    match auth::staff_can_reach_lead(&graph, &staff, &lead_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return fail(
+                StatusCode::FORBIDDEN,
+                "Lead is outside your staff visibility scope",
+            )
+        }
+        Err((status, msg)) => return fail(status, &msg),
+    }
 
     let ctx = PaymentContext {
         graph: graph.clone(),
@@ -760,10 +770,11 @@ pub async fn admin_assist_manual_payment_handler(
     .await
     {
         Ok(outcome) => {
-            emit_assist_audit(
+            emit_staff_audit(
                 graph,
                 staff.email,
                 "payment.manual.assisted",
+                "lead",
                 lead_id.clone(),
             );
             let data = ManualPaymentResponseData {
@@ -826,6 +837,16 @@ pub async fn admin_assist_proof_handler(
         return fail(StatusCode::NOT_FOUND, "Payment not found");
     }
     let lead_id = payment.lead_id.clone().unwrap_or_default();
+    match auth::staff_can_reach_lead(&graph, &staff, &lead_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return fail(
+                StatusCode::FORBIDDEN,
+                "Lead is outside your staff visibility scope",
+            )
+        }
+        Err((status, msg)) => return fail(status, &msg),
+    }
 
     let response = process_manual_proof_upload(
         &graph,
@@ -837,7 +858,13 @@ pub async fn admin_assist_proof_handler(
     )
     .await;
     if response.0 == StatusCode::OK {
-        emit_assist_audit(graph, staff.email, "payment.proof.assisted", lead_id);
+        emit_staff_audit(
+            graph,
+            staff.email,
+            "payment.proof.assisted",
+            "lead",
+            lead_id,
+        );
     }
     response
 }
@@ -846,17 +873,18 @@ pub async fn admin_assist_proof_handler(
 /// shape admission-services' `audit_repository::emit_staff` creates, so
 /// assisted payment actions show up in the admin audit log alongside every
 /// other staff mutation. A failed write never blocks the payment flow.
-fn emit_assist_audit(
+pub(crate) fn emit_staff_audit(
     graph: std::sync::Arc<neo4rs::Graph>,
     actor_email: String,
     action: &'static str,
+    target_type: &'static str,
     target_id: String,
 ) {
     tokio::spawn(async move {
         let q = neo4rs::Query::new(
             "CREATE (:AuditEvent { \
                 event_id: $id, actor_lead_id: '', actor_email: $actor_email, \
-                action: $action, target_type: 'lead', target_id: $tid, \
+                action: $action, target_type: $tt, target_id: $tid, \
                 diff: '', created_at: datetime() \
              })"
             .to_string(),
@@ -864,6 +892,7 @@ fn emit_assist_audit(
         .param("id", format!("AUDIT-{}", Uuid::new_v4()))
         .param("actor_email", actor_email)
         .param("action", action.to_string())
+        .param("tt", target_type.to_string())
         .param("tid", target_id);
         if let Err(e) = graph.run(q).await {
             warn!("assist audit write failed: {e}");
@@ -1150,10 +1179,19 @@ pub async fn admin_update_payment_settings_handler(
     )
     .await
     {
-        Ok(settings) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
-        ),
+        Ok(settings) => {
+            emit_staff_audit(
+                graph.clone(),
+                admin.email.clone(),
+                "payment.settings.updated",
+                "payment_settings",
+                "default".to_string(),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
+            )
+        }
         Err(e) => {
             error!("admin_update_payment_settings failed: {e}");
             fail(StatusCode::INTERNAL_SERVER_ERROR, &e)
@@ -1308,6 +1346,11 @@ pub async fn admin_review_manual_payment_handler(
         Err((status, msg)) => return fail(status, &msg),
     };
     let decision = payload.decision.to_lowercase();
+    let audit_action = match decision.as_str() {
+        "approve" => "payment.review.approved",
+        "underpaid" => "payment.review.underpaid",
+        _ => "payment.review.rejected",
+    };
     match payment_service::review_manual_payment(
         &graph,
         &state.tenant_id,
@@ -1318,6 +1361,13 @@ pub async fn admin_review_manual_payment_handler(
     .await
     {
         Ok(payment) => {
+            emit_staff_audit(
+                graph.clone(),
+                admin.email.clone(),
+                audit_action,
+                "payment",
+                payment.payment_id.clone(),
+            );
             queue_payment_review_notification(&state, &graph, &payment, &decision).await;
             queue_staff_review_notification(&state, &graph, &payment, &decision).await;
             (
@@ -1329,6 +1379,8 @@ pub async fn admin_review_manual_payment_handler(
             error!("admin_review_manual_payment failed: {e}");
             let status = if e.contains("not found") {
                 StatusCode::NOT_FOUND
+            } else if e == payment_service::SEGREGATION_OF_DUTIES {
+                StatusCode::CONFLICT
             } else if e.contains("required")
                 || e.contains("lower")
                 || e.contains("greater")

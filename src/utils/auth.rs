@@ -13,6 +13,51 @@ pub struct ParentAuth {
 #[derive(Debug, Clone)]
 pub struct AdminAuth {
     pub email: String,
+    /// Staff roles behind the grant (`["owner"]` for the legacy allowlist).
+    pub roles: Vec<String>,
+}
+
+impl AdminAuth {
+    fn owner(email: String) -> Self {
+        Self {
+            email,
+            roles: vec!["owner".to_string()],
+        }
+    }
+
+    /// Marketing staff without a manager/admissions/finance/owner role: their
+    /// lead reach is limited to own/claimed/team leads and the unassigned pool.
+    pub fn lead_scoped(&self) -> bool {
+        let wide = [
+            "owner",
+            "marketing_manager",
+            "admissions_staff",
+            "admissions_manager",
+            "admissions_admin",
+            "finance_admin",
+            "finance_approver",
+        ];
+        !self.roles.iter().any(|role| wide.contains(&role.as_str()))
+    }
+}
+
+/// Staff roles that may use the assisted payment endpoints.
+const STAFF_ROLES: &[&str] = &[
+    "owner",
+    "marketing_staff",
+    "marketing_manager",
+    "admissions_staff",
+    "admissions_manager",
+    "admissions_admin",
+    "finance_admin",
+    "finance_approver",
+];
+
+fn staff_roles(roles: Vec<String>) -> Vec<String> {
+    roles
+        .into_iter()
+        .filter(|role| STAFF_ROLES.contains(&role.as_str()))
+        .collect()
 }
 
 pub async fn require_parent_auth(
@@ -69,7 +114,7 @@ pub async fn require_admin(
                 .as_ref()
                 .is_none_or(|expected| expected == &id) =>
         {
-            return Ok(AdminAuth { email })
+            return Ok(AdminAuth::owner(email))
         }
         CanonicalAdmin::Owner(_) => {
             return Err((StatusCode::FORBIDDEN, "Staff identity mismatch".into()))
@@ -87,7 +132,7 @@ pub async fn require_admin(
         return Err((StatusCode::FORBIDDEN, "Admin access required".to_string()));
     }
 
-    Ok(AdminAuth { email })
+    Ok(AdminAuth::owner(email))
 }
 
 /// Staff gate for the marketing-assisted payment endpoints.
@@ -130,20 +175,9 @@ pub async fn require_staff(
             {
                 return Err((StatusCode::FORBIDDEN, "Staff identity mismatch".into()));
             }
-            if roles.iter().any(|role| {
-                [
-                    "owner",
-                    "marketing_staff",
-                    "marketing_manager",
-                    "admissions_staff",
-                    "admissions_manager",
-                    "admissions_admin",
-                    "finance_admin",
-                    "finance_approver",
-                ]
-                .contains(&role.as_str())
-            }) {
-                return Ok(AdminAuth { email });
+            let roles = staff_roles(roles);
+            if !roles.is_empty() {
+                return Ok(AdminAuth { email, roles });
             }
             return Err((StatusCode::FORBIDDEN, "Staff access required".into()));
         }
@@ -157,24 +191,83 @@ pub async fn require_staff(
     }
 
     if is_admin_email(&email) {
-        return Ok(AdminAuth { email });
+        return Ok(AdminAuth::owner(email));
     }
 
-    let roles = staff_roles_for_email(graph, &email).await?;
-    if roles.iter().any(|r| !r.trim().is_empty()) {
-        return Ok(AdminAuth { email });
+    // Legacy accounts: only recognised staff roles count (a parent's
+    // `User.roles = ['parent']` must never open staff endpoints).
+    let roles = staff_roles(staff_roles_for_email(graph, &email).await?);
+    if !roles.is_empty() {
+        return Ok(AdminAuth { email, roles });
     }
     Err((StatusCode::FORBIDDEN, "Staff access required".to_string()))
 }
 
-/// Roles allowed to APPROVE money: finance plus the full-admin-like roles.
-/// Deliberately excludes marketing (any level) and admissions staff — they
-/// can submit evidence via `require_staff`, never confirm it.
-const FINANCE_APPROVE_ROLES: &[&str] = &["finance_admin", "finance_approver", "owner"];
+/// Lead reach for assisted actions. Mirrors admission-services
+/// `can_view_lead`: lead-scoped marketing staff reach leads they are assigned
+/// to, leads attributed to their marketing owner or team, and the unassigned
+/// pool. Accepts a Lead id or a Student id (walked back to its Lead).
+pub async fn staff_can_reach_lead(
+    graph: &Graph,
+    staff: &AdminAuth,
+    lead_or_student_id: &str,
+) -> Result<bool, (StatusCode, String)> {
+    if !staff.lead_scoped() {
+        return Ok(true);
+    }
+    let q = Query::new(
+        "MATCH (l:Lead) WHERE l.lead_id = $id \
+            OR EXISTS { MATCH (l)-[:HAS_STUDENT]->(:Student {studentId:$id}) } \
+         WITH l LIMIT 1 \
+         OPTIONAL MATCH (me:MarketingOwner) WHERE toLower(me.email) = toLower($email) \
+         OPTIONAL MATCH (mu:User) WHERE toLower(mu.email) = toLower($email) \
+         WITH l, head(collect(me)) AS me, head(collect(mu)) AS mu \
+         WITH l, coalesce(me.owner_id, '') AS ownerId, \
+              coalesce(me.team_ids, []) + coalesce(mu.staffTeamIds, []) AS teams \
+         OPTIONAL MATCH (lo:MarketingOwner {owner_id: l.reference_owner_id}) \
+         OPTIONAL MATCH (au:User) \
+           WHERE toLower(au.email) = toLower(coalesce(l.assigned_admin_email, '')) \
+         RETURN max(CASE WHEN \
+              toLower(coalesce(l.assigned_admin_email, '')) = toLower($email) \
+              OR (ownerId <> '' AND coalesce(l.reference_owner_id, '') = ownerId) \
+              OR (size(teams) > 0 AND any(t IN coalesce(lo.team_ids, []) WHERE t IN teams)) \
+              OR (size(teams) > 0 AND any(t IN coalesce(au.staffTeamIds, []) WHERE t IN teams)) \
+              OR (coalesce(l.reference_code, l.referral_code, '') = '' \
+                  AND coalesce(l.reference_owner_id, '') = '') \
+              THEN 1 ELSE 0 END) = 1 AS allowed"
+            .to_string(),
+    )
+    .param("id", lead_or_student_id.to_string())
+    .param("email", staff.email.clone());
+    let unavailable = |e: neo4rs::Error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("staff scope lookup: {e}"),
+        )
+    };
+    let mut rows = graph.execute(q).await.map_err(unavailable)?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(unavailable)?
+        .and_then(|row| row.get::<bool>("allowed"))
+        .unwrap_or(false))
+}
+
+/// Roles allowed to APPROVE money: finance, admissions managers and owner.
+/// Marketing (any level) and admissions staff can submit evidence via
+/// `require_staff`, never confirm it; the reviewer must also differ from
+/// whoever uploaded the proof (enforced in the review service).
+const FINANCE_APPROVE_ROLES: &[&str] = &[
+    "finance_admin",
+    "finance_approver",
+    "admissions_admin",
+    "admissions_manager",
+    "owner",
+];
 
 /// Roles allowed to VIEW the payment review queue/detail/proofs. Superset of
-/// the approve roles: admissions managers can look (they track applications
-/// blocked on payment) but the approve endpoint stays finance-only.
+/// the approve roles.
 const FINANCE_VIEW_ROLES: &[&str] = &[
     "finance_admin",
     "finance_approver",
@@ -222,7 +315,10 @@ pub async fn require_finance(
                 return Err((StatusCode::FORBIDDEN, "Staff identity mismatch".into()));
             }
             return if finance_roles_allowed(&roles, approve) {
-                Ok(AdminAuth { email })
+                Ok(AdminAuth {
+                    email,
+                    roles: staff_roles(roles),
+                })
             } else {
                 Err((StatusCode::FORBIDDEN, "Finance access required".into()))
             };
@@ -237,12 +333,15 @@ pub async fn require_finance(
     }
 
     if !approve && is_admin_email(&email) {
-        return Ok(AdminAuth { email });
+        return Ok(AdminAuth::owner(email));
     }
 
     let roles = staff_roles_for_email(graph, &email).await?;
     if finance_roles_allowed(&roles, approve) {
-        return Ok(AdminAuth { email });
+        return Ok(AdminAuth {
+            email,
+            roles: staff_roles(roles),
+        });
     }
     Err((
         StatusCode::FORBIDDEN,
@@ -485,18 +584,51 @@ async fn resolve_email_for_subject(graph: &Graph, subject: &str) -> Result<Optio
 
 #[cfg(test)]
 mod tests {
-    use super::finance_roles_allowed;
+    use super::{finance_roles_allowed, staff_roles, AdminAuth};
 
     fn roles(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
     }
 
+    /// Matrix 2026-10-06: finance, admissions managers and owner approve
+    /// money; marketing and admissions staff never do.
     #[test]
-    fn admissions_can_view_but_cannot_confirm_money() {
-        let admissions = roles(&["admissions_admin"]);
-        assert!(finance_roles_allowed(&admissions, false));
-        assert!(!finance_roles_allowed(&admissions, true));
-        assert!(finance_roles_allowed(&roles(&["finance_approver"]), true));
-        assert!(finance_roles_allowed(&roles(&["owner"]), true));
+    fn money_approval_follows_the_role_matrix() {
+        for role in [
+            "finance_approver",
+            "finance_admin",
+            "admissions_manager",
+            "admissions_admin",
+            "owner",
+        ] {
+            assert!(finance_roles_allowed(&roles(&[role]), true), "{role}");
+            assert!(finance_roles_allowed(&roles(&[role]), false), "{role}");
+        }
+        for role in [
+            "admissions_staff",
+            "marketing_staff",
+            "marketing_manager",
+            "parent",
+        ] {
+            assert!(!finance_roles_allowed(&roles(&[role]), true), "{role}");
+            assert!(!finance_roles_allowed(&roles(&[role]), false), "{role}");
+        }
+    }
+
+    #[test]
+    fn only_staff_roles_survive_and_marketing_staff_are_lead_scoped() {
+        assert!(staff_roles(roles(&["parent", "student", " "])).is_empty());
+        assert_eq!(
+            staff_roles(roles(&["parent", "marketing_staff"])),
+            roles(&["marketing_staff"])
+        );
+        let auth = |values: &[&str]| AdminAuth {
+            email: "staff@example.test".into(),
+            roles: roles(values),
+        };
+        assert!(auth(&["marketing_staff"]).lead_scoped());
+        assert!(!auth(&["marketing_staff", "finance_approver"]).lead_scoped());
+        assert!(!auth(&["marketing_manager"]).lead_scoped());
+        assert!(!AdminAuth::owner("o@example.test".into()).lead_scoped());
     }
 }

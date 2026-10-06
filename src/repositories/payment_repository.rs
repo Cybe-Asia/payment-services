@@ -1006,6 +1006,30 @@ pub async fn create_payment_proof(
     Ok(payment_proof_from_row(&row))
 }
 
+/// Segregation of duties: true when `actor` uploaded live (non-rejected)
+/// evidence on this payment, so they must not also approve it.
+pub async fn actor_uploaded_live_proof(
+    graph: &Graph,
+    payment_id: &str,
+    actor: &str,
+) -> Result<bool, neo4rs::Error> {
+    let q = Query::new(
+        "MATCH (:Payment {payment_id:$payment_id})-[:HAS_PROOF]->(proof:PaymentProof) \
+         WHERE coalesce(proof.status, '') <> 'rejected' \
+           AND toLower(coalesce(proof.uploaded_by, '')) = toLower($actor) \
+         RETURN count(proof) > 0 AS conflicted"
+            .to_string(),
+    )
+    .param("payment_id", payment_id.to_string())
+    .param("actor", actor.trim().to_string());
+    let mut rows = graph.execute(q).await?;
+    Ok(rows
+        .next()
+        .await?
+        .and_then(|row| row.get::<bool>("conflicted"))
+        .unwrap_or(false))
+}
+
 pub async fn find_payment_proof_object(
     graph: &Graph,
     proof_id: &str,

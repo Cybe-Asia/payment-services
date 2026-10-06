@@ -74,9 +74,10 @@ pub async fn update_fee_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    if let Err((status, msg)) = auth::require_admin(&graph, &headers, &state.jwt_secret).await {
-        return fail(status, &msg);
-    }
+    let admin = match auth::require_admin(&graph, &headers, &state.jwt_secret).await {
+        Ok(admin) => admin,
+        Err((status, msg)) => return fail(status, &msg),
+    };
     let school_id = match school_repository::find_school_id_by_code(
         &graph,
         &state.tenant_id,
@@ -108,21 +109,30 @@ pub async fn update_fee_handler(
     )
     .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "responseCode": 200,
-                "responseMessage": "success",
-                "data": {
-                    "feeStructureId": new_id,
-                    "schoolCode": payload.school_code,
-                    "paymentType": payload.payment_type,
-                    "amount": payload.amount,
-                    "currency": payload.currency,
-                    "status": "active"
-                }
-            })),
-        ),
+        Ok(()) => {
+            crate::handlers::payment_handler::emit_staff_audit(
+                graph.clone(),
+                admin.email,
+                "payment.fee.updated",
+                "fee_structure",
+                new_id.clone(),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "responseCode": 200,
+                    "responseMessage": "success",
+                    "data": {
+                        "feeStructureId": new_id,
+                        "schoolCode": payload.school_code,
+                        "paymentType": payload.payment_type,
+                        "amount": payload.amount,
+                        "currency": payload.currency,
+                        "status": "active"
+                    }
+                })),
+            )
+        }
         Err(e) => {
             error!("fee update: {e}");
             fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")

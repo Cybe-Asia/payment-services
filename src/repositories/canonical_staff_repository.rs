@@ -192,12 +192,11 @@ mod tests {
         )
         .await
         .is_ok());
-        assert_eq!(
+        // Admissions managers approve money too (role matrix 2026-10-06).
+        assert!(
             crate::utils::auth::require_finance(&graph, &headers, "synthetic-guard-key", true)
                 .await
-                .unwrap_err()
-                .0,
-            StatusCode::FORBIDDEN
+                .is_ok()
         );
         for (status, schools) in [
             ("SUSPENDED", vec![]),

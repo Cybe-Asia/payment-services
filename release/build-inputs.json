@@ -51,7 +51,7 @@
     "src/handlers/fee_handler.rs": "5cf403e04439ac701f4ba186858595516f24a05bc84b920a713acacbf1d9faac",
     "src/handlers/payment_parent_acceptance.rs": "9c6a888ee76d9500b91d71aebb1ce13726f5ced6edf4f6480552425c65c8cd6b",
     "src/services/payment_service.rs": "f71fff8c291a171fc8224481c86a60628276835120ef32acd61a5e75d6a76693",
-    "src/services/invoice_notification.rs": "24712570cc0449739ef10626e1f5ea4dcc82d6c8def165cf20ece146c2aba0b9",
+    "src/services/invoice_notification.rs": "5065029058c180685313a28332ab6b183f7907ee70257e7dd1828a0a599ecc6c",
     "src/services/automatic_offer_invoice.rs": "3ede4de63130f421d525ca249fd15f4302d53ae29a14cf18379a42e7297fa3b9",
     "src/services/document_encryption.rs": "a5331158667a189b638357fb487e74cb25125bc5871dba0f8d815b25b88d8a37",
     "src/services/mod.rs": "451b6cda2cf7ca561af03540325f35478a5667352af87be1e3fd0e258c5b0d48",

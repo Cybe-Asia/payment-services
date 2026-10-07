@@ -185,6 +185,15 @@ mod tests {
         )
         .await
         .unwrap());
+        // SIS placement matches the paid offer by `Payment.lead_id`.
+        let mut rows = graph
+            .execute(
+                query("MATCH (p:Payment {payment_id:$p}) RETURN p").param("p", invoice_id.clone()),
+            )
+            .await
+            .unwrap();
+        let payment: neo4rs::Node = rows.next().await.unwrap().unwrap().get("p").unwrap();
+        assert_eq!(payment.get::<String>("lead_id").unwrap(), id);
         assert!(claim(&graph, &id, &guard, &invoice_id, "offer-invoice")
             .await
             .unwrap()

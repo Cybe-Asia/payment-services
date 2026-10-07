@@ -192,7 +192,7 @@ pub async fn upsert_doku_pending(
             p.payment_method='doku', p.provider='doku', p.invoice_ref=$invoice_number, \
             p.gateway_ref=$token_id, p.doku_session_id=$session_id, p.doku_request_id=$request_id, \
             p.provider_attempt=$attempt, \
-            p.hosted_invoice_url=$checkout_url, p.offer_id=$offer_id, \
+            p.hosted_invoice_url=$checkout_url, p.offer_id=$offer_id, p.lead_id=$lead_id, \
             p.offer_revision=$offer_revision, p.pricing_snapshot_hash=$snapshot_hash, p.pricing_snapshot_json=o.pricing_snapshot_json, \
             p.created_at=datetime(), p.updated_at=datetime() \
          MERGE (l)-[:MADE_PAYMENT]->(p) \
@@ -261,7 +261,7 @@ pub async fn upsert_offer_manual_pending(
             p.bank_account_name=$account_name, p.bank_account_number=$account_number, \
             p.manual_instructions=$instructions, p.amount_submitted=0, p.amount_verified=0, \
             p.short_amount=$amount, p.overpaid_amount=0, p.expires_at=datetime($expires_iso), \
-            p.offer_id=$offer_id, p.offer_revision=$offer_revision, \
+            p.offer_id=$offer_id, p.lead_id=$lead_id, p.offer_revision=$offer_revision, \
             p.pricing_snapshot_hash=$snapshot_hash, p.pricing_snapshot_json=o.pricing_snapshot_json, p.created_at=datetime(), p.updated_at=datetime() \
          MERGE (l)-[:MADE_PAYMENT]->(p) \
          MERGE (o)-[:PAID_VIA]->(p) \

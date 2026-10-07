@@ -736,7 +736,7 @@ fn offer_payment_error_status(message: &str) -> StatusCode {
         || message.contains("terminal")
     {
         StatusCode::CONFLICT
-    } else if message.contains("bank account") {
+    } else if message.to_ascii_lowercase().contains("bank account") {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::INTERNAL_SERVER_ERROR

@@ -261,13 +261,13 @@ pub async fn offer_manual_payment_settings(
     owned_lead_ids: &[String],
     seed: &PaymentSettingsSeed,
 ) -> Result<PaymentSettings, String> {
-    let _ = accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
+    let (offer, _) = accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
     let mut settings = get_payment_settings(graph, seed).await?;
     settings.xendit_enabled = false;
     if !settings.manual_transfer_enabled && !settings.qris_enabled {
         return Err("manual offer payment is disabled".into());
     }
-    Ok(settings)
+    restrict_to_offer_bank_account(settings, &offer)
 }
 
 pub async fn offer_payment_settings(
@@ -277,9 +277,34 @@ pub async fn offer_payment_settings(
     owned_lead_ids: &[String],
     seed: &PaymentSettingsSeed,
 ) -> Result<PaymentSettings, String> {
-    let _ = accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
+    let (offer, _) = accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
     let mut settings = get_payment_settings(graph, seed).await?;
     settings.xendit_enabled = false;
+    restrict_to_offer_bank_account(settings, &offer)
+}
+
+/// Automatic offers are bound to the capital-levy bank account captured at
+/// issue time, so the parent may only see (and pay to) that destination;
+/// online checkout and QRIS are rejected for these offers, so hide them too.
+fn restrict_to_offer_bank_account(
+    mut settings: PaymentSettings,
+    offer: &payment_repository::AcceptedOfferSnapshot,
+) -> Result<PaymentSettings, String> {
+    if !offer.auto_generated {
+        return Ok(settings);
+    }
+    if offer.bank_account_id.is_empty() {
+        return Err("Automatic offer bank account is missing".into());
+    }
+    let manual_transfer_enabled = settings.manual_transfer_enabled;
+    settings.manual_bank_accounts.retain(|account| {
+        manual_transfer_enabled && account.enabled && account.id == offer.bank_account_id
+    });
+    if settings.manual_bank_accounts.is_empty() {
+        return Err("Automatic offer bank account is not configured".into());
+    }
+    settings.qris_enabled = false;
+    settings.doku_enabled = false;
     Ok(settings)
 }
 
@@ -2015,10 +2040,64 @@ fn pretty_payment_type(ty: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        calculate_discount_amount, should_apply_doku_paid_side_effect,
-        validate_doku_callback_contract, PromotionRuleSnapshot,
+        calculate_discount_amount, restrict_to_offer_bank_account,
+        should_apply_doku_paid_side_effect, validate_doku_callback_contract, PromotionRuleSnapshot,
     };
     use crate::clients::doku::{DokuWebhook, DokuWebhookOrder, DokuWebhookTransaction};
+    use crate::repositories::{
+        payment_repository::AcceptedOfferSnapshot, payment_settings_repository::PaymentSettings,
+    };
+
+    fn offer_settings() -> PaymentSettings {
+        serde_json::from_value(serde_json::json!({
+            "tenantId": "T1", "xenditEnabled": false, "dokuEnabled": true,
+            "manualTransferEnabled": true, "qrisEnabled": true,
+            "qrisImageUrl": "https://example.invalid/qris.png", "qrisLabel": "QRIS",
+            "qrisInstructions": "", "bankName": "", "bankAccountName": "",
+            "bankAccountNumber": "", "instructions": "",
+            "manualBankAccounts": [
+                {"id": "BANK-A", "bankName": "A", "accountName": "School", "accountNumber": "1", "enabled": true},
+                {"id": "BANK-B", "bankName": "B", "accountName": "School", "accountNumber": "2", "enabled": true},
+                {"id": "BANK-C", "bankName": "C", "accountName": "School", "accountNumber": "3", "enabled": false}
+            ],
+            "updatedBy": null, "updatedAt": null
+        }))
+        .unwrap()
+    }
+
+    fn offer(auto_generated: bool, bank_account_id: &str) -> AcceptedOfferSnapshot {
+        AcceptedOfferSnapshot {
+            auto_generated,
+            bank_account_id: bank_account_id.into(),
+            offer_id: "OFF-1".into(),
+            offer_revision: 1,
+            lead_id: "LEAD-1".into(),
+            pricing_snapshot_hash: String::new(),
+            pricing_snapshot_json: String::new(),
+        }
+    }
+
+    #[test]
+    fn automatic_offer_methods_expose_only_the_offer_bank_account() {
+        let settings =
+            restrict_to_offer_bank_account(offer_settings(), &offer(true, "BANK-B")).unwrap();
+        let ids: Vec<_> = settings
+            .manual_bank_accounts
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(ids, ["BANK-B"]);
+        assert!(!settings.qris_enabled);
+        assert!(!settings.doku_enabled);
+
+        let manual = restrict_to_offer_bank_account(offer_settings(), &offer(false, "")).unwrap();
+        assert_eq!(manual.manual_bank_accounts.len(), 3);
+        assert!(manual.qris_enabled && manual.doku_enabled);
+
+        assert!(restrict_to_offer_bank_account(offer_settings(), &offer(true, "")).is_err());
+        assert!(restrict_to_offer_bank_account(offer_settings(), &offer(true, "BANK-C")).is_err());
+        assert!(restrict_to_offer_bank_account(offer_settings(), &offer(true, "BANK-X")).is_err());
+    }
 
     fn rule(discount_type: &str, discount_value: i64) -> PromotionRuleSnapshot {
         PromotionRuleSnapshot {

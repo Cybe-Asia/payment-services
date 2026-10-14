@@ -22,7 +22,7 @@
     "src/repositories/fee_structure_repository.rs": "e79504bc73641cb5d30c45c7215d45a9fc319d34309035237711c60ea531d102",
     "src/repositories/canonical_staff_repository.rs": "f644ed9ee4c7547ba41c270a1d04e63a48665a5270d6f3f6c686b5a0c0bee59b",
     "src/repositories/school_repository.rs": "d554b659e625b0935a84f07a2bb683af060d018f39e0627cadaf4ba8db34849f",
-    "src/repositories/promotion_repository.rs": "efdba529ee474652a4564a09319b15fd0f28187bd7ae3fca4738cb9ccde04a09",
+    "src/repositories/promotion_repository.rs": "0be4d180be8820e233bad0d2c1ef93f93a35bb6acd56a2adea430fbec8eedc5d",
     "src/repositories/mod.rs": "5e8a52ae6ad038292026ebf81007c60edab2fa29257557954e7266d2d0217850",
     "src/repositories/receipt_notification_repository.rs": "f3a52733fc0462c2f425a3544f084aba40a154b12a06dee7a1b71bc8eedd39b4",
     "src/repositories/fee_obligation_repository.rs": "29d811f5455a9c2c2d176d3411acb3168dfe43647add47c4221e2a49adfb120d",
@@ -50,11 +50,11 @@
     "src/handlers/mod.rs": "e5c6c8d5720e301d1f812036812518230ad0573e8a051b4191e535f32da5b625",
     "src/handlers/fee_handler.rs": "5cf403e04439ac701f4ba186858595516f24a05bc84b920a713acacbf1d9faac",
     "src/handlers/payment_parent_acceptance.rs": "9c6a888ee76d9500b91d71aebb1ce13726f5ced6edf4f6480552425c65c8cd6b",
-    "src/services/payment_service.rs": "f71fff8c291a171fc8224481c86a60628276835120ef32acd61a5e75d6a76693",
+    "src/services/payment_service.rs": "6dba0adaea0f863a5e4b43eccf6b49968733f538873084cbf78557a8208c7a57",
     "src/services/invoice_notification.rs": "a26c0f6842dd4185515e30ca33fc370d2b8e10599c4bc6755472766f2145e488",
     "src/services/automatic_offer_invoice.rs": "3ede4de63130f421d525ca249fd15f4302d53ae29a14cf18379a42e7297fa3b9",
     "src/services/document_encryption.rs": "a5331158667a189b638357fb487e74cb25125bc5871dba0f8d815b25b88d8a37",
-    "src/services/mod.rs": "451b6cda2cf7ca561af03540325f35478a5667352af87be1e3fd0e258c5b0d48",
+    "src/services/mod.rs": "5e77d9e2b5dbb1a3f04dd3ae07a46d82befe9a8851c9e7e50533d45ac698500d",
     "src/services/receipt_notification.rs": "b83b6051d45373250a94b15b70f40392ce4e234fea1bd9cd77f32cc97feecfee",
     "src/services/payment_document.rs": "ff039af21746d49d0a4a1f4fe16e08938dc5a8d360ef7d3fb3397634c3849e74",
     "Cargo.toml": "a66f489ed416971f6a7e9c8b491e3fc4dac5f2d3a0e35293e9d49536a9729243",
@@ -67,7 +67,8 @@
     "assets/payment-documents/iiss-receipt.jpg": "15ea81bc9eff650df84b844f1aef0a01adfeaafcd8e3a4870c14d79e2cc03b38",
     "src/services/notification_guard.rs": "682e37ea74955ab8e54eabdacbdf40c40c9c5a8219fa751099c94e1d4bedb13f",
     "src/utils/auth_scope_tests.rs": "a6b639fd35c6beadf75127c2775155c0e1bf343ade479672d2e3947a551562d4",
-    "src/services/payable_offers_tests.rs": "35ee62b0aae61a0114bf2fde273c76db933afc0e6fcb234431864afc2f076451"
+    "src/services/payable_offers_tests.rs": "35ee62b0aae61a0114bf2fde273c76db933afc0e6fcb234431864afc2f076451",
+    "src/services/discount_code_tests.rs": "c66a5a91dd55c97bda8e41a3899cb9119546aaa787985bbb008c7fd092977dfe"
   },
   "scope": "approved current web integration; school-staging; no automatic GitOps or production promotion"
 }

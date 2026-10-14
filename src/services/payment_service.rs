@@ -617,27 +617,15 @@ async fn calculate_payment(
     _currency: &str,
     student_count: i64,
 ) -> Result<PaymentCalculation, String> {
-    let gross_amount = (unit_amount * student_count).max(0);
-    // One payment, one promo: rank every valid candidate by the rupiah it
-    // actually saves on THIS gross and keep the winner. Ties prefer the
-    // promo a human attached (most specific) over the global ladder, and
-    // the ladder over reference-code perks.
+    let gross_amount = unit_amount.saturating_mul(student_count).max(0);
+    // Every promotion that applies to this charge right now, the Lead's
+    // verified discount code included. Eligibility is evaluated here, when
+    // the invoice is computed; a payment that already exists keeps the
+    // amounts it was created with.
     let candidates = promotion_repository::find_candidates_for_lead(graph, lead_id, payment_type)
         .await
         .map_err(|e| format!("promotion lookup failed: {e}"))?;
-    let rule = candidates
-        .into_iter()
-        .map(|rule| (calculate_discount_amount(gross_amount, &rule), rule))
-        .filter(|(discount, _)| *discount > 0)
-        .max_by_key(|(discount, rule)| {
-            let priority = match rule.source.as_str() {
-                "lead_promotion_code" => 2i64,
-                "global_ladder" => 1,
-                _ => 0,
-            };
-            (*discount, priority)
-        })
-        .map(|(_, rule)| rule);
+    let rule = select_promotion(gross_amount, candidates);
     let discount_amount = rule
         .as_ref()
         .map(|rule| calculate_discount_amount(gross_amount, rule))
@@ -651,8 +639,9 @@ async fn calculate_payment(
     if let Some(rule) = &rule {
         if discount_amount > 0 {
             let label_prefix = match rule.source.as_str() {
-                "lead_promotion_code" => "Promotion discount",
-                "global_ladder" => "Early-bird discount",
+                promotion_repository::SOURCE_LEAD_PROMOTION_CODE => "Promotion discount",
+                promotion_repository::SOURCE_GLOBAL_LADDER => "Early-bird discount",
+                promotion_repository::SOURCE_DISCOUNT_CODE => "Discount code",
                 _ => "Reference code discount",
             };
             line_items.push(PaymentLineItem {
@@ -688,6 +677,43 @@ async fn calculate_payment(
     })
 }
 
+/// One payment, one promotion: promotions never stack. Every candidate is
+/// ranked by the rupiah it actually takes off THIS gross and the largest
+/// reduction wins, so a family with both a reference-code promotion and a
+/// discount code gets the better of the two, never both. On a tie the more
+/// specific source is the one recorded: a promotion staff attached to the
+/// Lead, then the family's discount code, then the global ladder, then the
+/// reference code. A candidate that takes nothing off is not recorded.
+fn select_promotion(
+    gross_amount: i64,
+    candidates: Vec<PromotionRuleSnapshot>,
+) -> Option<PromotionRuleSnapshot> {
+    candidates
+        .into_iter()
+        .map(|rule| (calculate_discount_amount(gross_amount, &rule), rule))
+        .filter(|(discount, _)| *discount > 0)
+        .max_by_key(|(discount, rule)| {
+            let priority = match rule.source.as_str() {
+                promotion_repository::SOURCE_LEAD_PROMOTION_CODE => 3i64,
+                promotion_repository::SOURCE_DISCOUNT_CODE => 2,
+                promotion_repository::SOURCE_GLOBAL_LADDER => 1,
+                _ => 0,
+            };
+            (*discount, priority)
+        })
+        .map(|(_, rule)| rule)
+}
+
+/// Rupiah a rule takes off `gross_amount`. Amounts are whole rupiah (IDR
+/// has no minor unit here), integer arithmetic only.
+///
+/// - `percent`: the value is capped at 100 and the result is rounded down
+///   to the rupiah (`gross × percent ÷ 100`, integer division), so a
+///   rounding difference of less than one rupiah stays on the invoice.
+/// - `fixed_amount`: the value itself, once per invoice.
+/// - Then the rule's own cap (`max_discount_amount`) and floor
+///   (`min_net_amount`) apply, and the discount never exceeds the gross:
+///   the total cannot go below zero.
 fn calculate_discount_amount(gross_amount: i64, rule: &PromotionRuleSnapshot) -> i64 {
     if gross_amount <= 0 {
         return 0;
@@ -695,7 +721,7 @@ fn calculate_discount_amount(gross_amount: i64, rule: &PromotionRuleSnapshot) ->
     let raw_discount = match rule.discount_type.as_str() {
         "fixed_amount" => rule.discount_value,
         "percent" => gross_amount
-            .saturating_mul(rule.discount_value)
+            .saturating_mul(rule.discount_value.clamp(0, 100))
             .saturating_div(100),
         _ => 0,
     }
@@ -2040,7 +2066,7 @@ fn pretty_payment_type(ty: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        calculate_discount_amount, restrict_to_offer_bank_account,
+        calculate_discount_amount, restrict_to_offer_bank_account, select_promotion,
         should_apply_doku_paid_side_effect, validate_doku_callback_contract, PromotionRuleSnapshot,
     };
     use crate::clients::doku::{DokuWebhook, DokuWebhookOrder, DokuWebhookTransaction};
@@ -2193,6 +2219,158 @@ mod tests {
     fn unsupported_discount_type_is_zero() {
         let rule = rule("free_text", 100);
         assert_eq!(calculate_discount_amount(2_000_000, &rule), 0);
+    }
+
+    fn from(source: &str, code: &str, discount_type: &str, value: i64) -> PromotionRuleSnapshot {
+        PromotionRuleSnapshot {
+            promotion_code: code.to_string(),
+            promotion_rule_id: format!("PROMO-{code}"),
+            source: source.to_string(),
+            ..rule(discount_type, value)
+        }
+    }
+
+    #[test]
+    fn percent_discount_rounds_down_to_the_rupiah() {
+        // 10 % of Rp 1.250.000 is exact.
+        assert_eq!(
+            calculate_discount_amount(1_250_000, &rule("percent", 10)),
+            125_000
+        );
+        // 33 % of Rp 999.999 = 329.999,67 → Rp 329.999; the family pays
+        // Rp 670.000.
+        assert_eq!(
+            calculate_discount_amount(999_999, &rule("percent", 33)),
+            329_999
+        );
+        // 15 % of Rp 1.333.333 = 199.999,95 → Rp 199.999.
+        assert_eq!(
+            calculate_discount_amount(1_333_333, &rule("percent", 15)),
+            199_999
+        );
+        // Less than one rupiah is no discount.
+        assert_eq!(calculate_discount_amount(99, &rule("percent", 1)), 0);
+        // Two children: the percentage is taken from the invoice total.
+        assert_eq!(
+            calculate_discount_amount(2 * 1_250_000, &rule("percent", 10)),
+            250_000
+        );
+    }
+
+    #[test]
+    fn percent_is_capped_at_one_hundred_and_the_total_is_never_negative() {
+        for value in [100, 101, 250, i64::MAX] {
+            let discount = calculate_discount_amount(1_250_000, &rule("percent", value));
+            assert_eq!(discount, 1_250_000, "percent {value}");
+            assert_eq!(1_250_000 - discount, 0);
+        }
+        for (kind, value) in [
+            ("percent", -10),
+            ("percent", 0),
+            ("fixed_amount", -1),
+            ("fixed_amount", 0),
+        ] {
+            assert_eq!(calculate_discount_amount(1_250_000, &rule(kind, value)), 0);
+        }
+        // A fixed discount larger than the charge is capped at the charge.
+        assert_eq!(
+            calculate_discount_amount(1_250_000, &rule("fixed_amount", i64::MAX)),
+            1_250_000
+        );
+        // Nothing to discount on an empty or negative gross.
+        assert_eq!(
+            calculate_discount_amount(0, &rule("fixed_amount", 100_000)),
+            0
+        );
+        assert_eq!(calculate_discount_amount(-5, &rule("percent", 50)), 0);
+        // A very large gross does not overflow.
+        assert_eq!(
+            calculate_discount_amount(i64::MAX, &rule("percent", 50)),
+            i64::MAX / 100
+        );
+    }
+
+    #[test]
+    fn a_reference_promotion_and_a_discount_code_never_stack_and_the_larger_wins() {
+        let gross = 1_250_000;
+        let reference = || from("reference_code", "MKT-NADIA", "fixed_amount", 100_000);
+        // Discount code 10 % = 125.000 beats the reference code's 100.000.
+        let larger_code = select_promotion(
+            gross,
+            vec![reference(), from("discount_code", "HEMAT10", "percent", 10)],
+        )
+        .unwrap();
+        assert_eq!(larger_code.promotion_code, "HEMAT10");
+        assert_eq!(larger_code.promotion_rule_id, "PROMO-HEMAT10");
+        assert_eq!(calculate_discount_amount(gross, &larger_code), 125_000);
+        // Discount code 5 % = 62.500 loses to the reference code.
+        let larger_reference = select_promotion(
+            gross,
+            vec![from("discount_code", "HEMAT5", "percent", 5), reference()],
+        )
+        .unwrap();
+        assert_eq!(larger_reference.source, "reference_code");
+        assert_eq!(calculate_discount_amount(gross, &larger_reference), 100_000);
+        // Whatever the order, the result is one promotion, never the sum.
+        for candidates in [
+            vec![reference(), from("discount_code", "HEMAT10", "percent", 10)],
+            vec![from("discount_code", "HEMAT10", "percent", 10), reference()],
+        ] {
+            let chosen = select_promotion(gross, candidates).unwrap();
+            assert_eq!(chosen.source, "discount_code");
+            assert_eq!(gross - calculate_discount_amount(gross, &chosen), 1_125_000);
+        }
+    }
+
+    #[test]
+    fn on_a_tie_the_more_specific_source_is_recorded() {
+        let gross = 1_000_000;
+        let ten = |source: &str, code: &str| from(source, code, "percent", 10);
+        let all = || {
+            vec![
+                ten("reference_code", "MKT-NADIA"),
+                ten("global_ladder", "EARLY-202610"),
+                ten("discount_code", "HEMAT10"),
+                ten("lead_promotion_code", "STAFF-PICK"),
+            ]
+        };
+        assert_eq!(
+            select_promotion(gross, all()).unwrap().source,
+            "lead_promotion_code"
+        );
+        let mut reversed = all();
+        reversed.reverse();
+        assert_eq!(
+            select_promotion(gross, reversed).unwrap().source,
+            "lead_promotion_code"
+        );
+        let without_staff: Vec<_> = all().into_iter().take(3).collect();
+        assert_eq!(
+            select_promotion(gross, without_staff).unwrap().source,
+            "discount_code"
+        );
+        assert_eq!(
+            select_promotion(gross, all().into_iter().take(2).collect())
+                .unwrap()
+                .source,
+            "global_ladder"
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_takes_nothing_off_is_not_recorded() {
+        assert!(select_promotion(1_000_000, vec![]).is_none());
+        assert!(select_promotion(
+            1_000_000,
+            vec![
+                from("discount_code", "ZERO", "percent", 0),
+                from("reference_code", "BAD", "free_text", 10)
+            ]
+        )
+        .is_none());
+        assert!(
+            select_promotion(0, vec![from("discount_code", "HEMAT10", "percent", 10)]).is_none()
+        );
     }
 }
 

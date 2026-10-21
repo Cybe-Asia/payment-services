@@ -216,20 +216,67 @@ async fn monthly_levy_overseas_credit_and_online_settlement() {
         .unwrap();
     assert_eq!((next.period_start, next.amount), (start.key(), 21_000_000));
 
-    // ---- Capital Levy: installment, deposit shrinks the rest, bounds.
-    let levy = CapitalLevyInput {
-        student_id: student.clone(),
-        total_amount: 150_000_000,
+    // ---- Capital Levy: the year of entry is the admissions offer's; later years come from plans.
+    g.run(query("MATCH (s:Student {studentId:$student}) CREATE (s)-[:HAS_OFFER]->(o:Offer {offer_id:$offer,status:'accepted',academic_year:'2026',tenant_id:$tenant,target_school_id:$school,issued_at:datetime(),pricing_snapshot_json:$pricing,billing_test:$mark})-[:PAID_VIA]->(:Payment {payment_id:$pay,payment_type:'offer_due_now',status:'paid',amount:105000000,billing_test:$mark})")
+        .param("student", student.clone()).param("offer", format!("OFF-{mark}")).param("pay", format!("PAY-{mark}")).param("tenant", tenant.clone()).param("school", school.clone()).param("mark", mark.clone())
+        .param("pricing", r#"{"snapshotVersion":"offer-pricing-v1","currency":"IDR","lineItems":[{"code":"CAPITAL_LEVY","label":"Capital Levy","amount":75000000},{"code":"MONTHLY_FEE","label":"Monthly Fee - July 2099","amount":7000000}],"remainingBalance":0}"#)).await.unwrap();
+    let admitted = repo::admission_paid(&g, &c).await.unwrap().unwrap();
+    assert_eq!(
+        (admitted.academic_year.as_str(), admitted.capital_levy),
+        ("2026", Some(75_000_000))
+    );
+    assert_eq!(
+        admitted.monthly_fee_month.map(Month::key),
+        Some("2099-07".into())
+    );
+    // A month already paid with the offer is never billed again: the next period starts after it.
+    g.run(
+        query(
+            "MATCH (i:SchoolInvoice {id:$id}) SET i.status='paid',i.paid_at=toString(datetime())",
+        )
+        .param("id", next.invoice_id.clone()),
+    )
+    .await
+    .unwrap();
+    let after = service::issue_monthly(
+        &g,
+        &c,
+        chrono::NaiveDate::from_ymd_opt(2099, 7, 30).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(after.period_start, "2099-08");
+    let plan = |year: &str, version: i64| CapitalLevyPlanInput {
+        tenant_id: tenant.clone(),
+        school_id: school.clone(),
+        year_group: "*".into(),
+        academic_year: year.into(),
         installments: vec![
             inst("Capital Levy I", 75_000_000, "2026-01-10"),
             inst("Capital Levy II", 75_000_000, "2099-01-10"),
         ],
         issue_lead_days: 14,
+        active: true,
+        version,
     };
-    let c2 = repo::payer_of(&g, &student).await.unwrap();
-    let saved = repo::save_capital_levy(&g, &owner, &c2, &levy, 0)
+    repo::save_levy_plan(&g, &owner, &plan("2026", 0))
         .await
         .unwrap();
+    service::ensure_levies(&g, &c).await.unwrap();
+    assert!(
+        repo::capital_levies_for(&g, &c).await.unwrap().is_empty(),
+        "the year of entry was paid in admissions"
+    );
+    repo::save_levy_plan(&g, &owner, &plan("2027", 0))
+        .await
+        .unwrap();
+    service::ensure_levies(&g, &c).await.unwrap();
+    let saved = repo::capital_levies_for(&g, &c).await.unwrap().remove(0);
+    assert_eq!(
+        (saved.academic_year.as_str(), saved.payable),
+        ("2027", 150_000_000)
+    );
     let i1 = service::issue_installment(&g, &c, &saved, today())
         .await
         .unwrap()
@@ -242,12 +289,14 @@ async fn monthly_levy_overseas_credit_and_online_settlement() {
             .is_none(),
         "II is not due"
     );
-    assert!(
-        matches!(
-            repo::save_capital_levy(&g, &owner, &c2, &levy, 1).await,
-            Err(Error::Conflict)
-        ),
-        "billed schedule is frozen"
+    // Once billed, a changed plan no longer rewrites the child's schedule.
+    let mut changed = plan("2027", 1);
+    changed.installments[1].amount = 1;
+    repo::save_levy_plan(&g, &owner, &changed).await.unwrap();
+    service::ensure_levies(&g, &c).await.unwrap();
+    assert_eq!(
+        repo::capital_levies_for(&g, &c).await.unwrap()[0].payable,
+        150_000_000
     );
     assert!(
         service::deposit(&g, &c, &saved, 75_000_001, "dep-1")
@@ -443,6 +492,9 @@ async fn monthly_levy_overseas_credit_and_online_settlement() {
     assert_eq!(v["monthlyFee"]["selection"]["months"], 3);
     assert_eq!(v["capitalLevy"]["billed"], 150_000_000);
     assert_eq!(v["capitalLevy"]["paid"], 0);
+    assert_eq!(v["capitalLevy"]["academicYear"], "2027");
+    assert_eq!(v["capitalLevyYears"][1]["source"], "admission");
+    assert_eq!(v["capitalLevyYears"][1]["paid"], 75_000_000);
     assert_eq!(v["overseas"][0]["enrollment"]["payable"], 110_000_000);
     assert_eq!(v["overseas"][0]["participants"], 1);
     assert!(

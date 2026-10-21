@@ -61,13 +61,27 @@ pub struct CreditView {
     pub balance: i64,
     pub bills: Vec<Bill>,
 }
+/// One academic year of a child's Capital Levy: the year of entry paid in the
+/// admissions offer, or a year billed through the Payment tab.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LevyYearView {
+    pub academic_year: String,
+    pub payable: i64,
+    pub paid: i64,
+    /// `admission` (paid with the offer) or `billing`.
+    pub source: &'static str,
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChildView {
     #[serde(flatten)]
     pub child: Child,
     pub monthly_fee: Option<MonthlyFeeView>,
+    /// The newest billed academic year (what the card and detail show).
     pub capital_levy: Option<ScheduleView>,
+    /// Every academic year, newest first, including the year of entry.
+    pub capital_levy_years: Vec<LevyYearView>,
     pub overseas: Vec<ProgramView>,
     pub credit: CreditView,
 }
@@ -126,9 +140,41 @@ pub async fn summary(graph: &Graph, c: Child) -> Result<ChildView> {
             })
         }
     };
-    let capital_levy = repo::capital_levy(graph, &c)
+    let mut levies: Vec<ScheduleView> = repo::capital_levies_for(graph, &c)
         .await?
-        .map(|s| schedule_view(s, &all));
+        .into_iter()
+        .map(|s| schedule_view(s, &all))
+        .collect();
+    let mut capital_levy_years: Vec<LevyYearView> = levies
+        .iter()
+        .map(|v| LevyYearView {
+            academic_year: v.schedule.academic_year.clone(),
+            payable: v.schedule.payable,
+            paid: v.paid,
+            source: "billing",
+        })
+        .collect();
+    if let Some(admission) = repo::admission_paid(graph, &c).await? {
+        if let Some(amount) = admission.capital_levy {
+            if !capital_levy_years
+                .iter()
+                .any(|y| y.academic_year == admission.academic_year)
+            {
+                capital_levy_years.push(LevyYearView {
+                    academic_year: admission.academic_year,
+                    payable: amount,
+                    paid: amount,
+                    source: "admission",
+                });
+            }
+        }
+    }
+    capital_levy_years.sort_by(|a, b| b.academic_year.cmp(&a.academic_year));
+    let capital_levy = if levies.is_empty() {
+        None
+    } else {
+        Some(levies.remove(0))
+    };
     let mut joined = repo::enrollments(graph, &c).await?;
     let today = today();
     let overseas = repo::programs_for(graph, &c)
@@ -170,6 +216,7 @@ pub async fn summary(graph: &Graph, c: Child) -> Result<ChildView> {
         child: c,
         monthly_fee,
         capital_levy,
+        capital_levy_years,
         overseas,
     })
 }
@@ -213,9 +260,14 @@ pub async fn issue_monthly(graph: &Graph, c: &Child, today: NaiveDate) -> Result
     };
     let all = repo::child_bills(graph, &c.enrolled_student_id).await?;
     let monthly: Vec<&Bill> = all.iter().filter(|b| b.category == "monthly_fee").collect();
+    // The month paid with the admissions offer counts as billed.
+    let admitted = repo::admission_paid(graph, c)
+        .await?
+        .and_then(|a| a.monthly_fee_month);
     let last_end = monthly
         .iter()
         .filter_map(|b| Month::parse(&b.period_start).map(|m| m.plus(b.months as i32 - 1)))
+        .chain(admitted)
         .max();
     let Some(bill) = monthly_bill(
         plan.input.monthly_amount,
@@ -352,8 +404,9 @@ pub async fn issue_due(graph: &Graph, c: &Child, today: NaiveDate) -> Result<usi
         Ok(None) | Err(Error::Conflict) | Err(Error::Denied) => {}
         Err(e) => return Err(e),
     }
+    ensure_levies(graph, c).await?;
     let mut schedules = repo::enrollments(graph, c).await?;
-    schedules.extend(repo::capital_levy(graph, c).await?);
+    schedules.extend(repo::capital_levies_for(graph, c).await?);
     for s in &schedules {
         match issue_installment(graph, c, s, today).await {
             Ok(Some(_)) => count += 1,
@@ -362,6 +415,21 @@ pub async fn issue_due(graph: &Graph, c: &Child, today: NaiveDate) -> Result<usi
         }
     }
     Ok(count)
+}
+
+/// Creates the child's Capital Levy for every active plan year that the
+/// admissions offer did not already pay.
+pub async fn ensure_levies(graph: &Graph, c: &Child) -> Result<()> {
+    let admitted = repo::admission_paid(graph, c)
+        .await?
+        .filter(|a| a.capital_levy.is_some())
+        .map(|a| a.academic_year);
+    for plan in repo::levy_plans_for(graph, c).await? {
+        if admitted.as_deref() != Some(plan.input.academic_year.as_str()) {
+            repo::ensure_levy(graph, c, &plan.input).await?;
+        }
+    }
+    Ok(())
 }
 
 /// A parent-chosen extra payment towards a schedule.

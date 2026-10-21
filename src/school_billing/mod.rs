@@ -153,9 +153,12 @@ async fn levy_deposit(
     ids(&[&input.request_id])?;
     let (_, c) = child(&s, &h, &student).await?;
     let g = graph(&s)?;
-    let levy = repository::capital_levy(g, &c)
+    // Deposits go to the newest academic year billed through the Payment tab.
+    let levy = repository::capital_levies_for(g, &c)
         .await
         .map_err(owner_error)?
+        .into_iter()
+        .next()
         .ok_or_else(|| coded(StatusCode::CONFLICT, "NOT_CONFIGURED"))?;
     Ok(data(
         service::deposit(g, &c, &levy, input.amount, &input.request_id).await?,
@@ -347,39 +350,38 @@ async fn levies(State(s): State<AppState>, h: HeaderMap) -> Result<Response, Fai
     }
     Ok(data(out))
 }
-async fn save_levy(
+async fn levy_plans(State(s): State<AppState>, h: HeaderMap) -> Result<Response, Failure> {
+    let a = auth::staff(&h, &s.jwt_secret)?;
+    Ok(data(
+        repository::levy_plans(graph(&s)?, &a)
+            .await
+            .map_err(owner_error)?,
+    ))
+}
+async fn save_levy_plan(
     State(s): State<AppState>,
     h: HeaderMap,
-    input: Result<Json<Value>, JsonRejection>,
+    input: Result<Json<model::CapitalLevyPlanInput>, JsonRejection>,
 ) -> Result<Response, Failure> {
     let a = auth::staff(&h, &s.jwt_secret)?;
-    // `version` travels beside the strict levy body.
-    let mut raw = body(input)?;
-    let version = raw
-        .as_object_mut()
-        .and_then(|o| o.remove("version"))
-        .and_then(|v| v.as_i64())
-        .filter(|v| *v >= 0)
-        .ok_or_else(|| failure(StatusCode::BAD_REQUEST))?;
-    let levy: model::CapitalLevyInput =
-        serde_json::from_value(raw).map_err(|_| failure(StatusCode::BAD_REQUEST))?;
-    if !levy.valid() {
+    let input = body(input)?;
+    if !input.valid() {
         return Err(failure(StatusCode::BAD_REQUEST));
     }
-    let g = graph(&s)?;
-    let c = repository::payer_of(g, &levy.student_id)
+    let saved = repository::save_levy_plan(graph(&s)?, &a, &input)
         .await
         .map_err(owner_error)?;
-    let saved = repository::save_capital_levy(g, &a, &c, &levy, version)
-        .await
-        .map_err(owner_error)?;
-    if let Err(e) = service::issue_installment(g, &c, &saved, model::today()).await {
-        tracing::warn!(error = ?e, "capital levy installment was not issued after saving");
+    // The school's children get this year's levy now rather than at the next
+    // worker run; the request does not wait for it.
+    if let Some(g) = s.graph.clone() {
+        let (tenant, school) = (input.tenant_id.clone(), input.school_id.clone());
+        tokio::spawn(async move {
+            if let Err(e) = worker::run_school(&g, &tenant, &school).await {
+                tracing::warn!(error = ?e, "capital levy plan was not applied at once");
+            }
+        });
     }
-    let all = repository::bills(g, &c.payer_user_id, &c.enrolled_student_id)
-        .await
-        .map_err(owner_error)?;
-    Ok(data(service::ScheduleView::of(saved, &all)))
+    Ok(data(saved))
 }
 async fn programs(State(s): State<AppState>, h: HeaderMap) -> Result<Response, Failure> {
     let a = auth::staff(&h, &s.jwt_secret)?;
@@ -459,7 +461,11 @@ pub fn router() -> Router<AppState> {
         )
         .route(&format!("{A}/fee-plans"), get(plans).put(save_plan))
         .route(&format!("{A}/students"), get(staff_students))
-        .route(&format!("{A}/capital-levies"), get(levies).post(save_levy))
+        .route(&format!("{A}/capital-levies"), get(levies))
+        .route(
+            &format!("{A}/capital-levy-plans"),
+            get(levy_plans).put(save_levy_plan),
+        )
         .route(
             &format!("{A}/overseas-programs"),
             get(programs).post(create_program),

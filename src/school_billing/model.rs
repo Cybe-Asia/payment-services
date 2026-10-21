@@ -241,22 +241,112 @@ pub fn deposit_ok(amount: i64, payable: i64, billed: i64) -> bool {
     amount >= MIN_DEPOSIT.min(payable - billed).max(1) && amount <= payable - billed
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// The Capital Levy of one academic year for a school's year group (or `*`):
+/// every active enrolled child in it owes this schedule for that year.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CapitalLevyInput {
-    pub student_id: String,
-    pub total_amount: i64,
+pub struct CapitalLevyPlanInput {
+    pub tenant_id: String,
+    pub school_id: String,
+    pub year_group: String,
+    /// Start year of the academic year: `2027` is 2027/2028 (the admissions offer's `academic_year`).
+    pub academic_year: String,
     pub installments: Vec<Installment>,
     pub issue_lead_days: i64,
+    pub active: bool,
+    pub version: i64,
 }
-impl CapitalLevyInput {
+impl CapitalLevyPlanInput {
     pub fn valid(&self) -> bool {
-        identifier(&self.student_id)
-            && self.total_amount > 0
+        identifier(&self.tenant_id)
+            && identifier(&self.school_id)
+            && (self.year_group == "*" || text(&self.year_group, 32))
+            && academic_year(&self.academic_year)
             && valid_schedule(&self.installments)
-            && schedule_total(&self.installments) == self.total_amount
             && (0..=60).contains(&self.issue_lead_days)
+            && self.version >= 0
     }
+}
+pub fn academic_year(v: &str) -> bool {
+    v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()) && ("2000".."2100").contains(&v)
+}
+
+/// What the admissions offer already paid for a child: the Capital Levy of
+/// the year of entry and the month of monthly fee it included.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionPaid {
+    pub academic_year: String,
+    pub capital_levy: Option<i64>,
+    pub monthly_fee_month: Option<Month>,
+}
+const MONTH_NAMES: [[&str; 12]; 2] = [
+    [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ],
+    [
+        "januari",
+        "februari",
+        "maret",
+        "april",
+        "mei",
+        "juni",
+        "juli",
+        "agustus",
+        "september",
+        "oktober",
+        "november",
+        "desember",
+    ],
+];
+/// "Monthly Fee - July 2027" → 2027-07; anything else → None.
+pub fn month_in_label(label: &str) -> Option<Month> {
+    let words: Vec<String> = label
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    words.windows(2).find_map(|w| {
+        let m = MONTH_NAMES
+            .iter()
+            .find_map(|names| names.iter().position(|n| *n == w[0]))?;
+        let y: i32 = w[1].parse().ok().filter(|y| (2000..2100).contains(y))?;
+        Some(Month(y * 12 + m as i32))
+    })
+}
+/// Reads a paid offer's pricing snapshot (`offer-pricing-v1`). The levy counts
+/// only when the offer was paid in full (nothing left on an installment plan).
+pub fn admission_paid(academic_year_value: &str, pricing_json: &str) -> Option<AdmissionPaid> {
+    let v: serde_json::Value = serde_json::from_str(pricing_json).ok()?;
+    if v.get("currency")?.as_str()? != "IDR" || !academic_year(academic_year_value) {
+        return None;
+    }
+    let settled = v.get("remainingBalance").and_then(|r| r.as_i64()) == Some(0);
+    let lines = v.get("lineItems")?.as_array()?;
+    let code = |c: &str| {
+        lines
+            .iter()
+            .find(|l| l.get("code").and_then(|x| x.as_str()) == Some(c))
+    };
+    Some(AdmissionPaid {
+        academic_year: academic_year_value.to_string(),
+        capital_levy: code("CAPITAL_LEVY")
+            .and_then(|l| l.get("amount")?.as_i64())
+            .filter(|a| *a > 0 && settled),
+        monthly_fee_month: code("MONTHLY_FEE")
+            .and_then(|l| l.get("label")?.as_str())
+            .and_then(month_in_label),
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -503,6 +593,46 @@ mod tests {
             d("2027-03-13")
         ));
         assert!(!early_bird_open(None, d("2027-01-01")));
+    }
+
+    #[test]
+    fn admission_offer_counts_its_levy_and_month() {
+        let pricing = r#"{"snapshotVersion":"offer-pricing-v1","currency":"IDR","lineItems":[{"code":"CAPITAL_LEVY","label":"Capital Levy","amount":75000000},{"code":"MONTHLY_FEE","label":"Monthly Fee - July 2027","amount":7000000}],"remainingBalance":0}"#;
+        let paid = admission_paid("2026", pricing).unwrap();
+        assert_eq!(paid.capital_levy, Some(75_000_000));
+        assert_eq!(
+            paid.monthly_fee_month.map(Month::key),
+            Some("2027-07".into())
+        );
+        let partial = pricing.replace("\"remainingBalance\":0", "\"remainingBalance\":5");
+        assert_eq!(
+            admission_paid("2026", &partial).unwrap().capital_levy,
+            None,
+            "unpaid installments"
+        );
+        assert!(admission_paid("26", pricing).is_none());
+        assert_eq!(
+            month_in_label("SPP Agustus 2026").map(Month::key),
+            Some("2026-08".into())
+        );
+        assert_eq!(month_in_label("Monthly Fee"), None);
+    }
+
+    #[test]
+    fn levy_plan_validation() {
+        let mut p = CapitalLevyPlanInput {
+            tenant_id: "t".into(),
+            school_id: "s".into(),
+            year_group: "year7".into(),
+            academic_year: "2027".into(),
+            installments: vec![inst("Capital Levy I", 75, "2027-06-10")],
+            issue_lead_days: 14,
+            active: true,
+            version: 0,
+        };
+        assert!(p.valid());
+        p.academic_year = "27/28".into();
+        assert!(!p.valid());
     }
 
     #[test]

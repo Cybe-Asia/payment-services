@@ -70,12 +70,12 @@
     "src/services/payable_offers_tests.rs": "35ee62b0aae61a0114bf2fde273c76db933afc0e6fcb234431864afc2f076451",
     "src/services/discount_code_tests.rs": "c66a5a91dd55c97bda8e41a3899cb9119546aaa787985bbb008c7fd092977dfe",
     "src/school_billing/checkout.rs": "ab4b6b7075a31e6bb0671d9c33733433b9c1867c46270e84669f7123766326e5",
-    "src/school_billing/mod.rs": "91259e63126d4e9c6cf884882109572a130b5645b5776851c3caeb6c34ed4dce",
-    "src/school_billing/model.rs": "6590c4b35dd06d053789ee6504e7c10a3d08f566f2572c0d6270cea4d152b3f6",
-    "src/school_billing/repository.rs": "8ad1559641361ad93def4715803389030b78cc87614e523b98e08ff53238ca9c",
-    "src/school_billing/service.rs": "74b44703cd6d31ded30e457af2a2b50a7ee3e6fb1d4011e355529fcb5ae0759d",
-    "src/school_billing/tests.rs": "3221a1b3641c7a1131460003f60cade9f91f3f831680585e7d17622b4be2199a",
-    "src/school_billing/worker.rs": "7d7a755199f5e9da13885f818541c1911a301ece8d1f1973f34d3ecc1056e938"
+    "src/school_billing/mod.rs": "c07fbed605fcebacc5c371126e2b786107e413fe39368fad12a86d66492891d8",
+    "src/school_billing/model.rs": "e1b16856ea334079a0f2746c3afb1b6dba8725cd19871d37aa4c87bc20bee2c2",
+    "src/school_billing/repository.rs": "2353ba73bbe0bf3163d549be74f633c4800a000b7a6cc72887aa0736843bf934",
+    "src/school_billing/service.rs": "f413aa7d272a02cd1f26b57f487c790f59a322d494dc2d8e9062728fd298d045",
+    "src/school_billing/tests.rs": "255dfbec5df4ade8e4c946bedd2fd64354cc521a3b8281b225251af55cfb03af",
+    "src/school_billing/worker.rs": "f538e033cc46be8a4f48db741818f5f197bdf6e47ebc88cf72de8cd541de80ad"
   },
   "scope": "approved current web integration; school-staging; no automatic GitOps or production promotion"
 }

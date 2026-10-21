@@ -31,6 +31,10 @@ pub async fn run_once(graph: &neo4rs::Graph) -> Result<usize, Error> {
     for s in repo::all_schedules(graph).await? {
         pairs.insert((s.payer_user_id, s.student_id));
     }
+    // Children of schools with a Capital Levy plan get their year's levy.
+    for (tenant, school) in repo::levy_plan_schools(graph).await? {
+        pairs.extend(repo::school_families(graph, &tenant, &school).await?);
+    }
     let today = today();
     let mut issued = 0;
     for (payer, student) in pairs {
@@ -44,6 +48,21 @@ pub async fn run_once(graph: &neo4rs::Graph) -> Result<usize, Error> {
             Ok(n) => issued += n,
             Err(e) => tracing::warn!(error = ?e, "school billing child skipped"),
         }
+    }
+    Ok(issued)
+}
+
+/// Applies a school's plans to its children at once (after Admin saves one).
+pub async fn run_school(graph: &neo4rs::Graph, tenant: &str, school: &str) -> Result<usize, Error> {
+    let today = today();
+    let mut issued = 0;
+    for (payer, student) in repo::school_families(graph, tenant, school).await? {
+        let child = match repo::family(graph, &payer, &student).await {
+            Ok(c) => c,
+            Err(Error::Denied) => continue,
+            Err(e) => return Err(e),
+        };
+        issued += service::issue_due(graph, &child, today).await.unwrap_or(0);
     }
     Ok(issued)
 }

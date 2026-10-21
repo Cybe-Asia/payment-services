@@ -21,6 +21,7 @@ pub async fn init(graph: &Graph) -> Result<()> {
         ("monthly_fee_selection_key", "MonthlyFeeSelection", "key"),
         ("capital_levy_id", "CapitalLevyObligation", "id"),
         ("capital_levy_key", "CapitalLevyObligation", "key"),
+        ("capital_levy_plan_key", "CapitalLevyPlan", "key"),
         ("overseas_program_id", "OverseasProgram", "id"),
         ("overseas_enrollment_id", "OverseasEnrollment", "id"),
         ("overseas_enrollment_key", "OverseasEnrollment", "key"),
@@ -413,10 +414,12 @@ pub struct Schedule {
     pub issue_lead_days: i64,
     pub scheme: String,
     pub program_id: String,
+    /// Capital Levy only: start year of the academic year it is owed for.
+    pub academic_year: String,
     pub version: i64,
     pub created_at: String,
 }
-const SCHEDULE: &str = "RETURN o.id AS id,o.category AS category,o.student_id AS student,o.enrolled_student_id AS enrolled,o.payer_user_id AS payer,coalesce(o.student_name,'') AS name,o.gross AS gross,o.discount AS discount,o.payable AS payable,o.installments_json AS installments,o.issue_lead_days AS lead,coalesce(o.scheme,'') AS scheme,coalesce(o.program_id,'') AS program,o.version AS version,toString(o.created_at) AS created";
+const SCHEDULE: &str = "RETURN o.id AS id,o.category AS category,o.student_id AS student,o.enrolled_student_id AS enrolled,o.payer_user_id AS payer,coalesce(o.student_name,'') AS name,o.gross AS gross,o.discount AS discount,o.payable AS payable,o.installments_json AS installments,o.issue_lead_days AS lead,coalesce(o.scheme,'') AS scheme,coalesce(o.program_id,'') AS program,coalesce(o.academic_year,'') AS ay,o.version AS version,toString(o.created_at) AS created";
 fn schedule(row: &Row) -> Result<Schedule> {
     let installments: Vec<Installment> =
         serde_json::from_str(&s(row, "installments")?).map_err(unavailable)?;
@@ -437,20 +440,184 @@ fn schedule(row: &Row) -> Result<Schedule> {
         issue_lead_days: n(row, "lead")?,
         scheme: s(row, "scheme")?,
         program_id: s(row, "program")?,
+        academic_year: s(row, "ay")?,
         version: n(row, "version")?,
         created_at: s(row, "created")?,
     })
 }
-pub async fn capital_levy(graph: &Graph, c: &Child) -> Result<Option<Schedule>> {
+/// The child's Capital Levy of every academic year billed through the
+/// Payment tab, newest year first.
+pub async fn capital_levies_for(graph: &Graph, c: &Child) -> Result<Vec<Schedule>> {
+    rows(
+        graph,
+        query(&format!("MATCH (o:CapitalLevyObligation {{enrolled_student_id:$enrolled,tenant_id:$tenant,school_id:$school}}) WHERE o.payer_user_id=$payer {SCHEDULE} ORDER BY o.academic_year DESC LIMIT 21"))
+            .param("enrolled", c.enrolled_student_id.clone())
+            .param("tenant", c.tenant_id.clone())
+            .param("school", c.school_id.clone())
+            .param("payer", c.payer_user_id.clone()),
+        20,
+    )
+    .await?
+    .iter()
+    .map(schedule)
+    .collect()
+}
+/// What the child's accepted, paid admissions offer covered.
+pub async fn admission_paid(graph: &Graph, c: &Child) -> Result<Option<AdmissionPaid>> {
     let found = rows(
         graph,
-        query(&format!("MATCH (o:CapitalLevyObligation {{key:$key}}) WHERE o.payer_user_id=$payer {SCHEDULE} LIMIT 2"))
-            .param("key", selection_key(c))
-            .param("payer", c.payer_user_id.clone()),
-        1,
+        query("MATCH (:Student {studentId:$student})-[:HAS_OFFER]->(o:Offer {status:'accepted'})-[:PAID_VIA]->(p:Payment {status:'paid'}) WHERE p.payment_type IN ['offer_due_now','enrolment_fee'] AND coalesce(o.tenant_id,$tenant)=$tenant AND coalesce(o.target_school_id,$school)=$school AND o.pricing_snapshot_json IS NOT NULL RETURN toString(o.academic_year) AS ay,o.pricing_snapshot_json AS pricing ORDER BY o.issued_at DESC LIMIT 6")
+            .param("student", c.student_id.clone())
+            .param("tenant", c.tenant_id.clone())
+            .param("school", c.school_id.clone()),
+        5,
     )
     .await?;
-    found.first().map(schedule).transpose()
+    Ok(found
+        .iter()
+        .find_map(|r| admission_paid_from(&r.get::<String>("ay")?, &r.get::<String>("pricing")?)))
+}
+use super::model::admission_paid as admission_paid_from;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LevyPlan {
+    #[serde(flatten)]
+    pub input: CapitalLevyPlanInput,
+    pub updated_at: Option<String>,
+}
+const LEVY_PLAN: &str =
+    "RETURN p.payload AS payload,p.version AS version,toString(p.updated_at) AS updated";
+fn levy_plan(row: &Row) -> Result<LevyPlan> {
+    let mut input: CapitalLevyPlanInput =
+        serde_json::from_str(&s(row, "payload")?).map_err(unavailable)?;
+    input.version = n(row, "version")?;
+    if !input.valid() {
+        return Err(Error::Unavailable);
+    }
+    Ok(LevyPlan {
+        input,
+        updated_at: row.get("updated"),
+    })
+}
+pub async fn levy_plans(graph: &Graph, a: &auth::Staff) -> Result<Vec<LevyPlan>> {
+    rows(
+        graph,
+        staff(
+            query(&format!(
+                "{} WITH actor MATCH (p:CapitalLevyPlan) WHERE {} {LEVY_PLAN} ORDER BY p.academic_year DESC,p.school_id,p.year_group LIMIT 501",
+                auth::STAFF,
+                auth::scope("p.school_id", "p.tenant_id")
+            )),
+            a,
+        ),
+        500,
+    )
+    .await?
+    .iter()
+    .map(levy_plan)
+    .collect()
+}
+pub async fn save_levy_plan(
+    graph: &Graph,
+    a: &auth::Staff,
+    p: &CapitalLevyPlanInput,
+) -> Result<LevyPlan> {
+    let body = format!(
+        "MATCH (school:School {{school_id:$school,tenant_id:$tenant}}) MERGE (p:CapitalLevyPlan {{key:$key}}) ON CREATE SET p.version=0 SET p._lock=coalesce(p._lock,0)+1 WITH p {} WITH actor,p WHERE {} AND p.version=$version SET p.tenant_id=$tenant,p.school_id=$school,p.year_group=$year,p.academic_year=$ay,p.active=$active,p.payload=$payload,p.version=p.version+1,p.updated_by=actor.id,p.updated_at=datetime() CREATE (:SchoolBillingAudit {{id:$audit,subject:'capital_levy_plan',ref_id:p.key,actor_id:actor.id,action:'saved',version:p.version,payload:$payload,created_at:datetime()}}) {LEVY_PLAN}",
+        auth::fresh("p"),
+        auth::scope("$school", "$tenant")
+    );
+    let q = staff(query(&body), a)
+        .param(
+            "key",
+            format!(
+                "{}|{}|{}|{}",
+                p.tenant_id, p.school_id, p.year_group, p.academic_year
+            ),
+        )
+        .param("tenant", p.tenant_id.clone())
+        .param("school", p.school_id.clone())
+        .param("year", p.year_group.clone())
+        .param("ay", p.academic_year.clone())
+        .param("active", p.active)
+        .param("version", p.version)
+        .param("payload", serde_json::to_string(p).map_err(unavailable)?)
+        .param("audit", uuid::Uuid::new_v4().to_string());
+    invoices::write(graph, q, a.expires, levy_plan).await
+}
+/// Active plans that apply to a child: per academic year, its year group's
+/// plan wins over the school's `*` plan.
+pub async fn levy_plans_for(graph: &Graph, c: &Child) -> Result<Vec<LevyPlan>> {
+    let found: Vec<LevyPlan> = rows(
+        graph,
+        query(&format!("MATCH (p:CapitalLevyPlan {{tenant_id:$tenant,school_id:$school,active:true}}) WHERE p.year_group IN [$year,'*'] {LEVY_PLAN} ORDER BY p.academic_year,CASE p.year_group WHEN '*' THEN 1 ELSE 0 END LIMIT 41"))
+            .param("tenant", c.tenant_id.clone())
+            .param("school", c.school_id.clone())
+            .param("year", c.year_group.clone()),
+        40,
+    )
+    .await?
+    .iter()
+    .map(levy_plan)
+    .collect::<Result<_>>()?;
+    let mut seen = std::collections::BTreeSet::new();
+    Ok(found
+        .into_iter()
+        .filter(|p| seen.insert(p.input.academic_year.clone()))
+        .collect())
+}
+/// Creates the child's obligation for a plan's year, or brings it in line with
+/// the plan while nothing has been billed against it yet.
+pub async fn ensure_levy(graph: &Graph, c: &Child, p: &CapitalLevyPlanInput) -> Result<()> {
+    let total = schedule_total(&p.installments);
+    let q = query("MERGE (o:CapitalLevyObligation {key:$key}) ON CREATE SET o.id=$id,o.version=0,o.created_at=datetime(),o.payer_user_id=$payer SET o._lock=coalesce(o._lock,0)+1 WITH o WHERE NOT EXISTS { MATCH (:SchoolBillingLine {category:'capital_levy',ref_id:o.id}) } AND (o.plan_payload IS NULL OR o.plan_payload<>$payload) SET o.category='capital_levy',o.tenant_id=$tenant,o.school_id=$school,o.student_id=$student,o.enrolled_student_id=$enrolled,o.student_name=$name,o.academic_year=$ay,o.gross=$total,o.discount=0,o.payable=$total,o.installments_json=$installments,o.issue_lead_days=$lead,o.plan_payload=$payload,o.version=o.version+1,o.updated_at=datetime() CREATE (:SchoolBillingAudit {id:$audit,subject:'capital_levy',ref_id:o.id,actor_id:'system:school-billing',action:'from_plan',version:o.version,payload:$ay,created_at:datetime()}) RETURN o.id AS id")
+        .param("key", format!("{}|{}|{}|{}", c.tenant_id, c.school_id, c.enrolled_student_id, p.academic_year))
+        .param("id", format!("CLEVY-{}", uuid::Uuid::new_v4()))
+        .param("payer", c.payer_user_id.clone())
+        .param("tenant", c.tenant_id.clone())
+        .param("school", c.school_id.clone())
+        .param("student", c.student_id.clone())
+        .param("enrolled", c.enrolled_student_id.clone())
+        .param("name", c.name.clone())
+        .param("ay", p.academic_year.clone())
+        .param("total", total)
+        .param("installments", serde_json::to_string(&p.installments).map_err(unavailable)?)
+        .param("lead", p.issue_lead_days)
+        .param("payload", serde_json::to_string(p).map_err(unavailable)?)
+        .param("audit", uuid::Uuid::new_v4().to_string());
+    graph.run(q).await.map_err(unavailable)
+}
+/// Payer and child of every active enrolment of a school, for creating the
+/// Capital Levy of a plan's year.
+pub async fn school_families(
+    graph: &Graph,
+    tenant: &str,
+    school: &str,
+) -> Result<Vec<(String, String)>> {
+    rows(
+        graph,
+        query("MATCH (u:User)-[:HAS_APPLICATION]->(:Lead)-[:HAS_STUDENT]->(s:Student)-[:ENROLLED_AS]->(e:EnrolledStudent {status:'active',tenant_id:$tenant,school_id:$school}) RETURN DISTINCT u.id AS payer,s.studentId AS student ORDER BY student,payer LIMIT 5001")
+            .param("tenant", tenant.to_string())
+            .param("school", school.to_string()),
+        5000,
+    )
+    .await?
+    .iter()
+    .map(|r| Ok((s(r, "payer")?, s(r, "student")?)))
+    .collect()
+}
+/// Schools with an active Capital Levy plan, for the worker.
+pub async fn levy_plan_schools(graph: &Graph) -> Result<Vec<(String, String)>> {
+    rows(
+        graph,
+        query("MATCH (p:CapitalLevyPlan {active:true}) RETURN DISTINCT p.tenant_id AS tenant,p.school_id AS school LIMIT 201"),
+        200,
+    )
+    .await?
+    .iter()
+    .map(|r| Ok((s(r, "tenant")?, s(r, "school")?)))
+    .collect()
 }
 pub async fn enrollments(graph: &Graph, c: &Child) -> Result<Vec<Schedule>> {
     rows(
@@ -520,22 +687,6 @@ pub async fn staff_students(graph: &Graph, a: &auth::Staff) -> Result<Vec<StaffS
         .collect()
 }
 
-/// The single payer of an enrolled child, as the family read sees it.
-pub async fn payer_of(graph: &Graph, student: &str) -> Result<Child> {
-    let payers = rows(
-        graph,
-        query("MATCH (u:User)-[:HAS_APPLICATION]->(:Lead)-[:HAS_STUDENT]->(:Student {studentId:$student}) RETURN DISTINCT u.id AS id LIMIT 3")
-            .param("student", student.to_string()),
-        2,
-    )
-    .await
-    .map_err(|_| Error::Denied)?;
-    if payers.len() != 1 {
-        return Err(Error::Denied);
-    }
-    family(graph, &s(&payers[0], "id")?, student).await
-}
-
 pub async fn capital_levies(graph: &Graph, a: &auth::Staff) -> Result<Vec<Schedule>> {
     rows(
         graph,
@@ -554,40 +705,6 @@ pub async fn capital_levies(graph: &Graph, a: &auth::Staff) -> Result<Vec<Schedu
     .map(schedule)
     .collect()
 }
-/// Creates or replaces a child's Capital Levy schedule. Replacing is allowed
-/// only before anything was billed against it.
-pub async fn save_capital_levy(
-    graph: &Graph,
-    a: &auth::Staff,
-    c: &Child,
-    input: &CapitalLevyInput,
-    version: i64,
-) -> Result<Schedule> {
-    let body = format!(
-        "MERGE (o:CapitalLevyObligation {{key:$key}}) ON CREATE SET o.id=$id,o.version=0,o.created_at=datetime() SET o._lock=coalesce(o._lock,0)+1 WITH o {} WITH actor,o WHERE {} AND o.version=$version AND NOT EXISTS {{ MATCH (:SchoolBillingLine {{category:'capital_levy',ref_id:o.id}}) }} SET o.category='capital_levy',o.tenant_id=$tenant,o.school_id=$school,o.student_id=$student,o.enrolled_student_id=$enrolled,o.payer_user_id=$payer,o.student_name=$name,o.gross=$total,o.discount=0,o.payable=$total,o.installments_json=$installments,o.issue_lead_days=$lead,o.version=o.version+1,o.updated_by=actor.id,o.updated_at=datetime() CREATE (:SchoolBillingAudit {{id:$audit,subject:'capital_levy',ref_id:o.id,actor_id:actor.id,action:'saved',version:o.version,payload:$installments,created_at:datetime()}}) {SCHEDULE}",
-        auth::fresh("o"),
-        auth::scope("$school", "$tenant")
-    );
-    let q = staff(query(&body), a)
-        .param("key", selection_key(c))
-        .param("id", format!("CLEVY-{}", uuid::Uuid::new_v4()))
-        .param("version", version)
-        .param("tenant", c.tenant_id.clone())
-        .param("school", c.school_id.clone())
-        .param("student", c.student_id.clone())
-        .param("enrolled", c.enrolled_student_id.clone())
-        .param("payer", c.payer_user_id.clone())
-        .param("name", c.name.clone())
-        .param("total", input.total_amount)
-        .param(
-            "installments",
-            serde_json::to_string(&input.installments).map_err(unavailable)?,
-        )
-        .param("lead", input.issue_lead_days)
-        .param("audit", uuid::Uuid::new_v4().to_string());
-    invoices::write(graph, q, a.expires, schedule).await
-}
-
 // ---------------------------------------------------------------- overseas
 
 #[derive(Clone, Debug, Serialize)]

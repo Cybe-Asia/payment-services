@@ -374,7 +374,7 @@ impl OverseasProgramInput {
             && identifier(&self.school_id)
             && text(&self.title, 128)
             && text(&self.summary, 512)
-            && text(&self.terms, 40_000)
+            && terms_text(&self.terms)
             && self.year_groups.len() <= 20
             && self.year_groups.iter().all(|y| text(y, 32))
             && (1..=10_000).contains(&self.quota)
@@ -396,6 +396,16 @@ impl OverseasProgramInput {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(self.terms.as_bytes()))[..16].to_string()
     }
+}
+
+/// Terms are multi-line: line breaks and tabs are allowed, other control
+/// characters are not.
+pub fn terms_text(v: &str) -> bool {
+    !v.trim().is_empty()
+        && v.len() <= 40_000
+        && !v
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 }
 
 /// Which scheme a parent joining today gets.
@@ -584,6 +594,11 @@ mod tests {
         assert!(!p.valid(), "discount must leave something to pay");
         p.early_bird_discount = 15;
         assert_eq!(p.terms_version().len(), 16);
+        p.terms = "# 1. Definisi\n- Program Overseas\n\t1. Peserta".into();
+        assert!(p.valid(), "terms keep their lines");
+        p.terms = "bad\u{0007}bell".into();
+        assert!(!p.valid());
+        p.terms = "1. Definisi".into();
         assert!(early_bird_open(
             p.early_bird_until.as_deref(),
             d("2027-03-12")

@@ -71,7 +71,7 @@
     "src/services/discount_code_tests.rs": "c66a5a91dd55c97bda8e41a3899cb9119546aaa787985bbb008c7fd092977dfe",
     "src/school_billing/checkout.rs": "ab4b6b7075a31e6bb0671d9c33733433b9c1867c46270e84669f7123766326e5",
     "src/school_billing/mod.rs": "c07fbed605fcebacc5c371126e2b786107e413fe39368fad12a86d66492891d8",
-    "src/school_billing/model.rs": "e1b16856ea334079a0f2746c3afb1b6dba8725cd19871d37aa4c87bc20bee2c2",
+    "src/school_billing/model.rs": "26531b9ab887fc751006847473f4809445df9a4d96ca4b260af623ca3d367537",
     "src/school_billing/repository.rs": "2353ba73bbe0bf3163d549be74f633c4800a000b7a6cc72887aa0736843bf934",
     "src/school_billing/service.rs": "f413aa7d272a02cd1f26b57f487c790f59a322d494dc2d8e9062728fd298d045",
     "src/school_billing/tests.rs": "255dfbec5df4ade8e4c946bedd2fd64354cc521a3b8281b225251af55cfb03af",

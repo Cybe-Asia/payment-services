@@ -285,7 +285,17 @@ pub async fn doku_webhook_handler(
     let Some(graph) = state.graph.clone() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     };
-    match payment_service::handle_doku_webhook(&graph, request_id, &webhook).await {
+    // School invoices ("Online Payment", ADR 0014) share the signed callback.
+    let applied = if webhook
+        .order
+        .invoice_number
+        .starts_with(crate::school_billing::checkout::PREFIX)
+    {
+        crate::school_billing::checkout::apply(&graph, &webhook).await
+    } else {
+        payment_service::handle_doku_webhook(&graph, request_id, &webhook).await
+    };
+    match applied {
         Ok(_) => (
             StatusCode::OK,
             Json(serde_json::json!({"responseCode": 200, "responseMessage": "ok"})),

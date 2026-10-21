@@ -188,6 +188,7 @@ pub async fn create_doku_checkout(
             amount: pricing.amount_due_now,
             currency: &pricing.currency,
             due_minutes: 60 * 24,
+            return_url: None,
         })
         .await?;
     let persisted = payment_repository::upsert_doku_pending(

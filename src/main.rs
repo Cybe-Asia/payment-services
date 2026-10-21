@@ -17,6 +17,7 @@ mod handlers;
 mod models;
 mod repositories;
 mod routes;
+mod school_billing;
 mod school_invoice;
 mod services;
 mod utils;
@@ -144,6 +145,9 @@ async fn main() {
         school_invoice::repository::init(&graph)
             .await
             .expect("school invoice schema migration failed");
+        school_billing::repository::init(&graph)
+            .await
+            .expect("school billing schema migration failed");
         info!("school invoice schema migration complete");
         return;
     }
@@ -277,10 +281,21 @@ async fn main() {
         }
     }
 
+    if school_billing::worker::enabled() {
+        match state.graph.clone() {
+            Some(graph) => {
+                info!("school billing worker enabled");
+                school_billing::worker::start(graph);
+            }
+            None => tracing::error!("school billing worker not started without a graph"),
+        }
+    }
+
     let app: Router = Router::new()
         .route("/api/v1/payments/health", get(health_check))
         .merge(routes::payment_routes::routes())
         .merge(school_invoice::router())
+        .merge(school_billing::router())
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 

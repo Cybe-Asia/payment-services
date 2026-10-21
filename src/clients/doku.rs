@@ -28,6 +28,8 @@ pub struct CreateCheckoutRequest<'a> {
     pub amount: i64,
     pub currency: &'a str,
     pub due_minutes: i64,
+    /// Where DOKU sends the payer back; defaults to `DOKU_RETURN_URL`.
+    pub return_url: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,13 +103,14 @@ impl DokuClient {
             return Err("DOKU checkout requires a positive IDR amount".into());
         }
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let return_url = request.return_url.unwrap_or(&self.return_url);
         let body = serde_json::json!({
             "order": {
                 "amount": request.amount,
                 "invoice_number": request.invoice_number,
                 "currency": request.currency,
-                "callback_url": self.return_url,
-                "callback_url_result": self.return_url,
+                "callback_url": return_url,
+                "callback_url_result": return_url,
                 "auto_redirect": true,
                 "disable_retry_payment": true
             },

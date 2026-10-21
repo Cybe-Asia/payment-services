@@ -1,12 +1,12 @@
 //! Manual school billing. Separate invoice, evidence, audit and settlement
 //! labels; no admissions transitions, notifications, scheduling or providers.
-mod auth;
+pub(crate) mod auth;
 mod documents;
 #[cfg(test)]
 mod http_acceptance;
 pub mod model;
 mod parent_authority;
-mod payee;
+pub(crate) mod payee;
 mod proof;
 pub mod repository;
 #[cfg(test)]

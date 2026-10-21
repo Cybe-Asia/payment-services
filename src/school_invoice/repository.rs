@@ -17,7 +17,7 @@ fn unavailable(_: impl std::fmt::Debug) -> Error {
     Error::Unavailable
 }
 /// No failed guard/CAS or parse may commit a draft invoice or lock metadata.
-pub(super) async fn write<T>(
+pub(crate) async fn write<T>(
     graph: &Graph,
     q: Query,
     expires: i64,
@@ -132,7 +132,7 @@ pub async fn init(graph: &Graph) -> Result<()> {
     }
     Ok(())
 }
-pub(super) async fn schema_ready(graph: &Graph) -> Result<()> {
+pub(crate) async fn schema_ready(graph: &Graph) -> Result<()> {
     let mut rows = graph
         .execute(query(
             "SHOW CONSTRAINTS YIELD name RETURN collect(name) AS names",
@@ -183,6 +183,79 @@ pub async fn issue(graph: &Graph, a: &auth::Staff, input: &Issue) -> Result<Invo
     if rows.next().await.map_err(unavailable)?.is_some() {
         return Err(Error::Denied);
     }
+    issue_from(graph, Issuer::Staff(a), input, &row, None).await
+}
+
+/// Who issues an invoice: Finance staff, or the school billing system acting
+/// on a schedule or on the payer's own request (ADR 0014). The system has no
+/// staff scope; eligibility still comes from the SIS family read and from the
+/// school's own active payee configuration.
+#[derive(Clone, Copy)]
+pub enum Issuer<'a> {
+    Staff(&'a auth::Staff),
+    System,
+}
+pub const SYSTEM_ACTOR: &str = "system:school-billing";
+
+/// What a system-issued invoice bills (ADR 0014 `SchoolBillingLine`).
+#[derive(Clone, Debug, Default)]
+pub struct Line {
+    pub category: String,
+    pub kind: String,
+    pub ref_id: String,
+    pub period_start: String,
+    pub months: i64,
+    pub installment: i64,
+    pub gross: i64,
+    pub discount: i64,
+    /// Checked inside the issuing transaction, so concurrent requests cannot
+    /// bill past a schedule or overlap a monthly period.
+    pub guard: Guard,
+}
+#[derive(Clone, Debug, Default)]
+pub enum Guard {
+    #[default]
+    None,
+    /// Lines already billed for `(category, ref_id)` must still sum to this.
+    Billed(i64),
+    /// The child has no open monthly-fee invoice.
+    NoOpenMonthly,
+}
+
+/// The billing system's issuance: the payer must still pass the current-family
+/// read and the school must have an active payee bank account.
+pub async fn issue_system(graph: &Graph, mut input: Issue, line: &Line) -> Result<Invoice> {
+    schema_ready(graph).await?;
+    let mut rows = graph
+        .execute(
+            query(&format!("{FAMILY} MATCH (config:SchoolBillingPayee {{tenant_id:e.tenant_id,school_id:e.school_id,active:true}}) RETURN u.id AS payer,coalesce(u.fullName,u.name,u.email) AS payer_name,s.fullName AS student_name,e.student_id AS enrolled,e.school_id AS school,e.tenant_id AS tenant,coalesce(school.school_code,school.school_id) AS code,coalesce(school.name,school.school_name,school.school_code) AS payee,config.bank_account_id AS bank LIMIT 2"))
+                .param("payer", input.payer_user_id.clone())
+                .param("student", input.student_id.clone()),
+        )
+        .await
+        .map_err(unavailable)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(unavailable)?
+        .ok_or(Error::Denied)?;
+    if rows.next().await.map_err(unavailable)?.is_some() {
+        return Err(Error::Denied);
+    }
+    input.bank_account_id = row.get::<String>("bank").ok_or(Error::Denied)?;
+    if !input.valid() {
+        return Err(Error::Denied);
+    }
+    issue_from(graph, Issuer::System, &input, &row, Some(line)).await
+}
+
+async fn issue_from(
+    graph: &Graph,
+    issuer: Issuer<'_>,
+    input: &Issue,
+    row: &Row,
+    line: Option<&Line>,
+) -> Result<Invoice> {
     let field = |k| row.get::<String>(k).ok_or(Error::Unavailable);
     let tenant = field("tenant")?;
     let mut banks=graph.execute(query("MATCH (config:SchoolBillingPayee {tenant_id:$tenant,school_id:$school,active:true,bank_account_id:$bank}) MATCH(ps:PaymentSettings {tenant_id:config.tenant_id,manual_transfer_enabled:true}) RETURN config.bank_json AS banks,config.version AS version,ps.manual_bank_accounts_json AS directory LIMIT 2").param("tenant",tenant.clone()).param("school",field("school")?).param("bank",input.bank_account_id.clone())).await.map_err(unavailable)?;
@@ -273,8 +346,52 @@ pub async fn issue(graph: &Graph, a: &auth::Staff, input: &Issue) -> Result<Invo
         "{}|{}|{}",
         snapshot.tenant_id, snapshot.school_id, input.idempotency_key
     );
-    let body=format!("MATCH(config:SchoolBillingPayee {{tenant_id:$tenant,school_id:$school}}),(ps:PaymentSettings {{tenant_id:$tenant}}) SET ps.school_billing_lock=coalesce(ps.school_billing_lock,0)+1 SET config._lock=coalesce(config._lock,0)+1 WITH config,ps MERGE(i:SchoolInvoice {{issue_key:$key}}) ON CREATE SET i.id=$id SET i._lock=coalesce(i._lock,0)+1 WITH i,config,ps {} WITH i,config,ps,actor {} WHERE {} AND e.student_id=$enrolled AND e.school_id=$school AND e.tenant_id=$tenant AND config.school_id=e.school_id AND config.tenant_id=e.tenant_id AND config.active=true AND config.bank_json=$bankraw AND config.version=$payee_version AND ps.tenant_id=e.tenant_id AND ps.manual_transfer_enabled=true AND ps.manual_bank_accounts_json=$directoryraw AND (i.request_hash IS NULL OR i.request_hash=$hash) FOREACH (_ IN CASE WHEN i.request_hash IS NULL THEN [1] ELSE [] END | SET i.snapshot=$snapshot,i.request_hash=$hash,i.tenant_id=e.tenant_id,i.school_id=e.school_id,i.student_id=s.studentId,i.enrolled_student_id=e.student_id,i.payer_user_id=u.id,i.status='pending',i.version=0,i.issued_by=actor.id,i.issued_at=datetime() CREATE(:SchoolInvoiceAudit {{id:$audit,invoice_id:i.id,actor_id:actor.id,action:'issued',version:0,created_at:datetime(),eligibility_contract:'sis-current-family-v1',payer_user_id:u.id,student_id:s.studentId,enrolled_student_id:e.student_id,school_id:e.school_id,tenant_id:e.tenant_id,request_hash:$hash}})) {RETURN}",auth::fresh("i,config,ps"),carry(FAMILY,"i,config,ps,actor"),auth::scope("e.school_id","e.tenant_id"));
-    let q = staff_query(query(&body), a, false)
+    let (authority, scope) = match issuer {
+        Issuer::Staff(_) => (
+            format!("{} WITH i,config,ps,actor", auth::fresh("i,config,ps")),
+            auth::scope("e.school_id", "e.tenant_id"),
+        ),
+        Issuer::System => (
+            "WITH i,config,ps,{id:$system} AS actor".to_string(),
+            "true".to_string(),
+        ),
+    };
+    let guard = match line.map(|l| &l.guard) {
+        Some(Guard::Billed(_)) => " AND (i.request_hash IS NOT NULL OR $l_billed=coalesce(head(COLLECT { MATCH (x:SchoolBillingLine {category:$l_category,ref_id:$l_ref}) RETURN sum(x.amount) AS t }),0))",
+        Some(Guard::NoOpenMonthly) => " AND (i.request_hash IS NOT NULL OR NOT EXISTS { MATCH (x:SchoolInvoice {enrolled_student_id:e.student_id})-[:BILLED_AS]->(:SchoolBillingLine {category:'monthly_fee'}) WHERE x.status IN ['pending','pending_verification','rejected'] })",
+        _ => "",
+    };
+    let line_create = if line.is_some() {
+        " CREATE(i)-[:BILLED_AS]->(:SchoolBillingLine {invoice_id:i.id,category:$l_category,kind:$l_kind,ref_id:$l_ref,period_start:$l_period,months:$l_months,installment:$l_installment,gross:$l_gross,discount:$l_discount,amount:$amount,tenant_id:e.tenant_id,school_id:e.school_id,student_id:s.studentId,enrolled_student_id:e.student_id,payer_user_id:u.id,created_at:datetime()})"
+    } else {
+        ""
+    };
+    let body=format!("MATCH(config:SchoolBillingPayee {{tenant_id:$tenant,school_id:$school}}),(ps:PaymentSettings {{tenant_id:$tenant}}) SET ps.school_billing_lock=coalesce(ps.school_billing_lock,0)+1 SET config._lock=coalesce(config._lock,0)+1 WITH config,ps MERGE(i:SchoolInvoice {{issue_key:$key}}) ON CREATE SET i.id=$id SET i._lock=coalesce(i._lock,0)+1 WITH i,config,ps {authority} {} WHERE {scope} AND e.student_id=$enrolled AND e.school_id=$school AND e.tenant_id=$tenant AND config.school_id=e.school_id AND config.tenant_id=e.tenant_id AND config.active=true AND config.bank_json=$bankraw AND config.version=$payee_version AND ps.tenant_id=e.tenant_id AND ps.manual_transfer_enabled=true AND ps.manual_bank_accounts_json=$directoryraw AND (i.request_hash IS NULL OR i.request_hash=$hash){guard} FOREACH (_ IN CASE WHEN i.request_hash IS NULL THEN [1] ELSE [] END | SET i.snapshot=$snapshot,i.request_hash=$hash,i.tenant_id=e.tenant_id,i.school_id=e.school_id,i.student_id=s.studentId,i.enrolled_student_id=e.student_id,i.payer_user_id=u.id,i.status='pending',i.version=0,i.issued_by=actor.id,i.issued_at=datetime() CREATE(:SchoolInvoiceAudit {{id:$audit,invoice_id:i.id,actor_id:actor.id,action:'issued',version:0,created_at:datetime(),eligibility_contract:'sis-current-family-v1',payer_user_id:u.id,student_id:s.studentId,enrolled_student_id:e.student_id,school_id:e.school_id,tenant_id:e.tenant_id,request_hash:$hash}}){line_create}) {RETURN}",carry(FAMILY,"i,config,ps,actor"));
+    let (q, expires) = match issuer {
+        Issuer::Staff(a) => (staff_query(query(&body), a, false), a.expires),
+        Issuer::System => (
+            query(&body).param("system", SYSTEM_ACTOR),
+            chrono::Utc::now().timestamp() + 120,
+        ),
+    };
+    let l = line.cloned().unwrap_or_default();
+    let q = q
+        .param("l_category", l.category)
+        .param("l_kind", l.kind)
+        .param("l_ref", l.ref_id)
+        .param("l_period", l.period_start)
+        .param("l_months", l.months)
+        .param("l_installment", l.installment)
+        .param("l_gross", l.gross)
+        .param("l_discount", l.discount)
+        .param(
+            "l_billed",
+            match l.guard {
+                Guard::Billed(v) => v,
+                _ => 0,
+            },
+        )
+        .param("amount", input.amount)
         .param("payer", snapshot.payer_user_id.clone())
         .param("student", snapshot.student_id.clone())
         .param("school", snapshot.school_id.clone())
@@ -288,7 +405,7 @@ pub async fn issue(graph: &Graph, a: &auth::Staff, input: &Issue) -> Result<Invo
         .param("snapshot", raw)
         .param("hash", hash)
         .param("audit", uuid::Uuid::new_v4().to_string());
-    write(graph, q, a.expires, invoice).await
+    write(graph, q, expires, invoice).await
 }
 fn carry(q: &str, vars: &str) -> String {
     q.replace("WITH DISTINCT u,s", &format!("WITH DISTINCT {vars},u,s"))

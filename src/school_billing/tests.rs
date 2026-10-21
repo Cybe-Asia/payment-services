@@ -337,10 +337,108 @@ async fn monthly_levy_overseas_credit_and_online_settlement() {
         .await
         .unwrap());
 
+    // Three open top-ups at most; a fourth is refused.
+    for r in ["top-2", "top-3", "top-4"] {
+        service::top_up(&g, &c, 100_000, r).await.unwrap();
+    }
+    assert!(service::top_up(&g, &c, 100_000, "top-5").await.is_err());
+
+    // ---- An online payment never settles a bill whose transfer proof is under review.
+    let review = service::deposit(&g, &c, &saved, 100_000, "dep-review").await;
+    assert!(review.is_err(), "levy fully billed by now");
+    let open_levy = i2.invoice_id.clone();
+    g.run(query("MATCH (i:SchoolInvoice {id:$id}) SET i.status='pending_verification' CREATE (i)-[:PAID_ONLINE_VIA]->(:SchoolInvoiceCheckout {invoice_number:$n,invoice_id:i.id,request_id:'req-3',amount:$a,currency:'IDR',status:'created',url:'https://example.test',created_at:datetime(),expires_at:datetime()+duration('PT1H')})").param("id",open_levy.clone()).param("n",format!("{open_levy}-1")).param("a",i2.amount)).await.unwrap();
+    assert!(
+        !checkout::apply(&g, &paid(&format!("{open_levy}-1"), i2.amount, "req-3"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        invoices::parent(&g, &parent, &open_levy)
+            .await
+            .unwrap()
+            .status,
+        "pending_verification"
+    );
+    assert_eq!(
+        status(&g, format!("{open_levy}-1")).await,
+        "paid_needs_reconciliation"
+    );
+    // A second order paid after the bill settled is kept for a refund, once.
+    g.run(query("MATCH (i:SchoolInvoice {id:$id}) CREATE (i)-[:PAID_ONLINE_VIA]->(:SchoolInvoiceCheckout {invoice_number:$n,invoice_id:i.id,request_id:'req-4',amount:$a,currency:'IDR',status:'created',url:'https://example.test',created_at:datetime(),expires_at:datetime()+duration('PT1H')})").param("id",first.invoice_id.clone()).param("n",format!("{}-2", first.invoice_id)).param("a",first.amount)).await.unwrap();
+    assert!(!checkout::apply(
+        &g,
+        &paid(&format!("{}-2", first.invoice_id), first.amount, "req-4")
+    )
+    .await
+    .unwrap());
+    assert_eq!(
+        status(&g, format!("{}-2", first.invoice_id)).await,
+        "paid_duplicate"
+    );
+    assert!(!checkout::apply(
+        &g,
+        &paid(&format!("{}-2", first.invoice_id), first.amount, "req-4")
+    )
+    .await
+    .unwrap());
+
+    // ---- A second guardian of the same child neither overwrites the period nor re-bills months.
+    let other = format!("bq-{mark}");
+    g.run(query("MATCH (s:Student {studentId:$student}) CREATE (u:User {id:$other,role:'parent',email:$email,billing_test:$mark})-[:HAS_APPLICATION]->(:Lead {lead_id:$lead,email:$email,otp_verified:true,billing_test:$mark})-[:HAS_STUDENT]->(s)").param("student",student.clone()).param("other",other.clone()).param("email",format!("bq-{mark}@example.test")).param("lead",format!("LEAD-q-{mark}")).param("mark",mark.clone())).await.unwrap();
+    let second = Parent {
+        subject: other.clone(),
+        expires: exp,
+    };
+    let c_other = repo::family(&g, &other, &student).await.unwrap();
+    assert!(matches!(
+        repo::select(&g, &second, &c_other, 6, 2).await,
+        Err(Error::Conflict)
+    ));
+    assert!(
+        service::issue_monthly(&g, &c_other, today())
+            .await
+            .unwrap()
+            .is_none(),
+        "months already billed to the first guardian"
+    );
+
+    // ---- One live online order per bill; a failed one can be retried with the next number.
+    let next_bill = service::top_up(&g, &c, 100_000, "top-reserve").await;
+    assert!(next_bill.is_err(), "top-up cap still holds");
+    let target = i2.invoice_id.clone();
+    g.run(
+        query("MATCH (i:SchoolInvoice {id:$id}) SET i.status='rejected'")
+            .param("id", target.clone()),
+    )
+    .await
+    .unwrap();
+    let n2 = checkout::reserve(&g, &target, i2.amount, "req-r1", &parent)
+        .await
+        .unwrap();
+    assert_eq!(n2, format!("{target}-2"));
+    assert!(matches!(
+        checkout::reserve(&g, &target, i2.amount, "req-r2", &parent).await,
+        Err(Error::Conflict)
+    ));
+    g.run(
+        query("MATCH (c:SchoolInvoiceCheckout {invoice_number:$n}) SET c.status='failed'")
+            .param("n", n2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        checkout::reserve(&g, &target, i2.amount, "req-r3", &parent)
+            .await
+            .unwrap(),
+        format!("{target}-3")
+    );
+
     // ---- Summary as the Payment tab reads it.
     let view = service::summary(&g, c.clone()).await.unwrap();
     let v = serde_json::to_value(&view).unwrap();
     assert_eq!(v["credit"]["balance"], 500_000);
+    assert_eq!(v["credit"]["bills"].as_array().unwrap().len(), 4);
     assert_eq!(v["monthlyFee"]["locked"], true);
     assert_eq!(v["monthlyFee"]["selection"]["months"], 3);
     assert_eq!(v["capitalLevy"]["billed"], 150_000_000);
@@ -363,4 +461,19 @@ async fn monthly_levy_overseas_credit_and_online_settlement() {
     );
 
     g.run(query("MATCH (n) WHERE n.billing_test=$mark OR n.tenant_id=$tenant OR n.invoice_id STARTS WITH 'SINV-' AND EXISTS { MATCH (i:SchoolInvoice {id:n.invoice_id,tenant_id:$tenant}) } DETACH DELETE n").param("mark",mark).param("tenant",tenant)).await.unwrap();
+}
+
+async fn status(g: &Graph, n: String) -> String {
+    g.execute(
+        query("MATCH (c:SchoolInvoiceCheckout {invoice_number:$n}) RETURN c.status AS s")
+            .param("n", n),
+    )
+    .await
+    .unwrap()
+    .next()
+    .await
+    .unwrap()
+    .unwrap()
+    .get::<String>("s")
+    .unwrap()
 }

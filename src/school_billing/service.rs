@@ -10,6 +10,9 @@ use chrono::NaiveDate;
 use neo4rs::Graph;
 use serde::Serialize;
 
+/// Open (unpaid) top-up invoices a child may have at once.
+pub const MAX_OPEN_TOP_UPS: usize = 3;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OptionView {
@@ -208,7 +211,7 @@ pub async fn issue_monthly(graph: &Graph, c: &Child, today: NaiveDate) -> Result
     else {
         return Ok(None);
     };
-    let all = repo::bills(graph, &c.payer_user_id, &c.enrolled_student_id).await?;
+    let all = repo::child_bills(graph, &c.enrolled_student_id).await?;
     let monthly: Vec<&Bill> = all.iter().filter(|b| b.category == "monthly_fee").collect();
     let last_end = monthly
         .iter()
@@ -299,7 +302,7 @@ pub async fn issue_installment(
     s: &Schedule,
     today: NaiveDate,
 ) -> Result<Option<Bill>> {
-    let all = repo::bills(graph, &c.payer_user_id, &c.enrolled_student_id).await?;
+    let all = repo::child_bills(graph, &c.enrolled_student_id).await?;
     let mine: Vec<&Bill> = all
         .iter()
         .filter(|b| b.category == s.category && b.ref_id == s.id)
@@ -373,7 +376,7 @@ pub async fn deposit(
     if let Some(bill) = replayed(graph, c, &key).await? {
         return Ok(bill);
     }
-    let all = repo::bills(graph, &c.payer_user_id, &c.enrolled_student_id)
+    let all = repo::child_bills(graph, &c.enrolled_student_id)
         .await
         .map_err(super::owner_error)?;
     let billed: i64 = all
@@ -423,6 +426,19 @@ pub async fn top_up(
         return Err(super::coded(
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "AMOUNT_OUT_OF_RANGE",
+        ));
+    }
+    // A few open top-ups are enough; more would only be unpaid invoices.
+    let open = repo::bills(graph, &c.payer_user_id, &c.enrolled_student_id)
+        .await
+        .map_err(super::owner_error)?
+        .iter()
+        .filter(|b| b.category == "student_credit" && b.open())
+        .count();
+    if open >= MAX_OPEN_TOP_UPS {
+        return Err(super::coded(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "OPEN_INVOICE_LIMIT",
         ));
     }
     let input = issue(

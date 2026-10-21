@@ -168,11 +168,19 @@ impl Bill {
         self.status == "paid"
     }
 }
-/// Billing lines of one child for one payer, newest first.
+/// Billing lines of one child for one payer, newest first (what that payer sees).
 pub async fn bills(graph: &Graph, payer: &str, enrolled: &str) -> Result<Vec<Bill>> {
+    bills_where(graph, "i.payer_user_id=$payer", payer, enrolled).await
+}
+/// Every billing line of one child, whoever pays: what is already billed for
+/// the child, so a second guardian is never billed the same months again.
+pub async fn child_bills(graph: &Graph, enrolled: &str) -> Result<Vec<Bill>> {
+    bills_where(graph, "true", "", enrolled).await
+}
+async fn bills_where(graph: &Graph, scope: &str, payer: &str, enrolled: &str) -> Result<Vec<Bill>> {
     let found = rows(
         graph,
-        query("MATCH (i:SchoolInvoice {payer_user_id:$payer,enrolled_student_id:$enrolled})-[:BILLED_AS]->(l:SchoolBillingLine) WHERE l.invoice_id=i.id RETURN i.id AS id,i.status AS status,i.paid_at AS paid,i.snapshot AS snapshot,l.category AS category,l.kind AS kind,l.ref_id AS ref,l.period_start AS period_start,l.months AS months,l.installment AS installment,l.gross AS gross,l.discount AS discount,l.amount AS amount ORDER BY i.issued_at DESC,i.id LIMIT 501")
+        query(&format!("MATCH (i:SchoolInvoice {{enrolled_student_id:$enrolled}})-[:BILLED_AS]->(l:SchoolBillingLine) WHERE l.invoice_id=i.id AND {scope} RETURN i.id AS id,i.status AS status,i.paid_at AS paid,i.snapshot AS snapshot,l.category AS category,l.kind AS kind,l.ref_id AS ref,l.period_start AS period_start,l.months AS months,l.installment AS installment,l.gross AS gross,l.discount AS discount,l.amount AS amount ORDER BY i.issued_at DESC,i.id LIMIT 501"))
             .param("payer", payer.to_string())
             .param("enrolled", enrolled.to_string()),
         500,
@@ -351,7 +359,7 @@ pub async fn select(
     months: i32,
     version: i64,
 ) -> Result<Selection> {
-    let body = "MERGE (m:MonthlyFeeSelection {key:$key}) ON CREATE SET m.version=0 SET m._lock=coalesce(m._lock,0)+1 WITH m WHERE m.version=$version AND NOT EXISTS { MATCH (i:SchoolInvoice {enrolled_student_id:$enrolled})-[:BILLED_AS]->(:SchoolBillingLine {category:'monthly_fee'}) WHERE i.status IN ['pending','pending_verification','rejected'] } AND datetime.realtime().epochSeconds < $expires SET m.tenant_id=$tenant,m.school_id=$school,m.student_id=$student,m.enrolled_student_id=$enrolled,m.payer_user_id=$payer,m.months=$months,m.version=m.version+1,m.updated_at=datetime() CREATE (:SchoolBillingAudit {id:$audit,subject:'monthly_fee_selection',ref_id:m.key,actor_id:$payer,action:'selected',version:m.version,payload:toString($months),created_at:datetime()}) RETURN m.months AS months,m.version AS version";
+    let body = "MERGE (m:MonthlyFeeSelection {key:$key}) ON CREATE SET m.version=0 SET m._lock=coalesce(m._lock,0)+1 WITH m WHERE m.version=$version AND coalesce(m.payer_user_id,$payer)=$payer AND NOT EXISTS { MATCH (i:SchoolInvoice {enrolled_student_id:$enrolled})-[:BILLED_AS]->(:SchoolBillingLine {category:'monthly_fee'}) WHERE i.status IN ['pending','pending_verification','rejected'] } AND datetime.realtime().epochSeconds < $expires SET m.tenant_id=$tenant,m.school_id=$school,m.student_id=$student,m.enrolled_student_id=$enrolled,m.payer_user_id=$payer,m.months=$months,m.version=m.version+1,m.updated_at=datetime() CREATE (:SchoolBillingAudit {id:$audit,subject:'monthly_fee_selection',ref_id:m.key,actor_id:$payer,action:'selected',version:m.version,payload:toString($months),created_at:datetime()}) RETURN m.months AS months,m.version AS version";
     let q = query(body)
         .param("key", selection_key(c))
         .param("version", version)

@@ -225,28 +225,11 @@ async fn monthly_levy_overseas_credit_and_online_settlement() {
         (admitted.academic_year.as_str(), admitted.capital_levy),
         ("2026", Some(75_000_000))
     );
+    // The offer's monthly fee is July of its academic year, whatever its label says.
     assert_eq!(
         admitted.monthly_fee_month.map(Month::key),
-        Some("2099-07".into())
+        Some("2026-07".into())
     );
-    // A month already paid with the offer is never billed again: the next period starts after it.
-    g.run(
-        query(
-            "MATCH (i:SchoolInvoice {id:$id}) SET i.status='paid',i.paid_at=toString(datetime())",
-        )
-        .param("id", next.invoice_id.clone()),
-    )
-    .await
-    .unwrap();
-    let after = service::issue_monthly(
-        &g,
-        &c,
-        chrono::NaiveDate::from_ymd_opt(2099, 7, 30).unwrap(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(after.period_start, "2099-08");
     let plan = |year: &str, version: i64| CapitalLevyPlanInput {
         tenant_id: tenant.clone(),
         school_id: school.clone(),

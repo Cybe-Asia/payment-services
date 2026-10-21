@@ -279,50 +279,12 @@ pub struct AdmissionPaid {
     pub capital_levy: Option<i64>,
     pub monthly_fee_month: Option<Month>,
 }
-const MONTH_NAMES: [[&str; 12]; 2] = [
-    [
-        "january",
-        "february",
-        "march",
-        "april",
-        "may",
-        "june",
-        "july",
-        "august",
-        "september",
-        "october",
-        "november",
-        "december",
-    ],
-    [
-        "januari",
-        "februari",
-        "maret",
-        "april",
-        "mei",
-        "juni",
-        "juli",
-        "agustus",
-        "september",
-        "oktober",
-        "november",
-        "desember",
-    ],
-];
-/// "Monthly Fee - July 2027" → 2027-07; anything else → None.
-pub fn month_in_label(label: &str) -> Option<Month> {
-    let words: Vec<String> = label
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect();
-    words.windows(2).find_map(|w| {
-        let m = MONTH_NAMES
-            .iter()
-            .find_map(|names| names.iter().position(|n| *n == w[0]))?;
-        let y: i32 = w[1].parse().ok().filter(|y| (2000..2100).contains(y))?;
-        Some(Month(y * 12 + m as i32))
-    })
+/// Academic years start in July (user, 2026-10-21): `2026` is 2026/2027.
+pub const ACADEMIC_YEAR_START_MONTH: u32 = 7;
+/// The first month of an academic year (`2026` → 2026-07).
+pub fn academic_year_start(year: &str) -> Option<Month> {
+    let start: i32 = year.parse().ok().filter(|_| academic_year(year))?;
+    Some(Month(start * 12 + ACADEMIC_YEAR_START_MONTH as i32 - 1))
 }
 /// Reads a paid offer's pricing snapshot (`offer-pricing-v1`). The levy counts
 /// only when the offer was paid in full (nothing left on an installment plan).
@@ -343,9 +305,12 @@ pub fn admission_paid(academic_year_value: &str, pricing_json: &str) -> Option<A
         capital_levy: code("CAPITAL_LEVY")
             .and_then(|l| l.get("amount")?.as_i64())
             .filter(|a| *a > 0 && settled),
+        // The offer's monthly fee is the academic year's first month; its
+        // label is fixed admissions text and does not name the month.
         monthly_fee_month: code("MONTHLY_FEE")
-            .and_then(|l| l.get("label")?.as_str())
-            .and_then(month_in_label),
+            .and_then(|l| l.get("amount")?.as_i64())
+            .filter(|a| *a > 0)
+            .and_then(|_| academic_year_start(academic_year_value)),
     })
 }
 
@@ -617,7 +582,8 @@ mod tests {
         assert_eq!(paid.capital_levy, Some(75_000_000));
         assert_eq!(
             paid.monthly_fee_month.map(Month::key),
-            Some("2027-07".into())
+            Some("2026-07".into()),
+            "July of the offer's academic year, whatever the label says"
         );
         let partial = pricing.replace("\"remainingBalance\":0", "\"remainingBalance\":5");
         assert_eq!(
@@ -626,11 +592,22 @@ mod tests {
             "unpaid installments"
         );
         assert!(admission_paid("26", pricing).is_none());
-        assert_eq!(
-            month_in_label("SPP Agustus 2026").map(Month::key),
-            Some("2026-08".into())
-        );
-        assert_eq!(month_in_label("Monthly Fee"), None);
+        // Paid in July 2026, period chosen in October: the first period starts in October.
+        let option = PeriodOption {
+            months: 3,
+            discount_bps: 0,
+        };
+        let first = monthly_bill(
+            1,
+            &option,
+            10,
+            14,
+            paid.monthly_fee_month,
+            false,
+            d("2026-10-21"),
+        )
+        .unwrap();
+        assert_eq!(first.start.key(), "2026-10");
     }
 
     #[test]

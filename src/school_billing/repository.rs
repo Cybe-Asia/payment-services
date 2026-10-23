@@ -70,6 +70,12 @@ fn s(row: &Row, k: &str) -> Result<String> {
 fn n(row: &Row, k: &str) -> Result<i64> {
     row.get::<i64>(k).ok_or(Error::Unavailable)
 }
+/// A value that may be negative, returned by the query as `toString(...)`:
+/// neo4rs 0.6 decodes the tiny integers -16..-1 as 240..255, so -1 would
+/// read as 255.
+fn signed(row: &Row, k: &str) -> Result<i64> {
+    s(row, k)?.parse().map_err(unavailable)
+}
 
 /// A child the payer may be billed for right now.
 #[derive(Clone, Debug, Serialize)]
@@ -181,7 +187,7 @@ pub async fn child_bills(graph: &Graph, enrolled: &str) -> Result<Vec<Bill>> {
 async fn bills_where(graph: &Graph, scope: &str, payer: &str, enrolled: &str) -> Result<Vec<Bill>> {
     let found = rows(
         graph,
-        query(&format!("MATCH (i:SchoolInvoice {{enrolled_student_id:$enrolled}})-[:BILLED_AS]->(l:SchoolBillingLine) WHERE l.invoice_id=i.id AND {scope} RETURN i.id AS id,i.status AS status,i.paid_at AS paid,i.snapshot AS snapshot,l.category AS category,l.kind AS kind,l.ref_id AS ref,l.period_start AS period_start,l.months AS months,l.installment AS installment,l.gross AS gross,l.discount AS discount,l.amount AS amount ORDER BY i.issued_at DESC,i.id LIMIT 501"))
+        query(&format!("MATCH (i:SchoolInvoice {{enrolled_student_id:$enrolled}})-[:BILLED_AS]->(l:SchoolBillingLine) WHERE l.invoice_id=i.id AND {scope} RETURN i.id AS id,i.status AS status,i.paid_at AS paid,i.snapshot AS snapshot,l.category AS category,l.kind AS kind,l.ref_id AS ref,l.period_start AS period_start,l.months AS months,toString(l.installment) AS installment,l.gross AS gross,l.discount AS discount,l.amount AS amount ORDER BY i.issued_at DESC,i.id LIMIT 501"))
             .param("payer", payer.to_string())
             .param("enrolled", enrolled.to_string()),
         500,
@@ -209,7 +215,7 @@ fn bill(row: &Row) -> Result<Bill> {
         period: snapshot.period,
         period_start: s(row, "period_start")?,
         months: n(row, "months")?,
-        installment: n(row, "installment")?,
+        installment: signed(row, "installment")?,
         issued_at: snapshot.issued_at,
     })
 }

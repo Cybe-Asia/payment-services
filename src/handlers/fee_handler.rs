@@ -8,6 +8,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::dto::update_fee_request::UpdateFeeRequest;
+use crate::repositories::school_repository::SchoolLookupError;
 use crate::repositories::{fee_structure_repository, school_repository};
 use crate::utils::auth;
 use crate::utils::response::ApiResponse;
@@ -39,6 +40,10 @@ pub async fn get_fee_handler(
         {
             Ok(Some(id)) => id,
             Ok(None) => return fail(StatusCode::NOT_FOUND, "School not found"),
+            Err(e @ SchoolLookupError::Ambiguous { .. }) => {
+                error!("school lookup: {e}");
+                return fail(StatusCode::CONFLICT, "School code is ambiguous");
+            }
             Err(e) => {
                 error!("school lookup: {e}");
                 return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
@@ -87,6 +92,10 @@ pub async fn update_fee_handler(
     {
         Ok(Some(id)) => id,
         Ok(None) => return fail(StatusCode::NOT_FOUND, "School not found"),
+        Err(e @ SchoolLookupError::Ambiguous { .. }) => {
+            error!("school lookup: {e}");
+            return fail(StatusCode::CONFLICT, "School code is ambiguous");
+        }
         Err(e) => {
             error!("school lookup: {e}");
             return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");

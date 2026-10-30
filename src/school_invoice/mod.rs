@@ -49,6 +49,17 @@ fn data(v: impl serde::Serialize) -> Response {
     )
         .into_response()
 }
+/// Staff session for a Finance school-billing statement. `review` is the role
+/// set those statements use (`auth::roles`); the capability is asked only when
+/// that role check denies (ADR 0018 slice 6). Owner-only routes do not use it.
+pub(crate) async fn finance_staff(
+    s: &AppState,
+    h: &HeaderMap,
+    review: bool,
+) -> Result<auth::Staff, Failure> {
+    let a = auth::staff(h, &s.jwt_secret)?;
+    Ok(auth::with_capability(s.graph.as_deref(), h, a, review).await)
+}
 fn path(id: &str) -> Result<(), Failure> {
     if model::identifier(id) && id.starts_with("SINV-") {
         Ok(())
@@ -61,7 +72,7 @@ async fn issue(
     h: HeaderMap,
     input: Result<Json<model::Issue>, JsonRejection>,
 ) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = finance_staff(&s, &h, false).await?;
     let input = input.map_err(|_| failure(StatusCode::BAD_REQUEST))?.0;
     if !input.valid() {
         return Err(failure(StatusCode::BAD_REQUEST));
@@ -81,7 +92,7 @@ async fn parent_list(State(s): State<AppState>, h: HeaderMap) -> Result<Response
     ))
 }
 async fn finance_list(State(s): State<AppState>, h: HeaderMap) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = finance_staff(&s, &h, true).await?;
     Ok(data(
         repository::list_finance(graph(&s)?, &a)
             .await
@@ -107,7 +118,7 @@ async fn finance_detail(
     Path(id): Path<String>,
 ) -> Result<Response, Failure> {
     path(&id)?;
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = finance_staff(&s, &h, true).await?;
     let g = graph(&s)?;
     let inv = repository::finance(g, &a, &id).await.map_err(owner_error)?;
     let proofs = repository::proofs(g, &id).await.map_err(owner_error)?;
@@ -121,7 +132,7 @@ async fn review(
     input: Result<Json<model::Review>, JsonRejection>,
 ) -> Result<Response, Failure> {
     path(&id)?;
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = finance_staff(&s, &h, true).await?;
     let i = input.map_err(|_| failure(StatusCode::BAD_REQUEST))?.0;
     if !i.valid() {
         return Err(failure(StatusCode::BAD_REQUEST));
@@ -223,7 +234,7 @@ async fn school_configuration(
     State(s): State<AppState>,
     h: HeaderMap,
 ) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = finance_staff(&s, &h, true).await?;
     Ok(data(
         payee::list(graph(&s)?, &a).await.map_err(owner_error)?,
     ))

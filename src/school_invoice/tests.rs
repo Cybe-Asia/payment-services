@@ -29,11 +29,13 @@ async fn current_family_scope_issuance_cas_and_separate_settlement() {
         subject: format!("billing-owner-{mark}"),
         id: format!("billing-owner-staff-{mark}"),
         expires: chrono::Utc::now().timestamp() + 900,
+        capability: Default::default(),
     };
     let finance = Staff {
         subject: format!("billing-finance-{mark}"),
         id: format!("billing-finance-staff-{mark}"),
         expires: chrono::Utc::now().timestamp() + 900,
+        capability: Default::default(),
     };
     let parent = Parent {
         subject: payer.clone(),
@@ -498,6 +500,7 @@ async fn configuration_authority_is_independent_of_historical_invoice_bounds() {
         subject: format!("bound-user-{mark}"),
         id: format!("bound-staff-{mark}"),
         expires: chrono::Utc::now().timestamp() + 900,
+        capability: Default::default(),
     };
     let bank=json!([{"id":"bank-fixture","bankName":"Synthetic Bank","accountName":"Synthetic School","accountNumber":"0000000","instructions":"No money transfer","enabled":true}]).to_string();
     g.run(query("CREATE(:User {id:$user,billing_test:$mark})-[:STAFF_MEMBER]->(:StaffMember {id:$staff,membershipStatus:'ACTIVE',roles:['owner'],schoolIds:[$school],tenantIds:[$tenant],teamIds:[],billing_test:$mark}) CREATE(:School {school_id:$school,tenant_id:$tenant,name:'Synthetic School',billing_test:$mark}) CREATE(:PaymentSettings {tenant_id:$tenant,manual_transfer_enabled:true,manual_bank_accounts_json:$bank,billing_test:$mark}) WITH 1 AS ignored UNWIND range(1,201) AS n CREATE(:SchoolInvoice {id:'SINV-bound-'+$mark+'-'+toString(n),tenant_id:$tenant,school_id:$school,snapshot:'malformed-historical-json',status:'pending',version:0,billing_test:$mark})").param("user",actor.subject.clone()).param("staff",actor.id.clone()).param("school",school.clone()).param("tenant",tenant.clone()).param("bank",bank).param("mark",mark.clone())).await.unwrap();
@@ -515,6 +518,7 @@ async fn configuration_authority_is_independent_of_historical_invoice_bounds() {
         subject: "foreign-user".into(),
         id: "foreign-staff".into(),
         expires: actor.expires,
+        capability: Default::default(),
     };
     assert!(matches!(
         payee::list(&g, &foreign).await,
@@ -523,4 +527,197 @@ async fn configuration_authority_is_independent_of_historical_invoice_bounds() {
     g.run(query("MATCH(n {billing_test:$mark}) DETACH DELETE n").param("mark", mark))
         .await
         .unwrap();
+}
+
+/// ADR 0018 slice 6: `billing.school_invoice.manage` opens Finance school billing
+/// only at a school SIS names (or its whole tenant) that the actor's own
+/// membership also names; role holders never ask SIS; Owner-only stays Owner-only.
+#[tokio::test]
+#[ignore = "requires explicitly owned disposable SCHOOL_INVOICE_TEST_NEO4J_URI"]
+async fn school_billing_capability_needs_the_school_and_own_scope() {
+    use crate::utils::capabilities::{stub, SCHOOL_INVOICE_MANAGE as CODE};
+    let uri = std::env::var("SCHOOL_INVOICE_TEST_NEO4J_URI").unwrap();
+    assert!(uri.starts_with("bolt://127.0.0.1:"));
+    let g = Graph::new(
+        &uri,
+        &std::env::var("SCHOOL_INVOICE_TEST_NEO4J_USER").unwrap(),
+        &std::env::var("SCHOOL_INVOICE_TEST_NEO4J_PASSWORD").unwrap(),
+    )
+    .await
+    .unwrap();
+    repo::init(&g).await.unwrap();
+    let mark = uuid::Uuid::new_v4().to_string();
+    let tenant = format!("cap-tenant-{mark}");
+    let school = format!("cap-school-{mark}");
+    let other = format!("cap-other-{mark}");
+    let student = format!("cap-child-{mark}");
+    let payer = format!("cap-parent-{mark}");
+    let staff = |name: &str| Staff {
+        subject: format!("cap-{name}-{mark}"),
+        id: format!("cap-{name}-staff-{mark}"),
+        expires: chrono::Utc::now().timestamp() + 900,
+        capability: Default::default(),
+    };
+    let (owner, finance, admin) = (staff("owner"), staff("finance"), staff("admin"));
+    let bank=json!([{"id":"bank-fixture","bankName":"Synthetic Bank","accountName":"Synthetic School","accountNumber":"0000000","instructions":"No money transfer","enabled":true}]).to_string();
+    g.run(query("CREATE(u:User {id:$payer,role:'parent',email:$email,fullName:'Synthetic Parent',billing_test:$mark})-[:HAS_APPLICATION]->(l:Lead {lead_id:$lead,email:$email,status:'handed_to_sis',otp_verified:true,billing_test:$mark})-[:HAS_STUDENT]->(s:Student {studentId:$student,fullName:'Synthetic Child',applicantStatus:'handed_to_sis',billing_test:$mark}) CREATE(s)-[:ENROLLED_AS]->(e:EnrolledStudent {student_id:$enrolled,applicant_student_id:$student,status:'active',school_id:$school,tenant_id:$tenant,billing_test:$mark})-[:ENROLLED_IN]->(:Section {section_id:$section,status:'active',school_id:$school,tenant_id:$tenant,billing_test:$mark}) CREATE(:School {school_id:$school,school_code:'IISS',tenant_id:$tenant,name:'Synthetic School',billing_test:$mark}) CREATE(:School {school_id:$other,school_code:'IIHS',tenant_id:$tenant,name:'Other School',billing_test:$mark}) CREATE(:PaymentSettings {tenant_id:$tenant,manual_transfer_enabled:true,manual_bank_accounts_json:$bank,billing_test:$mark}) CREATE(:User {id:$owner,billing_test:$mark})-[:STAFF_MEMBER]->(:StaffMember {id:$ownerstaff,membershipStatus:'ACTIVE',roles:['owner'],tenantIds:[$tenant],schoolIds:[$school],teamIds:[],billing_test:$mark}) CREATE(:User {id:$finance,billing_test:$mark})-[:STAFF_MEMBER]->(:StaffMember {id:$financestaff,membershipStatus:'ACTIVE',roles:['finance_admin'],tenantIds:[$tenant],schoolIds:[$school],teamIds:[],billing_test:$mark}) CREATE(:User {id:$admin,billing_test:$mark})-[:STAFF_MEMBER]->(:StaffMember {id:$adminstaff,membershipStatus:'ACTIVE',roles:['school_admin'],tenantIds:[$tenant],schoolIds:[$school],teamIds:[],billing_test:$mark})")
+        .param("payer",payer.clone()).param("email",format!("cap-{mark}@example.test")).param("lead",format!("LEAD-cap-{mark}")).param("student",student.clone()).param("enrolled",format!("cap-enrolled-{mark}")).param("section",format!("cap-section-{mark}")).param("tenant",tenant.clone()).param("school",school.clone()).param("other",other.clone()).param("owner",owner.subject.clone()).param("ownerstaff",owner.id.clone()).param("finance",finance.subject.clone()).param("financestaff",finance.id.clone()).param("admin",admin.subject.clone()).param("adminstaff",admin.id.clone()).param("bank",bank).param("mark",mark.clone())).await.unwrap();
+    let config = payee::Configure {
+        tenant_id: tenant.clone(),
+        school_id: school.clone(),
+        bank_account_id: "bank-fixture".into(),
+        version: 0,
+    };
+    payee::configure(&g, &owner, &config).await.unwrap();
+    let input = |key: &str| Issue {
+        idempotency_key: format!("{key}-{mark}"),
+        student_id: student.clone(),
+        payer_user_id: payer.clone(),
+        period: "October 2026".into(),
+        description: "Explicit school tuition".into(),
+        amount: 100,
+        currency: "IDR".into(),
+        due_date: "2026-10-10".into(),
+        bank_account_id: "bank-fixture".into(),
+    };
+    let issued = repo::issue(&g, &finance, &input("role")).await.unwrap();
+    let id = issued.snapshot.id.clone();
+    let denied = |r: &repo::Result<Invoice>| matches!(r, Err(repo::Error::Denied));
+
+    // Day one: a school admin without any capability is denied as today.
+    assert!(denied(&repo::issue(&g, &admin, &input("none")).await));
+    assert!(matches!(
+        repo::list_finance(&g, &admin).await,
+        Err(repo::Error::Denied)
+    ));
+    assert!(denied(&repo::finance(&g, &admin, &id).await));
+    assert!(matches!(
+        payee::list(&g, &admin).await,
+        Err(repo::Error::Denied)
+    ));
+
+    let sis = stub::Sis::start().await;
+    std::env::set_var("SIS_ACCESS_ORIGIN", &sis.origin);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "authorization",
+        "Bearer opaque-staff-token".parse().unwrap(),
+    );
+    let ask = |a: &Staff, review: bool| {
+        super::auth::with_capability(Some(&g), &headers, a.clone(), review)
+    };
+
+    // A role holder never asks SIS, even when SIS would answer.
+    sis.holds(&finance.id, &[(CODE, &[tenant.as_str()], &[])]);
+    for review in [false, true] {
+        assert!(!ask(&finance, review).await.capability.any());
+        assert!(!ask(&owner, review).await.capability.any());
+    }
+    assert!(sis.calls().is_empty());
+
+    // Held at another school only: SIS is asked, this school stays closed.
+    sis.holds(
+        &admin.id,
+        &[(CODE, &[], &[(tenant.as_str(), other.as_str())])],
+    );
+    let elsewhere = ask(&admin, true).await;
+    assert_eq!(
+        sis.calls(),
+        vec![("Bearer opaque-staff-token".to_string(), CODE.to_string())]
+    );
+    assert_eq!(
+        elsewhere.capability.schools,
+        vec![format!("{tenant}|{other}")]
+    );
+    assert!(denied(&repo::finance(&g, &elsewhere, &id).await));
+    assert!(repo::list_finance(&g, &elsewhere).await.unwrap().is_empty());
+    assert!(denied(
+        &repo::issue(&g, &ask(&admin, false).await, &input("elsewhere")).await
+    ));
+
+    // Held at this school, then tenant-wide: Finance school billing opens.
+    for (tenants, schools) in [
+        (vec![], vec![(tenant.as_str(), school.as_str())]),
+        (vec![tenant.as_str()], vec![]),
+    ] {
+        sis.holds(&admin.id, &[(CODE, &tenants, &schools)]);
+        let held = ask(&admin, true).await;
+        assert_eq!(repo::finance(&g, &held, &id).await.unwrap().snapshot.id, id);
+        assert_eq!(repo::list_finance(&g, &held).await.unwrap().len(), 1);
+        assert_eq!(payee::list(&g, &held).await.unwrap().len(), 1);
+        // Owner-only payee configuration ignores any capability.
+        assert!(matches!(
+            payee::configure(
+                &g,
+                &held,
+                &payee::Configure {
+                    version: 1,
+                    ..config_clone(&config)
+                }
+            )
+            .await,
+            Err(repo::Error::Denied)
+        ));
+    }
+    let held = ask(&admin, false).await;
+    assert_eq!(
+        repo::issue(&g, &held, &input("capability"))
+            .await
+            .unwrap()
+            .snapshot
+            .school_id,
+        school
+    );
+
+    // The actor's own membership must name the school too.
+    g.run(
+        query("MATCH(m:StaffMember {id:$id}) SET m.schoolIds=[$other]")
+            .param("id", admin.id.clone())
+            .param("other", other.clone()),
+    )
+    .await
+    .unwrap();
+    let outside = ask(&admin, true).await;
+    assert!(outside.capability.any());
+    assert!(denied(&repo::finance(&g, &outside, &id).await));
+    g.run(
+        query("MATCH(m:StaffMember {id:$id}) SET m.schoolIds=[$school]")
+            .param("id", admin.id.clone())
+            .param("school", school.clone()),
+    )
+    .await
+    .unwrap();
+
+    // SIS failure, an answer for someone else, or SIS off: denied as today.
+    sis.reply(503, json!({}));
+    assert!(denied(
+        &repo::finance(&g, &ask(&admin, true).await, &id).await
+    ));
+    sis.holds("someone-else", &[(CODE, &[tenant.as_str()], &[])]);
+    assert!(denied(
+        &repo::finance(&g, &ask(&admin, true).await, &id).await
+    ));
+    std::env::remove_var("SIS_ACCESS_ORIGIN");
+    sis.holds(&admin.id, &[(CODE, &[tenant.as_str()], &[])]);
+    sis.forget();
+    assert!(denied(
+        &repo::finance(&g, &ask(&admin, true).await, &id).await
+    ));
+    assert!(sis.calls().is_empty());
+
+    g.run(query("MATCH(n {billing_test:$mark}) DETACH DELETE n").param("mark", mark.clone()))
+        .await
+        .unwrap();
+    g.run(query("MATCH(n) WHERE (n:SchoolInvoice OR n:SchoolInvoiceAudit OR n:SchoolBillingPayee) AND n.tenant_id=$tenant DETACH DELETE n").param("tenant", tenant))
+        .await
+        .unwrap();
+}
+
+fn config_clone(c: &payee::Configure) -> payee::Configure {
+    payee::Configure {
+        tenant_id: c.tenant_id.clone(),
+        school_id: c.school_id.clone(),
+        bank_account_id: c.bank_account_id.clone(),
+        version: c.version,
+    }
 }

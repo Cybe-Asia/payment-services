@@ -95,10 +95,7 @@ fn invoice(row: &Row) -> Result<Invoice> {
 }
 const RETURN:&str="RETURN i.snapshot AS snapshot,i.status AS status,i.version AS version,i.paid_at AS paid,i.receipt_ref AS receipt,i.id AS id,i.tenant_id AS tenant,i.school_id AS school,i.student_id AS student,i.enrolled_student_id AS enrolled,i.payer_user_id AS payer,i.issue_key AS issue_key,i.request_hash AS request_hash";
 fn staff_query(q: Query, a: &auth::Staff, review: bool) -> Query {
-    q.param("subject", a.subject.clone())
-        .param("staff", a.id.clone())
-        .param("roles", auth::roles(review))
-        .param("expires", a.expires)
+    a.bind(q, auth::roles(review))
 }
 fn parent_guard() -> String {
     super::parent_authority::guard()

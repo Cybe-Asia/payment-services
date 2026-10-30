@@ -1,6 +1,7 @@
 use axum::http::{HeaderMap, StatusCode};
 use neo4rs::{Graph, Query};
 
+use crate::utils::capabilities::{self, Gate};
 use crate::utils::jwt::{decode_session_claims, Claims};
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,9 @@ pub struct AdminAuth {
     pub email: String,
     /// Staff roles behind the grant (`["owner"]` for the legacy allowlist).
     pub roles: Vec<String>,
+    /// The gate opened through a tenant-wide SIS capability (ADR 0018 slice 6),
+    /// not through a role. Such a holder reaches leads like admissions staff.
+    pub capability: bool,
 }
 
 impl AdminAuth {
@@ -22,6 +26,23 @@ impl AdminAuth {
         Self {
             email,
             roles: vec!["owner".to_string()],
+            capability: false,
+        }
+    }
+
+    fn by_role(email: String, roles: Vec<String>) -> Self {
+        Self {
+            email,
+            roles,
+            capability: false,
+        }
+    }
+
+    fn by_capability(email: String, roles: Vec<String>) -> Self {
+        Self {
+            email,
+            roles,
+            capability: true,
         }
     }
 
@@ -37,7 +58,7 @@ impl AdminAuth {
             "finance_admin",
             "finance_approver",
         ];
-        !self.roles.iter().any(|role| wide.contains(&role.as_str()))
+        !self.capability && !self.roles.iter().any(|role| wide.contains(&role.as_str()))
     }
 }
 
@@ -177,12 +198,18 @@ pub async fn require_staff(
             }
             let roles = staff_roles(roles);
             if !roles.is_empty() {
-                return Ok(AdminAuth { email, roles });
+                return Ok(AdminAuth::by_role(email, roles));
+            }
+            if capability_opens(graph, headers, &claims, Gate::AssistedSubmit, Some(&id)).await {
+                return Ok(AdminAuth::by_capability(email, roles));
             }
             return Err((StatusCode::FORBIDDEN, "Staff access required".into()));
         }
         CanonicalStaff::Denied => {
-            return Err((StatusCode::FORBIDDEN, "Staff access required".into()))
+            if capability_opens(graph, headers, &claims, Gate::AssistedSubmit, None).await {
+                return Ok(AdminAuth::by_capability(email, Vec::new()));
+            }
+            return Err((StatusCode::FORBIDDEN, "Staff access required".into()));
         }
         CanonicalStaff::NotLinked if claims.staff_member_id.is_some() => {
             return Err((StatusCode::FORBIDDEN, "Staff identity unavailable".into()))
@@ -198,7 +225,7 @@ pub async fn require_staff(
     // `User.roles = ['parent']` must never open staff endpoints).
     let roles = staff_roles(staff_roles_for_email(graph, &email).await?);
     if !roles.is_empty() {
-        return Ok(AdminAuth { email, roles });
+        return Ok(AdminAuth::by_role(email, roles));
     }
     Err((StatusCode::FORBIDDEN, "Staff access required".to_string()))
 }
@@ -315,17 +342,19 @@ pub async fn require_finance(
             {
                 return Err((StatusCode::FORBIDDEN, "Staff identity mismatch".into()));
             }
-            return if finance_roles_allowed(&roles, approve) {
-                Ok(AdminAuth {
-                    email,
-                    roles: staff_roles(roles),
-                })
-            } else {
-                Err((StatusCode::FORBIDDEN, "Finance access required".into()))
-            };
+            if finance_roles_allowed(&roles, approve) {
+                return Ok(AdminAuth::by_role(email, staff_roles(roles)));
+            }
+            if capability_opens(graph, headers, &claims, Gate::finance(approve), Some(&id)).await {
+                return Ok(AdminAuth::by_capability(email, staff_roles(roles)));
+            }
+            return Err((StatusCode::FORBIDDEN, "Finance access required".into()));
         }
         CanonicalStaff::Denied => {
-            return Err((StatusCode::FORBIDDEN, "Finance access required".into()))
+            if capability_opens(graph, headers, &claims, Gate::finance(approve), None).await {
+                return Ok(AdminAuth::by_capability(email, Vec::new()));
+            }
+            return Err((StatusCode::FORBIDDEN, "Finance access required".into()));
         }
         CanonicalStaff::NotLinked if claims.staff_member_id.is_some() => {
             return Err((StatusCode::FORBIDDEN, "Staff identity unavailable".into()))
@@ -339,10 +368,7 @@ pub async fn require_finance(
 
     let roles = staff_roles_for_email(graph, &email).await?;
     if finance_roles_allowed(&roles, approve) {
-        return Ok(AdminAuth {
-            email,
-            roles: staff_roles(roles),
-        });
+        return Ok(AdminAuth::by_role(email, staff_roles(roles)));
     }
     Err((
         StatusCode::FORBIDDEN,
@@ -361,6 +387,52 @@ fn finance_roles_allowed(roles: &[String], approve: bool) -> bool {
         FINANCE_VIEW_ROLES
     };
     roles.iter().any(|role| allowed.contains(&role.as_str()))
+}
+
+/// ADR 0018 slice 6, asked only after the role check denied. Only Auth's
+/// `staff-api+jwt` whose User links to exactly the Staff Member it names may ask
+/// SIS; `linked` is that member's id when the caller already resolved it. Off,
+/// unreachable or failing SIS, and any other identity, keep today's denial.
+async fn capability_opens(
+    graph: &Graph,
+    headers: &HeaderMap,
+    claims: &Claims,
+    gate: Gate,
+    linked: Option<&str>,
+) -> bool {
+    if !capabilities::enabled() {
+        return false;
+    }
+    let (Some(token), Some(staff)) = (canonical_bearer(headers), claims.staff_member_id.as_deref())
+    else {
+        return false;
+    };
+    let linked = match linked {
+        Some(id) => Some(id.to_string()),
+        None => crate::repositories::canonical_staff_repository::sole_member(graph, &claims.sub)
+            .await
+            .ok()
+            .flatten(),
+    };
+    if linked.as_deref() != Some(staff) {
+        return false;
+    }
+    let answer = capabilities::held(&token, gate.codes()).await;
+    capabilities::decide(
+        false,
+        Some(staff),
+        gate,
+        &capabilities::tenant(),
+        Some(&answer),
+    )
+}
+
+/// The bearer, only when it is Auth's typed staff credential (already verified
+/// by `staff_claims_from_bearer`); legacy session tokens never ask SIS.
+fn canonical_bearer(headers: &HeaderMap) -> Option<String> {
+    let token = bearer_from(headers)?;
+    let header = jsonwebtoken::decode_header(&token).ok()?;
+    (header.typ.as_deref() == Some("staff-api+jwt")).then_some(token)
 }
 
 /// Active staff roles for an email from the shared graph (empty when the
@@ -623,13 +695,79 @@ mod tests {
             staff_roles(roles(&["parent", "marketing_staff"])),
             roles(&["marketing_staff"])
         );
-        let auth = |values: &[&str]| AdminAuth {
-            email: "staff@example.test".into(),
-            roles: roles(values),
-        };
+        let auth = |values: &[&str]| AdminAuth::by_role("staff@example.test".into(), roles(values));
         assert!(auth(&["marketing_staff"]).lead_scoped());
         assert!(!auth(&["marketing_staff", "finance_approver"]).lead_scoped());
         assert!(!auth(&["marketing_manager"]).lead_scoped());
         assert!(!AdminAuth::owner("o@example.test".into()).lead_scoped());
+        // A tenant-wide capability holder reaches leads like admissions staff.
+        assert!(!AdminAuth::by_capability("c@example.test".into(), vec![]).lead_scoped());
+        assert!(
+            !AdminAuth::by_capability("c@example.test".into(), roles(&["marketing_staff"]))
+                .lead_scoped()
+        );
+    }
+
+    /// ADR 0018 slice 6 day-one equality: without a held capability (not asked,
+    /// empty answer, SIS off or failing) every role gets exactly today's answer
+    /// from the finance and assisted-submit gates.
+    #[test]
+    fn without_held_capabilities_every_role_keeps_todays_answer() {
+        use crate::utils::capabilities::{decide, Gate, Held, Unavailable};
+        let answers = [
+            None,
+            Some(Ok(Held {
+                staff_member_id: "staff-1".into(),
+                capabilities: Default::default(),
+            })),
+            Some(Err(Unavailable::Off)),
+            Some(Err(Unavailable::Failed)),
+        ];
+        let all = [
+            "owner",
+            "school_admin",
+            "principal",
+            "teacher",
+            "finance_admin",
+            "finance_approver",
+            "admissions_staff",
+            "admissions_manager",
+            "admissions_admin",
+            "marketing_staff",
+            "marketing_manager",
+            "parent",
+            "",
+        ];
+        for role in all {
+            let held = roles(&[role]);
+            for answer in &answers {
+                for approve in [false, true] {
+                    let today = finance_roles_allowed(&held, approve);
+                    assert_eq!(
+                        decide(
+                            today,
+                            Some("staff-1"),
+                            Gate::finance(approve),
+                            "TENANT-001",
+                            answer.as_ref()
+                        ),
+                        today,
+                        "{role} approve={approve}"
+                    );
+                }
+                let today = !staff_roles(held.clone()).is_empty();
+                assert_eq!(
+                    decide(
+                        today,
+                        Some("staff-1"),
+                        Gate::AssistedSubmit,
+                        "TENANT-001",
+                        answer.as_ref()
+                    ),
+                    today,
+                    "{role} assisted"
+                );
+            }
+        }
     }
 }

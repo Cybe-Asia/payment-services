@@ -304,7 +304,7 @@ async fn refresh_checkout(
 // ------------------------------------------------------------------- admin
 
 async fn plans(State(s): State<AppState>, h: HeaderMap) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = crate::school_invoice::finance_staff(&s, &h, false).await?;
     Ok(data(
         repository::plans(graph(&s)?, &a)
             .await
@@ -316,7 +316,7 @@ async fn save_plan(
     h: HeaderMap,
     input: Result<Json<model::FeePlanInput>, JsonRejection>,
 ) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = crate::school_invoice::finance_staff(&s, &h, false).await?;
     let input = body(input)?;
     if !input.valid() {
         return Err(failure(StatusCode::BAD_REQUEST));
@@ -328,7 +328,7 @@ async fn save_plan(
     ))
 }
 async fn staff_students(State(s): State<AppState>, h: HeaderMap) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = crate::school_invoice::finance_staff(&s, &h, false).await?;
     Ok(data(
         repository::staff_students(graph(&s)?, &a)
             .await
@@ -336,7 +336,7 @@ async fn staff_students(State(s): State<AppState>, h: HeaderMap) -> Result<Respo
     ))
 }
 async fn levies(State(s): State<AppState>, h: HeaderMap) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = crate::school_invoice::finance_staff(&s, &h, false).await?;
     let g = graph(&s)?;
     let mut out = vec![];
     for levy in repository::capital_levies(g, &a)
@@ -351,7 +351,7 @@ async fn levies(State(s): State<AppState>, h: HeaderMap) -> Result<Response, Fai
     Ok(data(out))
 }
 async fn levy_plans(State(s): State<AppState>, h: HeaderMap) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = crate::school_invoice::finance_staff(&s, &h, false).await?;
     Ok(data(
         repository::levy_plans(graph(&s)?, &a)
             .await
@@ -363,7 +363,7 @@ async fn save_levy_plan(
     h: HeaderMap,
     input: Result<Json<model::CapitalLevyPlanInput>, JsonRejection>,
 ) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = crate::school_invoice::finance_staff(&s, &h, false).await?;
     let input = body(input)?;
     if !input.valid() {
         return Err(failure(StatusCode::BAD_REQUEST));
@@ -384,7 +384,7 @@ async fn save_levy_plan(
     Ok(data(saved))
 }
 async fn programs(State(s): State<AppState>, h: HeaderMap) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = crate::school_invoice::finance_staff(&s, &h, false).await?;
     Ok(data(
         repository::programs(graph(&s)?, &a)
             .await
@@ -396,7 +396,7 @@ async fn create_program(
     h: HeaderMap,
     input: Result<Json<model::OverseasProgramInput>, JsonRejection>,
 ) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = crate::school_invoice::finance_staff(&s, &h, false).await?;
     let input = body(input)?;
     if !input.valid() || input.version != 0 {
         return Err(failure(StatusCode::BAD_REQUEST));
@@ -413,7 +413,7 @@ async fn update_program(
     Path(id): Path<String>,
     input: Result<Json<model::OverseasProgramInput>, JsonRejection>,
 ) -> Result<Response, Failure> {
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = crate::school_invoice::finance_staff(&s, &h, false).await?;
     let input = body(input)?;
     if !input.valid() || input.version < 1 {
         return Err(failure(StatusCode::BAD_REQUEST));

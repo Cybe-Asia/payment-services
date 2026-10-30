@@ -186,7 +186,7 @@ pub async fn finance_download(
     Path((id, proof)): Path<(String, String)>,
 ) -> Result<Response, Failure> {
     path(&id)?;
-    let a = auth::staff(&h, &s.jwt_secret)?;
+    let a = super::finance_staff(&s, &h, true).await?;
     repository::finance(graph(&s)?, &a, &id)
         .await
         .map_err(owner_error)?;

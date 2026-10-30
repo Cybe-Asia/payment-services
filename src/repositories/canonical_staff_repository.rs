@@ -32,6 +32,30 @@ const LOOKUP: &str = "MATCH (u:User {id:$userId})-[:STAFF_MEMBER]->(s:StaffMembe
  coalesce(s.roles,[]) AS roles, coalesce(s.tenantIds,[]) AS tenantIds, \
  coalesce(s.schoolIds,[]) AS schoolIds, coalesce(s.teamIds,[]) AS teamIds LIMIT 2";
 
+/// The one Staff Member a canonical User links to, whatever its status or scope;
+/// `None` for no link or several. ADR 0018 slice 6 binds a capability answer to
+/// this identity before asking SIS; it never grants anything by itself.
+pub async fn sole_member(graph: &Graph, user_id: &str) -> Result<Option<String>, String> {
+    if user_id.is_empty() || user_id.starts_with("LEAD-") {
+        return Ok(None);
+    }
+    let unavailable = |_| "Staff authorization unavailable".to_string();
+    let mut rows = graph
+        .execute(
+            query("MATCH (:User {id:$userId})-[:STAFF_MEMBER]->(s:StaffMember) RETURN s.id AS id LIMIT 2")
+                .param("userId", user_id.to_string()),
+        )
+        .await
+        .map_err(unavailable)?;
+    let Some(row) = rows.next().await.map_err(unavailable)? else {
+        return Ok(None);
+    };
+    if rows.next().await.map_err(unavailable)?.is_some() {
+        return Ok(None);
+    }
+    Ok(row.get::<String>("id").filter(|id| !id.is_empty()))
+}
+
 pub async fn resolve_staff(graph: &Graph, user_id: &str) -> Result<CanonicalStaff, String> {
     let lookup = if user_id.starts_with("LEAD-") {
         LOOKUP.replace(

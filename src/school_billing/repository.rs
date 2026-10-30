@@ -278,10 +278,7 @@ pub async fn plan_for(graph: &Graph, c: &Child) -> Result<Option<FeePlan>> {
 }
 
 fn staff(q: Query, a: &auth::Staff) -> Query {
-    q.param("subject", a.subject.clone())
-        .param("staff", a.id.clone())
-        .param("roles", auth::roles(false))
-        .param("expires", a.expires)
+    a.bind(q, auth::roles(false))
 }
 /// Plans of every school the staff member may bill.
 pub async fn plans(graph: &Graph, a: &auth::Staff) -> Result<Vec<FeePlan>> {

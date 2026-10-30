@@ -61,6 +61,7 @@ async fn monthly_levy_overseas_credit_and_online_settlement() {
         subject: format!("bo-{mark}"),
         id: format!("bos-{mark}"),
         expires: exp,
+        capability: Default::default(),
     };
     let parent = Parent {
         subject: payer.clone(),

@@ -37,11 +37,7 @@ pub async fn configure(g: &Graph, a: &auth::Staff, input: &Configure) -> Result<
     let prefix=format!("{} WITH actor MATCH(school:School {{school_id:$school,tenant_id:$tenant}}) WHERE {} AND NOT EXISTS {{ MATCH(other_school:School {{school_id:school.school_id,tenant_id:school.tenant_id}}) WHERE other_school<>school }} MATCH(ps:PaymentSettings {{tenant_id:school.tenant_id,manual_transfer_enabled:true}}) WHERE NOT EXISTS {{ MATCH(other_settings:PaymentSettings {{tenant_id:ps.tenant_id}}) WHERE other_settings<>ps }} RETURN ps.manual_bank_accounts_json AS banks LIMIT 2",auth::STAFF,auth::scope("school.school_id","school.tenant_id"));
     let mut rows = g
         .execute(
-            query(&prefix)
-                .param("subject", a.subject.clone())
-                .param("staff", a.id.clone())
-                .param("expires", a.expires)
-                .param("roles", vec!["owner"])
+            a.bind_owner_only(query(&prefix))
                 .param("school", input.school_id.clone())
                 .param("tenant", input.tenant_id.clone()),
         )
@@ -76,11 +72,7 @@ pub async fn configure(g: &Graph, a: &auth::Staff, input: &Configure) -> Result<
     let body=format!("{} WITH actor MATCH(school:School {{school_id:$school,tenant_id:$tenant}}) WHERE {} AND NOT EXISTS {{ MATCH(other_school:School {{school_id:school.school_id,tenant_id:school.tenant_id}}) WHERE other_school<>school }} MATCH(ps:PaymentSettings {{tenant_id:school.tenant_id,manual_transfer_enabled:true,manual_bank_accounts_json:$raw}}) WHERE NOT EXISTS {{ MATCH(other_settings:PaymentSettings {{tenant_id:ps.tenant_id}}) WHERE other_settings<>ps }} SET ps.school_billing_lock=coalesce(ps.school_billing_lock,0)+1 WITH actor,school,ps WHERE ps.manual_transfer_enabled=true AND ps.manual_bank_accounts_json=$raw OPTIONAL MATCH(existing:SchoolBillingPayee {{key:$key}}) WITH actor,school,ps,existing WHERE (existing IS NULL AND $version=0) OR existing.version=$version MERGE(config:SchoolBillingPayee {{key:$key}}) ON CREATE SET config.version=0 SET config._lock=coalesce(config._lock,0)+1 WITH config,school,ps {} WITH actor,config,school,ps WHERE config.version=$version AND school.school_id=$school AND school.tenant_id=$tenant AND ps.manual_transfer_enabled=true AND ps.manual_bank_accounts_json=$raw AND {} SET config.school_id=school.school_id,config.tenant_id=school.tenant_id,config.bank_account_id=$bank,config.bank_json=$json,config.version=config.version+1,config.active=true,config.updated_at=datetime(),config.updated_by=actor.id CREATE(:SchoolInvoiceAudit {{id:$audit,school_id:school.school_id,tenant_id:school.tenant_id,actor_id:actor.id,action:'payee_configured',version:config.version,created_at:datetime()}}) RETURN config.version AS version",auth::STAFF,auth::scope("school.school_id","school.tenant_id"),auth::fresh("config,school,ps"),auth::scope("school.school_id","school.tenant_id"));
     let version = super::repository::write(
         g,
-        query(&body)
-            .param("subject", a.subject.clone())
-            .param("staff", a.id.clone())
-            .param("expires", a.expires)
-            .param("roles", vec!["owner"])
+        a.bind_owner_only(query(&body))
             .param("school", input.school_id.clone())
             .param("tenant", input.tenant_id.clone())
             .param("raw", raw)
@@ -117,13 +109,7 @@ pub async fn list(g: &Graph, a: &auth::Staff) -> Result<Vec<SchoolConfiguration>
     // Also validates authority when there are no configured school rows.
     super::repository::staff_authority(g, a).await?;
     let mut rows = g
-        .execute(
-            query(&body)
-                .param("subject", a.subject.clone())
-                .param("staff", a.id.clone())
-                .param("roles", auth::roles(true))
-                .param("expires", a.expires),
-        )
+        .execute(a.bind(query(&body), auth::roles(true)))
         .await
         .map_err(|_| Error::Unavailable)?;
     let mut result = Vec::new();

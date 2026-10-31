@@ -46,9 +46,29 @@ pub struct AppState {
     pub default_due_hours: i64,
     pub jwt_secret: String,
     pub notification_service_url: String,
+    pub notification_internal_token: Option<String>,
     pub frontend_url: String,
     pub minio: Option<MinioClient>,
     pub payment_settings_seed: PaymentSettingsSeed,
+}
+
+impl AppState {
+    /// POST to notification-service, with `X-Internal-Token` when configured.
+    pub fn notification_post(
+        &self,
+        client: &reqwest::Client,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
+        let request = client.post(format!(
+            "{}{}",
+            self.notification_service_url.trim_end_matches('/'),
+            path
+        ));
+        match &self.notification_internal_token {
+            Some(token) => request.header("X-Internal-Token", token),
+            None => request,
+        }
+    }
 }
 
 fn load_env() {
@@ -255,6 +275,7 @@ async fn main() {
         default_due_hours: cfg.default_fee_due_hours,
         jwt_secret: cfg.jwt_secret.clone(),
         notification_service_url: cfg.notification_service_url.clone(),
+        notification_internal_token: cfg.notification_internal_token.clone(),
         frontend_url: cfg.frontend_url.clone(),
         minio,
         payment_settings_seed,

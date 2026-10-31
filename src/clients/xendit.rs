@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -20,7 +21,7 @@ impl XenditClient {
         failure_redirect_url: &str,
     ) -> Self {
         Self {
-            http: Client::new(),
+            http: super::provider_http_client(),
             api_url: api_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             success_redirect_url: success_redirect_url.to_string(),
@@ -144,5 +145,21 @@ pub struct GetInvoiceResponse {
 /// Verify that a webhook request is authentic.
 /// Xendit uses a static shared "x-callback-token" header (simpler model than HMAC).
 pub fn verify_webhook(header_token: &str, configured_token: &str) -> bool {
-    !configured_token.is_empty() && header_token == configured_token
+    !configured_token.is_empty()
+        && bool::from(header_token.as_bytes().ct_eq(configured_token.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_webhook;
+
+    #[test]
+    fn webhook_token_must_match_exactly_and_be_configured() {
+        assert!(verify_webhook("tok-123", "tok-123"));
+        assert!(!verify_webhook("tok-124", "tok-123"));
+        assert!(!verify_webhook("tok-12", "tok-123"));
+        assert!(!verify_webhook("tok-1234", "tok-123"));
+        assert!(!verify_webhook("", "tok-123"));
+        assert!(!verify_webhook("", ""));
+    }
 }

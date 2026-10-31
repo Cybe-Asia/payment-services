@@ -1994,14 +1994,9 @@ fn dispatch_email_notification(state: &AppState, email: String, subject: String,
         return;
     }
     let html = body_to_html(&body);
-    let client = state.http_client.clone();
-    let url = format!(
-        "{}/api/email/v1/send",
-        state.notification_service_url.trim_end_matches('/')
-    );
+    let request = state.notification_post(&state.http_client, "/api/email/v1/send");
     tokio::spawn(async move {
-        let response = client
-            .post(url)
+        let response = request
             .json(&serde_json::json!({
                 "email": email,
                 "subject": subject,
@@ -2029,15 +2024,10 @@ fn dispatch_whatsapp_notification(state: &AppState, to: String, event: &str, bod
     if to.trim().is_empty() || body.trim().is_empty() {
         return;
     }
-    let client = state.http_client.clone();
-    let url = format!(
-        "{}/api/whatsapp/v1/send",
-        state.notification_service_url.trim_end_matches('/')
-    );
+    let request = state.notification_post(&state.http_client, "/api/whatsapp/v1/send");
     let event = event.to_string();
     tokio::spawn(async move {
-        let response = client
-            .post(url)
+        let response = request
             .json(&serde_json::json!({
                 "to": to,
                 "body": body,

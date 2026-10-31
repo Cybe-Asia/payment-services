@@ -39,7 +39,7 @@ async fn deliver_batch(
             payment_repository::find_by_id_for_tenant(graph, &id, &state.tenant_id).await?;
         let sent = if let Some(payment) = payment.filter(|_| !email.trim().is_empty()) {
             let (subject, body, html) = receipt_content(&payment, &state.frontend_url);
-            client.post(format!("{}/api/email/v1/send",state.notification_service_url.trim_end_matches('/')))
+            state.notification_post(client, "/api/email/v1/send")
                 .json(&serde_json::json!({"idempotencyKey":format!("receipt:{}:{}:email",state.tenant_id,id),"email":email,"subject":subject,"body":body,"html":html}))
                 .send().await.map(|r|r.status().is_success()).unwrap_or(false)
         } else {

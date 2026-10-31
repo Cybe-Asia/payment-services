@@ -60,6 +60,7 @@ async fn parent_manual_payment_http_saved_retry_and_revocation() {
         default_due_hours: 24,
         jwt_secret: secret,
         notification_service_url: "http://127.0.0.1:1".into(),
+        notification_internal_token: None,
         frontend_url: "http://127.0.0.1".into(),
         minio: None,
         payment_settings_seed:

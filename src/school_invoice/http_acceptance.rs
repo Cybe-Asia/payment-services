@@ -80,6 +80,7 @@ async fn actual_owner_http_proof_receipt_and_scope_denials() {
         default_due_hours: 24,
         jwt_secret: string(&f, "parentKey").into(),
         notification_service_url: "http://127.0.0.1:1".into(),
+        notification_internal_token: None,
         frontend_url: "http://127.0.0.1".into(),
         minio: Some(minio.clone()),
         payment_settings_seed:

@@ -35,6 +35,8 @@ pub struct Config {
     pub manual_transfer_account_number: String,
     pub manual_transfer_instructions: String,
     pub notification_service_url: String,
+    /// Sent as `X-Internal-Token` on calls to notification-service when set.
+    pub notification_internal_token: Option<String>,
     pub frontend_url: String,
 }
 
@@ -45,8 +47,11 @@ pub fn load() -> Config {
         .unwrap();
     let neo4j_uri = env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://neo4j:7687".to_string());
     let neo4j_user = env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
-    let neo4j_password = env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "password".to_string());
-    let jwt_secret = env::var("JWT_SECRET").unwrap_or_else(|_| "mysecretkey".to_string());
+    let neo4j_password = env::var("NEO4J_PASSWORD").expect("NEO4J_PASSWORD must be set");
+    let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    if jwt_secret.len() < 32 {
+        tracing::warn!("JWT_SECRET is shorter than 32 bytes; rotate it to a longer secret");
+    }
     let tenant_id = env::var("TENANT_ID").unwrap_or_else(|_| "TENANT-001".to_string());
     let xendit_api_url =
         env::var("XENDIT_API_URL").unwrap_or_else(|_| "https://api.xendit.co".to_string());
@@ -104,6 +109,10 @@ pub fn load() -> Config {
     let manual_transfer_instructions = env::var("MANUAL_TRANSFER_INSTRUCTIONS").unwrap_or_default();
     let notification_service_url = env::var("NOTIFICATION_SERVICE_URL")
         .unwrap_or_else(|_| "http://notification-service".to_string());
+    let notification_internal_token = env::var("NOTIFICATION_INTERNAL_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let frontend_url =
         env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
 
@@ -142,6 +151,7 @@ pub fn load() -> Config {
         manual_transfer_account_number,
         manual_transfer_instructions,
         notification_service_url,
+        notification_internal_token,
         frontend_url,
     }
 }

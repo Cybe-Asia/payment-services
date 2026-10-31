@@ -32,6 +32,15 @@ jobs:
               output.write('revision=' + source['revision'] + '\n')
               output.write('source_hash=' + source['source_snapshot_sha256'] + '\n')
           PYTHON
+      # Rulebook gates (docs/RUST_RULES_OF_THUMB.md §26, §31) before the image build.
+      - name: Rulebook ratchet
+        run: scripts/check-rulebook.sh
+      - name: Tests
+        run: cargo test --locked
+      # Report-only until the existing warnings are fixed; target is `-- -D warnings`.
+      # cargo clean frees the runner disk this job needs for the image build.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked && cargo clean
       - name: Build Linux image
         env:
           RELEASE_IMAGE: ${{ steps.release.outputs.image }}

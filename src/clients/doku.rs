@@ -147,7 +147,9 @@ impl DokuClient {
             .map_err(ServiceError::failed("DOKU checkout request failed"))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(format!("DOKU checkout rejected request with status {status}").into());
+            return Err(ServiceError::failed("DOKU checkout rejected the request")(
+                status.to_string(),
+            ));
         }
         let parsed = response
             .json::<CheckoutEnvelope>()
@@ -196,7 +198,9 @@ impl DokuClient {
             .map_err(ServiceError::failed("DOKU status request failed"))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(format!("DOKU status request was rejected with status {status}").into());
+            return Err(ServiceError::failed("DOKU status request was rejected")(
+                status.to_string(),
+            ));
         }
         response
             .json::<DokuWebhook>()

@@ -3,8 +3,9 @@ use std::{borrow::Cow, error::Error, fmt};
 
 type Source = Box<dyn Error + Send + Sync>;
 
-/// `Display` is exactly the text these paths returned as `String` before: handlers
-/// still choose the HTTP status from it and send it as `responseError`.
+/// `Message` text is written for the caller and may be sent as `responseError`;
+/// `Failed` keeps the source for the log and never reaches a client (`into_public`).
+/// `Display` keeps the former `String` wording for logs.
 #[derive(Debug)]
 pub enum ServiceError {
     /// A refusal or failure described only by its message.
@@ -23,6 +24,25 @@ impl ServiceError {
             context,
             source: source.into(),
         }
+    }
+}
+
+impl ServiceError {
+    /// Text safe for a client: the written message, or a fixed text for a failed step.
+    pub fn public_message(&self) -> &str {
+        match self {
+            Self::Message(message) => message,
+            Self::Failed { .. } => crate::utils::response::SERVER_ERROR_MESSAGE,
+        }
+    }
+
+    /// What a handler may send and choose its status from: the written message, or, once the
+    /// failed step is logged, the fixed server-error text, which no handler keys a status on.
+    pub fn into_public(self) -> String {
+        if let Self::Failed { .. } = &self {
+            tracing::error!(error = %self, "request failed");
+        }
+        self.public_message().to_string()
     }
 }
 
@@ -69,5 +89,15 @@ mod tests {
         let failed = ServiceError::failed::<String>("payment fetch failed")("boom".into());
         assert_eq!(failed.to_string(), "payment fetch failed: boom");
         assert!(std::error::Error::source(&failed).is_some());
+    }
+
+    #[test]
+    fn only_written_text_reaches_a_client() {
+        assert_eq!(
+            ServiceError::from("Payment not found").into_public(),
+            "Payment not found"
+        );
+        let failed = ServiceError::failed::<String>("payment fetch failed")("db detail".into());
+        assert_eq!(failed.into_public(), "Internal Server Error");
     }
 }

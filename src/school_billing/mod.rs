@@ -85,7 +85,7 @@ async fn children(State(s): State<AppState>, h: HeaderMap) -> Result<Response, F
     }
     Ok(data(json!({
         "students": views,
-        "onlinePayment": s.doku.configured() && std::env::var("SCHOOL_BILLING_RETURN_URL").is_ok(),
+        "onlinePayment": s.doku.configured() && s.school_billing_return_url.is_some(),
     })))
 }
 

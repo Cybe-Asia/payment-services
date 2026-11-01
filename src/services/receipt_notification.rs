@@ -80,7 +80,7 @@ fn receipt_content(payment: &Payment, frontend: &str) -> (String, String, String
         .unwrap_or("Terverifikasi");
     let paid_at = chrono::DateTime::parse_from_rfc3339(paid_at)
         .map(|date| {
-            date.with_timezone(&chrono::FixedOffset::east_opt(7 * 3600).unwrap())
+            date.with_timezone(&chrono::FixedOffset::east_opt(7 * 3600).expect("UTC+7 is a valid offset"))
                 .format("%d %b %Y, %H:%M WIB")
                 .to_string()
         })

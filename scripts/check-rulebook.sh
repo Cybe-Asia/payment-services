@@ -7,10 +7,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 baseline=scripts/rulebook-baseline.txt
 
-# Non-test Rust source: skip test files and everything after the first #[cfg(test)].
+# Non-test Rust source: skip test files, and any item under `#[cfg(test)]` that opens a block on its first line
+# (a test module, helper fn or match arm) up to the closing brace at the same indent. Nothing else is hidden.
 prod_src() {
   find -H src -name '*.rs' ! -name '*test*.rs' ! -path '*/tests/*' -print0 |
-    xargs -0 awk 'FNR==1{skip=0} /#\[cfg\(test\)\]/{skip=1} !skip{print FILENAME": "$0}'
+    xargs -0 awk '
+      FNR==1 { skip=0; pending=0 }
+      skip { if ($0 ~ "^" indent "}") skip=0; next }
+      pending && /^[ \t]*#\[/ { next }
+      pending { pending=0; if ($0 ~ /\{[ \t]*$/) { indent=substr($0, 1, match($0, /[^ \t]/)-1); skip=1; next } }
+      /^[ \t]*#\[cfg\(test\)\][ \t]*$/ { pending=1; next }
+      { print FILENAME": "$0 }'
 }
 
 count() { prod_src | grep -E -c "$1" || true; }
@@ -21,7 +28,7 @@ counts() {
   # §21: environment read only in the config module
   echo "envReadOutsideConfig=$(prod_src | grep -E 'env::var\(' | grep -v -E '^src/(config|main\.rs)' | wc -l | tr -d ' ')"
   # §11: no driver or client error text in responses
-  echo "errorTextToClient=$(count '(ApiResponse::[a-z_]+|error_response|failure)\(&?[a-z_]*\.to_string\(\)')"
+  echo "errorTextToClient=$(count '((ApiResponse::[a-z_]+|error_response|failure)\(&?[a-z_]*\.to_string\(\)|StatusCode::[A-Z_]+, *&?(e|err|error)\.to_string\(\))')"
   # §11: typed errors in new code
   echo "resultString=$(count 'Result<[^;]*, ?String>')"
   # §11: no unwrap in production paths

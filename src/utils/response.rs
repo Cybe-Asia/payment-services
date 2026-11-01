@@ -37,6 +37,8 @@ pub fn ok<T: Serialize>(data: T) -> (StatusCode, Json<Value>) {
     }
 }
 
+pub const SERVER_ERROR_MESSAGE: &str = "Internal Server Error";
+
 /// The standard failure envelope with `responseCode` set to the HTTP status.
 pub fn fail(status: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
     let body = json!({

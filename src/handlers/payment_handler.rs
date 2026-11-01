@@ -24,7 +24,8 @@ use crate::services::payment_document::{
 };
 use crate::services::payment_service::{self, PaymentContext, ReviewManualPaymentRequest};
 use crate::utils::auth;
-use crate::utils::response::{fail, ok};
+use crate::utils::error::ServiceError;
+use crate::utils::response::{fail, ok, SERVER_ERROR_MESSAGE};
 use crate::AppState;
 
 #[derive(Serialize, ToSchema)]
@@ -97,7 +98,7 @@ pub async fn create_doku_checkout_handler(
         &state.payment_settings_seed,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(outcome) => ok(outcome),
         Err(message) => {
@@ -138,7 +139,7 @@ pub async fn get_offer_payment_methods_handler(
         &state.payment_settings_seed,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(settings) => ok(settings),
         Err(message) if message.contains("not found") => fail(StatusCode::NOT_FOUND, &message),
@@ -166,7 +167,7 @@ pub async fn get_offer_manual_payment_methods_handler(
         &state.payment_settings_seed,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(settings) => ok(settings),
         Err(message) => {
@@ -205,7 +206,7 @@ pub async fn create_offer_manual_payment_handler(
         &state.payment_settings_seed,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(outcome) => {
             let data = ManualPaymentResponseData {
@@ -291,7 +292,7 @@ pub async fn doku_webhook_handler(
     } else {
         payment_service::handle_doku_webhook(&graph, request_id, &webhook).await
     };
-    match applied.map_err(|e| e.to_string()) {
+    match applied.map_err(ServiceError::into_public) {
         Ok(_) => (
             StatusCode::OK,
             Json(serde_json::json!({"responseCode": 200, "responseMessage": "ok"})),
@@ -322,7 +323,7 @@ pub async fn reconcile_doku_payment_handler(
         &payment_id,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(payment) => ok(payment),
         Err(message) if message.contains("not found") => fail(StatusCode::NOT_FOUND, &message),
@@ -374,7 +375,7 @@ pub async fn create_invoice_handler(
     };
     match payment_service::create_invoice(ctx, &payload.admission_id, &payload.payment_type)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(ServiceError::into_public)
     {
         Ok(outcome) => {
             let data = CreateInvoiceResponseData {
@@ -453,7 +454,7 @@ pub async fn create_manual_payment_handler(
         payload.manual_bank_account_id.as_deref(),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(outcome) => {
             if !auth::owns_lead(&parent, outcome.payment.lead_id.as_deref()) {
@@ -509,7 +510,7 @@ pub async fn upload_manual_proof_handler(
 
     let payment = match payment_service::fetch_payment(&graph, &payment_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(ServiceError::into_public)
     {
         Ok(Some(payment)) => payment,
         Ok(None) => return fail(StatusCode::NOT_FOUND, "Payment not found"),
@@ -660,10 +661,8 @@ async fn process_manual_proof_upload(
         Ok(true) => return fail(StatusCode::CONFLICT, "This proof file was already uploaded"),
         Ok(false) => {}
         Err(e) => {
-            return fail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("duplicate check failed: {e}"),
-            )
+            error!("duplicate check failed: {e}");
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, SERVER_ERROR_MESSAGE);
         }
     }
 
@@ -698,7 +697,7 @@ async fn process_manual_proof_upload(
 
     match payment_service::record_manual_proof(graph, input)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(ServiceError::into_public)
     {
         Ok(proof) => ok(proof),
         Err(e) => {
@@ -833,7 +832,7 @@ pub async fn admin_assist_offer_manual_payment_handler(
         &state.payment_settings_seed,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(outcome) => {
             emit_staff_audit(
@@ -895,7 +894,7 @@ pub async fn admin_assist_manual_payment_handler(
         payload.manual_bank_account_id.as_deref(),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(outcome) => {
             emit_staff_audit(
@@ -955,7 +954,7 @@ pub async fn admin_assist_proof_handler(
 
     let payment = match payment_service::fetch_payment(&graph, &payment_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(ServiceError::into_public)
     {
         Ok(Some(payment)) => payment,
         Ok(None) => return fail(StatusCode::NOT_FOUND, "Payment not found"),
@@ -1084,7 +1083,7 @@ pub async fn preview_invoice_handler(
         &q.payment_type,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(preview) => ok(preview),
         Err(e) => {
@@ -1241,7 +1240,7 @@ pub async fn get_payment_settings_handler(
     };
     match payment_service::get_payment_settings(&graph, &state.payment_settings_seed)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(ServiceError::into_public)
     {
         Ok(mut settings) => {
             if !state.legacy_parent_payments_enabled {
@@ -1272,7 +1271,7 @@ pub async fn admin_get_payment_settings_handler(
     }
     match payment_service::get_payment_settings(&graph, &state.payment_settings_seed)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(ServiceError::into_public)
     {
         Ok(settings) => ok(settings),
         Err(e) => {
@@ -1301,7 +1300,7 @@ pub async fn admin_update_payment_settings_handler(
         &admin.email,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(settings) => {
             emit_staff_audit(
@@ -1403,7 +1402,7 @@ pub async fn admin_payment_reviews_handler(
     };
     match payment_service::list_manual_review_rows(&graph, &state.tenant_id, filters, limit, offset)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(ServiceError::into_public)
     {
         Ok(payload) => ok(payload),
         Err(e) => {
@@ -1438,7 +1437,7 @@ pub async fn admin_payment_review_detail_handler(
     }
     match payment_service::get_manual_review_detail(&graph, &state.tenant_id, &payment_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(ServiceError::into_public)
     {
         Ok(Some(detail)) => ok(detail),
         Ok(None) => fail(StatusCode::NOT_FOUND, "Payment not found"),
@@ -1478,7 +1477,7 @@ pub async fn admin_review_manual_payment_handler(
         &admin.email,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(payment) => {
             emit_staff_audit(
@@ -1653,7 +1652,7 @@ pub async fn xendit_webhook_handler(
         payload.payment_id.as_deref(),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(ServiceError::into_public)
     {
         Ok(()) => {
             if let Ok(Some(payment)) =

@@ -90,7 +90,7 @@ pub async fn require_parent_auth(
     let claims = claims_from_bearer(headers, jwt_secret)?;
     let (email, lead_ids) = resolve_owned_leads(graph, &claims)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.into_public()))?;
 
     if lead_ids.is_empty() {
         return Err((
@@ -116,7 +116,7 @@ pub async fn require_admin(
         Some(email) if !email.trim().is_empty() => email,
         _ => resolve_email_for_subject(graph, &claims.sub)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.into_public()))?
             .ok_or_else(|| {
                 (
                     StatusCode::UNAUTHORIZED,
@@ -128,7 +128,7 @@ pub async fn require_admin(
     use crate::repositories::canonical_staff_repository::{resolve_admin, CanonicalAdmin};
     match resolve_admin(graph, &claims.sub)
         .await
-        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message.to_string()))?
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.into_public()))?
     {
         CanonicalAdmin::Owner(id)
             if claims
@@ -175,7 +175,7 @@ pub async fn require_staff(
         Some(email) if !email.trim().is_empty() => email,
         _ => resolve_email_for_subject(graph, &claims.sub)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.into_public()))?
             .ok_or_else(|| {
                 (
                     StatusCode::UNAUTHORIZED,
@@ -187,7 +187,7 @@ pub async fn require_staff(
     use crate::repositories::canonical_staff_repository::{resolve_staff, CanonicalStaff};
     match resolve_staff(graph, &claims.sub)
         .await
-        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message.to_string()))?
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.into_public()))?
     {
         CanonicalStaff::Active { id, roles } => {
             if claims
@@ -271,7 +271,7 @@ pub async fn staff_can_reach_lead(
     let unavailable = |e: neo4rs::Error| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("staff scope lookup: {e}"),
+            ServiceError::failed("staff scope lookup")(e).into_public(),
         )
     };
     let mut rows = graph.execute(q).await.map_err(unavailable)?;
@@ -321,7 +321,7 @@ pub async fn require_finance(
         Some(email) if !email.trim().is_empty() => email,
         _ => resolve_email_for_subject(graph, &claims.sub)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.into_public()))?
             .ok_or_else(|| {
                 (
                     StatusCode::UNAUTHORIZED,
@@ -333,7 +333,7 @@ pub async fn require_finance(
     use crate::repositories::canonical_staff_repository::{resolve_staff, CanonicalStaff};
     match resolve_staff(graph, &claims.sub)
         .await
-        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message.to_string()))?
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.into_public()))?
     {
         CanonicalStaff::Active { id, roles } => {
             if claims
@@ -453,7 +453,7 @@ async fn staff_roles_for_email(
     let mut res = graph.execute(q).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("staff role lookup: {e}"),
+            ServiceError::failed("staff role lookup")(e).into_public(),
         )
     })?;
     Ok(res
@@ -462,7 +462,7 @@ async fn staff_roles_for_email(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("staff role row: {e}"),
+                ServiceError::failed("staff role row")(e).into_public(),
             )
         })?
         .and_then(|row| row.get::<Vec<String>>("roles"))
@@ -522,7 +522,7 @@ fn staff_claims_from_bearer(
         return claims_from_bearer(headers, parent_secret);
     }
     let (key, issuer) = crate::config::config::staff_downstream_settings(parent_secret)
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.into_public()))?;
     let typed = crate::utils::jwt::decode_staff_api_claims(&token, &key, &issuer)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid staff credential".into()))?;
     Ok(Claims {

@@ -68,10 +68,13 @@ impl XenditClient {
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
             warn!(%status, "xendit invoice error body={}", text);
-            return Err(format!("xendit invoice error {status}: {text}").into());
+            return Err(ServiceError::failed("xendit invoice error")(format!(
+                "{status}: {text}"
+            )));
         }
-        let parsed: CreateInvoiceResponse = serde_json::from_str(&text)
-            .map_err(|e| format!("xendit parse error: {e} / body={text}"))?;
+        let parsed: CreateInvoiceResponse = serde_json::from_str(&text).map_err(|e| {
+            ServiceError::failed("xendit parse error")(format!("{e} / body={text}"))
+        })?;
         info!(invoice_id=%parsed.id, status=%parsed.status, "xendit invoice created");
         Ok(parsed)
     }
@@ -97,10 +100,13 @@ impl XenditClient {
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
             warn!(%status, "xendit get_invoice error body={}", text);
-            return Err(format!("xendit get_invoice error {status}: {text}").into());
+            return Err(ServiceError::failed("xendit get_invoice error")(format!(
+                "{status}: {text}"
+            )));
         }
-        let parsed: GetInvoiceResponse = serde_json::from_str(&text)
-            .map_err(|e| format!("xendit get_invoice parse error: {e} / body={text}"))?;
+        let parsed: GetInvoiceResponse = serde_json::from_str(&text).map_err(|e| {
+            ServiceError::failed("xendit get_invoice parse error")(format!("{e} / body={text}"))
+        })?;
         Ok(parsed)
     }
 }

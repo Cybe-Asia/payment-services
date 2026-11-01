@@ -15,7 +15,8 @@ pub struct Config {
     pub legacy_parent_payments_enabled: bool,
     pub doku_api_url: String,
     pub doku_client_id: String,
-    pub doku_secret_key: String,
+    /// `None` keeps DOKU checkout and its webhook disabled.
+    pub doku_secret_key: Option<String>,
     pub doku_return_url: String,
     pub doku_notification_url: String,
     pub doku_payment_method_types: Vec<String>,
@@ -55,8 +56,9 @@ pub fn load() -> Config {
     let tenant_id = env::var("TENANT_ID").unwrap_or_else(|_| "TENANT-001".to_string());
     let xendit_api_url =
         env::var("XENDIT_API_URL").unwrap_or_else(|_| "https://api.xendit.co".to_string());
-    let xendit_api_key = env::var("XENDIT_API_KEY").unwrap_or_default();
-    let xendit_webhook_token = env::var("XENDIT_WEBHOOK_TOKEN").unwrap_or_default();
+    let xendit_api_key = env::var("XENDIT_API_KEY").expect("XENDIT_API_KEY must be set");
+    let xendit_webhook_token =
+        env::var("XENDIT_WEBHOOK_TOKEN").expect("XENDIT_WEBHOOK_TOKEN must be set");
     let xendit_success_redirect_url =
         env::var("XENDIT_SUCCESS_REDIRECT_URL").unwrap_or_else(|_| {
             "http://localhost:3000/auth/setup-account/payment/return?status=paid".to_string()
@@ -71,7 +73,12 @@ pub fn load() -> Config {
     let doku_api_url =
         env::var("DOKU_API_URL").unwrap_or_else(|_| "https://api-sandbox.doku.com".to_string());
     let doku_client_id = env::var("DOKU_CLIENT_ID").unwrap_or_default();
-    let doku_secret_key = env::var("DOKU_SECRET_KEY").unwrap_or_default();
+    let doku_secret_key = env::var("DOKU_SECRET_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if doku_secret_key.is_none() {
+        tracing::warn!("DOKU_SECRET_KEY is not set; DOKU checkout and its webhook are disabled");
+    }
     let doku_return_url = env::var("DOKU_RETURN_URL").unwrap_or_default();
     let doku_notification_url = env::var("DOKU_NOTIFICATION_URL").unwrap_or_default();
     let doku_payment_method_types = env::var("DOKU_PAYMENT_METHOD_TYPES")
@@ -90,11 +97,12 @@ pub fn load() -> Config {
     let minio_endpoint = env::var("MINIO_ENDPOINT").unwrap_or_default();
     let minio_bucket = env::var("MINIO_BUCKET").unwrap_or_default();
     let minio_region = env::var("MINIO_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-    let minio_access_key = env::var("MINIO_ACCESS_KEY").unwrap_or_default();
-    let minio_secret_key = env::var("MINIO_SECRET_KEY").unwrap_or_default();
-    let document_encryption_primary_key_id =
-        env::var("DOCUMENT_ENCRYPTION_PRIMARY_KEY_ID").unwrap_or_default();
-    let document_encryption_keyring = env::var("DOCUMENT_ENCRYPTION_KEYRING").unwrap_or_default();
+    let minio_access_key = env::var("MINIO_ACCESS_KEY").expect("MINIO_ACCESS_KEY must be set");
+    let minio_secret_key = env::var("MINIO_SECRET_KEY").expect("MINIO_SECRET_KEY must be set");
+    let document_encryption_primary_key_id = env::var("DOCUMENT_ENCRYPTION_PRIMARY_KEY_ID")
+        .expect("DOCUMENT_ENCRYPTION_PRIMARY_KEY_ID must be set");
+    let document_encryption_keyring =
+        env::var("DOCUMENT_ENCRYPTION_KEYRING").expect("DOCUMENT_ENCRYPTION_KEYRING must be set");
     let document_legacy_plaintext_reads_allowed =
         env::var("DOCUMENT_LEGACY_PLAINTEXT_READS_ALLOWED")
             .map(|value| value.eq_ignore_ascii_case("true"))

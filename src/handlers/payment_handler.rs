@@ -257,6 +257,10 @@ pub async fn doku_webhook_handler(
     let request_id = header("Request-Id");
     let timestamp = header("Request-Timestamp");
     let signature = header("Signature");
+    // DOKU is off without its key; an empty key would make any signature forgeable.
+    let Some(secret_key) = state.doku_secret_key.as_deref() else {
+        return fail(StatusCode::UNAUTHORIZED, "Invalid DOKU signature");
+    };
     if client_id != state.doku_client_id
         || request_id.is_empty()
         || !verify_non_snap_webhook(
@@ -266,7 +270,7 @@ pub async fn doku_webhook_handler(
             timestamp,
             "/api/v1/payments/webhook/doku",
             &body,
-            &state.doku_secret_key,
+            secret_key,
         )
     {
         return fail(StatusCode::UNAUTHORIZED, "Invalid DOKU signature");

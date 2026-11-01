@@ -69,9 +69,9 @@ async fn actual_owner_http_proof_receipt_and_scope_denials() {
     let state = AppState {
         graph: Some(g.clone()),
         xendit: crate::clients::xendit::XenditClient::new("http://127.0.0.1:1", "", "", ""),
-        doku: crate::clients::doku::DokuClient::new("http://127.0.0.1:1", "", "", "", "", vec![]),
+        doku: crate::clients::doku::DokuClient::new("http://127.0.0.1:1", "", None, "", "", vec![]),
         doku_client_id: String::new(),
-        doku_secret_key: String::new(),
+        doku_secret_key: None,
         legacy_parent_payments_enabled: false,
         http_client: reqwest::Client::new(),
         tenant_id: tenant.clone(),

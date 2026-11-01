@@ -15,7 +15,7 @@ pub struct DokuClient {
     http: Client,
     api_url: String,
     client_id: String,
-    secret_key: String,
+    secret_key: Option<String>,
     return_url: String,
     notification_url: String,
     payment_method_types: Vec<String>,
@@ -68,7 +68,7 @@ impl DokuClient {
     pub fn new(
         api_url: &str,
         client_id: &str,
-        secret_key: &str,
+        secret_key: Option<&str>,
         return_url: &str,
         notification_url: &str,
         payment_method_types: Vec<String>,
@@ -77,7 +77,7 @@ impl DokuClient {
             http: super::outbound_http_client(),
             api_url: api_url.trim_end_matches('/').to_string(),
             client_id: client_id.to_string(),
-            secret_key: secret_key.to_string(),
+            secret_key: secret_key.map(str::to_string),
             return_url: return_url.to_string(),
             notification_url: notification_url.to_string(),
             payment_method_types,
@@ -86,7 +86,7 @@ impl DokuClient {
 
     pub fn configured(&self) -> bool {
         !self.client_id.is_empty()
-            && !self.secret_key.is_empty()
+            && self.secret_key.is_some()
             && !self.return_url.is_empty()
             && !self.notification_url.is_empty()
             && !self.payment_method_types.is_empty()
@@ -96,9 +96,9 @@ impl DokuClient {
         &self,
         request: &CreateCheckoutRequest<'_>,
     ) -> Result<CreateCheckoutResponse, String> {
-        if !self.configured() {
+        let Some(secret_key) = self.secret_key.as_deref().filter(|_| self.configured()) else {
             return Err("DOKU sandbox prerequisites are not configured".into());
-        }
+        };
         if request.amount <= 0 || request.currency != "IDR" {
             return Err("DOKU checkout requires a positive IDR amount".into());
         }
@@ -130,7 +130,7 @@ impl DokuClient {
             &timestamp,
             CHECKOUT_TARGET,
             &body_bytes,
-            &self.secret_key,
+            secret_key,
         )?;
         let response = self
             .http
@@ -170,9 +170,9 @@ impl DokuClient {
         invoice_number: &str,
         request_id: &str,
     ) -> Result<DokuWebhook, String> {
-        if !self.configured() {
+        let Some(secret_key) = self.secret_key.as_deref().filter(|_| self.configured()) else {
             return Err("DOKU sandbox prerequisites are not configured".into());
-        }
+        };
         if invoice_number.is_empty()
             || invoice_number.len() > 128
             || !invoice_number
@@ -188,7 +188,7 @@ impl DokuClient {
             request_id,
             &timestamp,
             &target,
-            &self.secret_key,
+            secret_key,
         )?;
         let response = self
             .http

@@ -37,7 +37,7 @@ pub struct AppState {
     pub xendit: XenditClient,
     pub doku: DokuClient,
     pub doku_client_id: String,
-    pub doku_secret_key: String,
+    pub doku_secret_key: Option<String>,
     pub legacy_parent_payments_enabled: bool,
     pub http_client: reqwest::Client,
     pub tenant_id: String,
@@ -202,7 +202,7 @@ async fn main() {
     let doku = DokuClient::new(
         &cfg.doku_api_url,
         &cfg.doku_client_id,
-        &cfg.doku_secret_key,
+        cfg.doku_secret_key.as_deref(),
         &cfg.doku_return_url,
         &cfg.doku_notification_url,
         cfg.doku_payment_method_types.clone(),

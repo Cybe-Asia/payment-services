@@ -49,9 +49,9 @@ async fn parent_manual_payment_http_saved_retry_and_revocation() {
     let state = AppState {
         graph: Some(graph.clone()),
         xendit: crate::clients::xendit::XenditClient::new("http://127.0.0.1:1", "", "", ""),
-        doku: crate::clients::doku::DokuClient::new("http://127.0.0.1:1", "", "", "", "", vec![]),
+        doku: crate::clients::doku::DokuClient::new("http://127.0.0.1:1", "", None, "", "", vec![]),
         doku_client_id: String::new(),
-        doku_secret_key: String::new(),
+        doku_secret_key: None,
         legacy_parent_payments_enabled: true,
         http_client: reqwest::Client::new(),
         tenant_id: tenant.clone(),

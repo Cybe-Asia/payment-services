@@ -1,3 +1,4 @@
+use crate::utils::error::ServiceError;
 use axum::http::{HeaderMap, StatusCode};
 use neo4rs::{Graph, Query};
 
@@ -89,7 +90,7 @@ pub async fn require_parent_auth(
     let claims = claims_from_bearer(headers, jwt_secret)?;
     let (email, lead_ids) = resolve_owned_leads(graph, &claims)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if lead_ids.is_empty() {
         return Err((
@@ -115,7 +116,7 @@ pub async fn require_admin(
         Some(email) if !email.trim().is_empty() => email,
         _ => resolve_email_for_subject(graph, &claims.sub)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| {
                 (
                     StatusCode::UNAUTHORIZED,
@@ -127,7 +128,7 @@ pub async fn require_admin(
     use crate::repositories::canonical_staff_repository::{resolve_admin, CanonicalAdmin};
     match resolve_admin(graph, &claims.sub)
         .await
-        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?
+        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message.to_string()))?
     {
         CanonicalAdmin::Owner(id)
             if claims
@@ -174,7 +175,7 @@ pub async fn require_staff(
         Some(email) if !email.trim().is_empty() => email,
         _ => resolve_email_for_subject(graph, &claims.sub)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| {
                 (
                     StatusCode::UNAUTHORIZED,
@@ -186,7 +187,7 @@ pub async fn require_staff(
     use crate::repositories::canonical_staff_repository::{resolve_staff, CanonicalStaff};
     match resolve_staff(graph, &claims.sub)
         .await
-        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?
+        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message.to_string()))?
     {
         CanonicalStaff::Active { id, roles } => {
             if claims
@@ -320,7 +321,7 @@ pub async fn require_finance(
         Some(email) if !email.trim().is_empty() => email,
         _ => resolve_email_for_subject(graph, &claims.sub)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| {
                 (
                     StatusCode::UNAUTHORIZED,
@@ -332,7 +333,7 @@ pub async fn require_finance(
     use crate::repositories::canonical_staff_repository::{resolve_staff, CanonicalStaff};
     match resolve_staff(graph, &claims.sub)
         .await
-        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?
+        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message.to_string()))?
     {
         CanonicalStaff::Active { id, roles } => {
             if claims
@@ -474,7 +475,7 @@ pub async fn owns_admission(
     parent: &ParentAuth,
     id: &str,
     tenant_id: &str,
-) -> Result<bool, String> {
+) -> Result<bool, ServiceError> {
     let mut rows = graph
         .execute(
             Query::new(
@@ -521,7 +522,7 @@ fn staff_claims_from_bearer(
         return claims_from_bearer(headers, parent_secret);
     }
     let (key, issuer) = crate::config::config::staff_downstream_settings(parent_secret)
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     let typed = crate::utils::jwt::decode_staff_api_claims(&token, &key, &issuer)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid staff credential".into()))?;
     Ok(Claims {
@@ -572,7 +573,7 @@ fn is_admin_email(email: &str) -> bool {
 async fn resolve_owned_leads(
     graph: &Graph,
     claims: &Claims,
-) -> Result<(Option<String>, Vec<String>), String> {
+) -> Result<(Option<String>, Vec<String>), ServiceError> {
     if claims.sub.starts_with("LEAD-") {
         let q = Query::new(
             "MATCH (seed:Lead {lead_id: $seed}) \
@@ -588,11 +589,11 @@ async fn resolve_owned_leads(
         let mut res = graph
             .execute(q)
             .await
-            .map_err(|e| format!("lead auth lookup: {e}"))?;
+            .map_err(ServiceError::failed("lead auth lookup"))?;
         if let Some(row) = res
             .next()
             .await
-            .map_err(|e| format!("lead auth row: {e}"))?
+            .map_err(ServiceError::failed("lead auth row"))?
         {
             let email = row.get::<String>("email");
             let ids = row.get::<Vec<String>>("ids").unwrap_or_default();
@@ -612,11 +613,11 @@ async fn resolve_owned_leads(
     let mut res = graph
         .execute(q)
         .await
-        .map_err(|e| format!("user auth lookup: {e}"))?;
+        .map_err(ServiceError::failed("user auth lookup"))?;
     if let Some(row) = res
         .next()
         .await
-        .map_err(|e| format!("user auth row: {e}"))?
+        .map_err(ServiceError::failed("user auth row"))?
     {
         let email = row.get::<String>("email").or_else(|| claims.email.clone());
         let ids = row.get::<Vec<String>>("ids").unwrap_or_default();
@@ -626,7 +627,10 @@ async fn resolve_owned_leads(
     }
 }
 
-async fn resolve_email_for_subject(graph: &Graph, subject: &str) -> Result<Option<String>, String> {
+async fn resolve_email_for_subject(
+    graph: &Graph,
+    subject: &str,
+) -> Result<Option<String>, ServiceError> {
     if subject.starts_with("LEAD-") {
         let q =
             Query::new("MATCH (l:Lead {lead_id: $id}) RETURN l.email AS email LIMIT 1".to_string())
@@ -634,11 +638,11 @@ async fn resolve_email_for_subject(graph: &Graph, subject: &str) -> Result<Optio
         let mut res = graph
             .execute(q)
             .await
-            .map_err(|e| format!("lead email lookup: {e}"))?;
+            .map_err(ServiceError::failed("lead email lookup"))?;
         return Ok(res
             .next()
             .await
-            .map_err(|e| format!("lead email row: {e}"))?
+            .map_err(ServiceError::failed("lead email row"))?
             .and_then(|row| row.get::<String>("email")));
     }
 
@@ -647,11 +651,11 @@ async fn resolve_email_for_subject(graph: &Graph, subject: &str) -> Result<Optio
     let mut res = graph
         .execute(q)
         .await
-        .map_err(|e| format!("user email lookup: {e}"))?;
+        .map_err(ServiceError::failed("user email lookup"))?;
     Ok(res
         .next()
         .await
-        .map_err(|e| format!("user email row: {e}"))?
+        .map_err(ServiceError::failed("user email row"))?
         .and_then(|row| row.get::<String>("email")))
 }
 

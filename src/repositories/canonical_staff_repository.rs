@@ -1,4 +1,5 @@
 //! Read-only bridge to the auth-owned Staff Directory. Never resolve permissions by email.
+use crate::utils::error::ServiceError;
 use neo4rs::{query, Graph};
 
 #[derive(Debug, PartialEq)]
@@ -15,7 +16,7 @@ pub enum CanonicalStaff {
     Active { id: String, roles: Vec<String> },
 }
 
-pub async fn resolve_admin(graph: &Graph, user_id: &str) -> Result<CanonicalAdmin, String> {
+pub async fn resolve_admin(graph: &Graph, user_id: &str) -> Result<CanonicalAdmin, ServiceError> {
     Ok(match resolve_staff(graph, user_id).await? {
         CanonicalStaff::NotLinked => CanonicalAdmin::NotLinked,
         CanonicalStaff::Active { id, roles } if roles.iter().any(|r| r == "owner") => {
@@ -35,7 +36,7 @@ const LOOKUP: &str = "MATCH (u:User {id:$userId})-[:STAFF_MEMBER]->(s:StaffMembe
 /// The one Staff Member a canonical User links to, whatever its status or scope;
 /// `None` for no link or several. ADR 0018 slice 6 binds a capability answer to
 /// this identity before asking SIS; it never grants anything by itself.
-pub async fn sole_member(graph: &Graph, user_id: &str) -> Result<Option<String>, String> {
+pub async fn sole_member(graph: &Graph, user_id: &str) -> Result<Option<String>, ServiceError> {
     if user_id.is_empty() || user_id.starts_with("LEAD-") {
         return Ok(None);
     }
@@ -56,7 +57,7 @@ pub async fn sole_member(graph: &Graph, user_id: &str) -> Result<Option<String>,
     Ok(row.get::<String>("id").filter(|id| !id.is_empty()))
 }
 
-pub async fn resolve_staff(graph: &Graph, user_id: &str) -> Result<CanonicalStaff, String> {
+pub async fn resolve_staff(graph: &Graph, user_id: &str) -> Result<CanonicalStaff, ServiceError> {
     let lookup = if user_id.starts_with("LEAD-") {
         LOOKUP.replace(
             "MATCH (u:User {id:$userId})",

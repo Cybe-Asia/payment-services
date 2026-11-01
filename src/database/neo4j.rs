@@ -41,10 +41,10 @@ fn safe_failure(stage: &'static str, error: neo4rs::Error) -> GraphCheckFailure 
 
 fn configured_value(name: &str) -> Result<String, GraphCheckFailure> {
     crate::config::config::graph_setting(name).ok_or(GraphCheckFailure {
-            stage: "config",
-            category: "config",
-            io_kind: None,
-        })
+        stage: "config",
+        category: "config",
+        io_kind: None,
+    })
 }
 
 /// This diagnostic requires explicit graph settings and does not load other Payment configuration.

@@ -1,3 +1,4 @@
+use crate::utils::error::ServiceError;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{SecondsFormat, Utc};
 use hmac::{Hmac, Mac};
@@ -95,7 +96,7 @@ impl DokuClient {
     pub async fn create_checkout(
         &self,
         request: &CreateCheckoutRequest<'_>,
-    ) -> Result<CreateCheckoutResponse, String> {
+    ) -> Result<CreateCheckoutResponse, ServiceError> {
         let Some(secret_key) = self.secret_key.as_deref().filter(|_| self.configured()) else {
             return Err("DOKU sandbox prerequisites are not configured".into());
         };
@@ -122,8 +123,8 @@ impl DokuClient {
                 "override_notification_url": self.notification_url
             }
         });
-        let body_bytes =
-            serde_json::to_vec(&body).map_err(|e| format!("DOKU request encode failed: {e}"))?;
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(ServiceError::failed("DOKU request encode failed"))?;
         let signature = sign_non_snap_request(
             &self.client_id,
             request.request_id,
@@ -143,17 +144,15 @@ impl DokuClient {
             .body(body_bytes)
             .send()
             .await
-            .map_err(|e| format!("DOKU checkout request failed: {e}"))?;
+            .map_err(ServiceError::failed("DOKU checkout request failed"))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(format!(
-                "DOKU checkout rejected request with status {status}"
-            ));
+            return Err(format!("DOKU checkout rejected request with status {status}").into());
         }
         let parsed = response
             .json::<CheckoutEnvelope>()
             .await
-            .map_err(|e| format!("DOKU checkout response was invalid: {e}"))?;
+            .map_err(ServiceError::failed("DOKU checkout response was invalid"))?;
         Ok(CreateCheckoutResponse {
             checkout_url: parsed.response.payment.url,
             token_id: parsed.response.payment.token_id,
@@ -169,7 +168,7 @@ impl DokuClient {
         &self,
         invoice_number: &str,
         request_id: &str,
-    ) -> Result<DokuWebhook, String> {
+    ) -> Result<DokuWebhook, ServiceError> {
         let Some(secret_key) = self.secret_key.as_deref().filter(|_| self.configured()) else {
             return Err("DOKU sandbox prerequisites are not configured".into());
         };
@@ -183,13 +182,8 @@ impl DokuClient {
         }
         let target = format!("{STATUS_TARGET_PREFIX}{invoice_number}");
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-        let signature = sign_non_snap_get(
-            &self.client_id,
-            request_id,
-            &timestamp,
-            &target,
-            secret_key,
-        )?;
+        let signature =
+            sign_non_snap_get(&self.client_id, request_id, &timestamp, &target, secret_key)?;
         let response = self
             .http
             .get(format!("{}{}", self.api_url, target))
@@ -199,17 +193,15 @@ impl DokuClient {
             .header("Signature", signature)
             .send()
             .await
-            .map_err(|e| format!("DOKU status request failed: {e}"))?;
+            .map_err(ServiceError::failed("DOKU status request failed"))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(format!(
-                "DOKU status request was rejected with status {status}"
-            ));
+            return Err(format!("DOKU status request was rejected with status {status}").into());
         }
         response
             .json::<DokuWebhook>()
             .await
-            .map_err(|e| format!("DOKU status response was invalid: {e}"))
+            .map_err(ServiceError::failed("DOKU status response was invalid"))
     }
 }
 
@@ -220,7 +212,7 @@ pub fn sign_non_snap_request(
     request_target: &str,
     body: &[u8],
     secret: &str,
-) -> Result<String, String> {
+) -> Result<String, ServiceError> {
     let digest = B64.encode(Sha256::digest(body));
     let component = format!(
         "Client-Id:{client_id}\nRequest-Id:{request_id}\nRequest-Timestamp:{request_timestamp}\nRequest-Target:{request_target}\nDigest:{digest}"
@@ -240,7 +232,7 @@ pub fn sign_non_snap_get(
     request_timestamp: &str,
     request_target: &str,
     secret: &str,
-) -> Result<String, String> {
+) -> Result<String, ServiceError> {
     let component = format!(
         "Client-Id:{client_id}\nRequest-Id:{request_id}\nRequest-Timestamp:{request_timestamp}\nRequest-Target:{request_target}"
     );

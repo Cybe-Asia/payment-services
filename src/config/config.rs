@@ -1,3 +1,4 @@
+use crate::utils::error::ServiceError;
 use std::env;
 
 pub struct Config {
@@ -203,7 +204,7 @@ pub fn graph_setting(name: &str) -> Option<String> {
 
 /// Staff credentials use a key distinct from legacy parent sessions. Missing
 /// configuration disables the new family; never fall back to the parent key.
-pub fn staff_downstream_settings(parent_secret: &str) -> Result<(String, String), String> {
+pub fn staff_downstream_settings(parent_secret: &str) -> Result<(String, String), ServiceError> {
     let key = env::var("STAFF_DOWNSTREAM_JWT_SECRET")
         .map_err(|_| "Staff API authorization unavailable")?;
     let issuer = env::var("STAFF_DOWNSTREAM_JWT_ISSUER")

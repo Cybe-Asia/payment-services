@@ -1,3 +1,4 @@
+use crate::utils::error::ServiceError;
 use neo4rs::{Graph, Query};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -20,7 +21,7 @@ fn seed_school_id(code: &str) -> String {
 /// Retries on transient connection errors — neo4rs lazy-initialises the
 /// connection pool, so the very first query during pod startup can race
 /// with the neo4j service DNS/endpoints becoming ready.
-pub async fn seed_fees(graph: &Graph, tenant_id: &str) -> Result<(), String> {
+pub async fn seed_fees(graph: &Graph, tenant_id: &str) -> Result<(), ServiceError> {
     // 1) Tenant (with retry — this is the first query; absorbs startup race)
     let tenant_q = || {
         Query::new(
@@ -49,7 +50,7 @@ pub async fn seed_fees(graph: &Graph, tenant_id: &str) -> Result<(), String> {
         }
     }
     if let Some(e) = last_err {
-        return Err(format!("seed Tenant failed after retries: {e}"));
+        return Err(format!("seed Tenant failed after retries: {e}").into());
     }
 
     // 2) Schools. The identity is `school_id` (`SCH-<code>`). A School that
@@ -74,7 +75,7 @@ pub async fn seed_fees(graph: &Graph, tenant_id: &str) -> Result<(), String> {
         let present = match r.next().await {
             Ok(Some(row)) => row.get::<i64>("n").unwrap_or(0),
             Ok(None) => 0,
-            Err(e) => return Err(format!("seed School {code} lookup failed: {e}")),
+            Err(e) => return Err(format!("seed School {code} lookup failed: {e}").into()),
         };
         if present > 0 {
             if present > 1 {

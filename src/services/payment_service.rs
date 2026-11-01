@@ -1,3 +1,4 @@
+use crate::utils::error::ServiceError;
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
@@ -114,7 +115,7 @@ pub async fn create_doku_checkout(
     owned_lead_ids: &[String],
     attempt: u32,
     seed: &PaymentSettingsSeed,
-) -> Result<DokuCheckoutOutcome, String> {
+) -> Result<DokuCheckoutOutcome, ServiceError> {
     if !(1..=5).contains(&attempt) {
         return Err("attempt must be between 1 and 5".into());
     }
@@ -139,7 +140,7 @@ pub async fn create_doku_checkout(
     let payment_id = format!("PAY-DOKU-{}", &idempotency_hash[..24]);
     if let Some(existing) = payment_repository::find_by_id(graph, &payment_id)
         .await
-        .map_err(|e| format!("existing DOKU payment lookup failed: {e}"))?
+        .map_err(ServiceError::failed("existing DOKU payment lookup failed"))?
     {
         if existing.payment_method.as_deref() != Some("doku")
             || existing.amount != pricing.amount_due_now
@@ -175,7 +176,7 @@ pub async fn create_doku_checkout(
         true,
     )
     .await
-    .map_err(|e| format!("DOKU payment reservation failed: {e}"))?;
+    .map_err(ServiceError::failed("DOKU payment reservation failed"))?;
     if !reserved {
         return Err(
             "another offer payment method is already active for this accepted snapshot".into(),
@@ -206,7 +207,7 @@ pub async fn create_doku_checkout(
         response.session_id.as_deref(),
     )
     .await
-    .map_err(|e| format!("DOKU payment persistence failed: {e}"))?;
+    .map_err(ServiceError::failed("DOKU payment persistence failed"))?;
     if !persisted {
         return Err(
             "another offer payment method is already active for this accepted snapshot".into(),
@@ -232,7 +233,7 @@ async fn accepted_offer_pricing(
         payment_repository::AcceptedOfferSnapshot,
         AcceptedPricingSnapshot,
     ),
-    String,
+    ServiceError,
 > {
     let offer = payment_repository::find_accepted_offer_snapshot(
         graph,
@@ -241,7 +242,7 @@ async fn accepted_offer_pricing(
         tenant_id,
     )
     .await
-    .map_err(|e| format!("accepted offer lookup failed: {e}"))?
+    .map_err(ServiceError::failed("accepted offer lookup failed"))?
     .ok_or_else(|| "accepted offer snapshot not found for current parent".to_string())?;
     let actual_hash = hex::encode(Sha256::digest(offer.pricing_snapshot_json.as_bytes()));
     if actual_hash != offer.pricing_snapshot_hash {
@@ -261,7 +262,7 @@ pub async fn offer_manual_payment_settings(
     offer_id: &str,
     owned_lead_ids: &[String],
     seed: &PaymentSettingsSeed,
-) -> Result<PaymentSettings, String> {
+) -> Result<PaymentSettings, ServiceError> {
     let (offer, _) = accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
     let mut settings = get_payment_settings(graph, seed).await?;
     settings.xendit_enabled = false;
@@ -277,7 +278,7 @@ pub async fn offer_payment_settings(
     offer_id: &str,
     owned_lead_ids: &[String],
     seed: &PaymentSettingsSeed,
-) -> Result<PaymentSettings, String> {
+) -> Result<PaymentSettings, ServiceError> {
     let (offer, _) = accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
     let mut settings = get_payment_settings(graph, seed).await?;
     settings.xendit_enabled = false;
@@ -290,7 +291,7 @@ pub async fn offer_payment_settings(
 fn restrict_to_offer_bank_account(
     mut settings: PaymentSettings,
     offer: &payment_repository::AcceptedOfferSnapshot,
-) -> Result<PaymentSettings, String> {
+) -> Result<PaymentSettings, ServiceError> {
     if !offer.auto_generated {
         return Ok(settings);
     }
@@ -326,10 +327,10 @@ pub async fn list_payable_offers(
     graph: &Graph,
     tenant_id: &str,
     lead_id: &str,
-) -> Result<Vec<PayableOffer>, String> {
+) -> Result<Vec<PayableOffer>, ServiceError> {
     let rows = payment_repository::list_accepted_unpaid_offers(graph, lead_id, tenant_id)
         .await
-        .map_err(|e| format!("payable offers lookup failed: {e}"))?;
+        .map_err(ServiceError::failed("payable offers lookup failed"))?;
     Ok(rows
         .into_iter()
         .filter_map(
@@ -356,7 +357,7 @@ pub async fn create_offer_manual_payment(
     manual_bank_account_id: Option<&str>,
     default_due_hours: i64,
     seed: &PaymentSettingsSeed,
-) -> Result<ManualPaymentOutcome, String> {
+) -> Result<ManualPaymentOutcome, ServiceError> {
     let (offer, pricing) =
         accepted_offer_pricing(graph, tenant_id, offer_id, owned_lead_ids).await?;
     if pricing.amount_due_now <= 0 || pricing.currency != "IDR" {
@@ -377,7 +378,9 @@ pub async fn create_offer_manual_payment(
     let payment_id = format!("PAY-MANUAL-{}", &idempotency_hash[..24]);
     if let Some(existing) = payment_repository::find_by_id(graph, &payment_id)
         .await
-        .map_err(|e| format!("existing manual offer payment lookup failed: {e}"))?
+        .map_err(ServiceError::failed(
+            "existing manual offer payment lookup failed",
+        ))?
     {
         if existing.payment_method.as_deref() != Some("manual_transfer")
             || existing.amount != pricing.amount_due_now
@@ -419,7 +422,9 @@ pub async fn create_offer_manual_payment(
         false,
     )
     .await
-    .map_err(|e| format!("manual offer payment reservation failed: {e}"))?;
+    .map_err(ServiceError::failed(
+        "manual offer payment reservation failed",
+    ))?;
     if !reserved {
         return Err(
             "another offer payment method is already active for this accepted snapshot".into(),
@@ -437,7 +442,9 @@ pub async fn create_offer_manual_payment(
         &bank,
     )
     .await
-    .map_err(|e| format!("manual offer payment persistence failed: {e}"))?;
+    .map_err(ServiceError::failed(
+        "manual offer payment persistence failed",
+    ))?;
     if !persisted {
         return Err(
             "another offer payment method is already active for this accepted snapshot".into(),
@@ -445,7 +452,7 @@ pub async fn create_offer_manual_payment(
     }
     let payment = payment_repository::find_by_id(graph, &payment_id)
         .await
-        .map_err(|e| format!("manual offer payment fetch failed: {e}"))?
+        .map_err(ServiceError::failed("manual offer payment fetch failed"))?
         .ok_or_else(|| "manual offer payment was not returned".to_string())?;
     Ok(ManualPaymentOutcome { payment, settings })
 }
@@ -454,14 +461,14 @@ pub async fn handle_doku_webhook(
     graph: &Graph,
     request_id: &str,
     webhook: &DokuWebhook,
-) -> Result<bool, String> {
+) -> Result<bool, ServiceError> {
     let payment = payment_repository::find_by_invoice_ref(graph, &webhook.order.invoice_number)
         .await
-        .map_err(|e| format!("DOKU payment lookup failed: {e}"))?
+        .map_err(ServiceError::failed("DOKU payment lookup failed"))?
         .ok_or_else(|| "DOKU payment reference not found".to_string())?;
     let expected_request_id = payment_repository::find_doku_request_id(graph, &payment.payment_id)
         .await
-        .map_err(|e| format!("DOKU request reference lookup failed: {e}"))?
+        .map_err(ServiceError::failed("DOKU request reference lookup failed"))?
         .ok_or_else(|| "DOKU original request reference is missing".to_string())?;
     validate_doku_callback_contract(
         payment.amount,
@@ -496,11 +503,13 @@ pub async fn handle_doku_webhook(
         provider_reference,
     )
     .await
-    .map_err(|e| format!("DOKU webhook persistence failed: {e}"))?;
+    .map_err(ServiceError::failed("DOKU webhook persistence failed"))?;
     if applied && status == "paid" {
         let persisted = payment_repository::find_by_id(graph, &payment.payment_id)
             .await
-            .map_err(|e| format!("DOKU payment state confirmation failed: {e}"))?
+            .map_err(ServiceError::failed(
+                "DOKU payment state confirmation failed",
+            ))?
             .ok_or_else(|| "DOKU payment disappeared after callback persistence".to_string())?;
         if should_apply_doku_paid_side_effect(applied, status, &persisted.status) {
             apply_paid_side_effects(graph, &persisted).await?;
@@ -526,10 +535,10 @@ pub async fn reconcile_doku_payment(
     doku: &DokuClient,
     tenant_id: &str,
     payment_id: &str,
-) -> Result<Payment, String> {
+) -> Result<Payment, ServiceError> {
     let payment = payment_repository::find_by_id(graph, payment_id)
         .await
-        .map_err(|e| format!("DOKU payment lookup failed: {e}"))?
+        .map_err(ServiceError::failed("DOKU payment lookup failed"))?
         .ok_or_else(|| "DOKU payment not found".to_string())?;
     if payment.tenant_id != tenant_id || payment.payment_method.as_deref() != Some("doku") {
         return Err("DOKU payment not found for current tenant".into());
@@ -549,8 +558,10 @@ pub async fn reconcile_doku_payment(
     handle_doku_webhook(graph, &request_id, &provider_status).await?;
     payment_repository::find_by_id(graph, payment_id)
         .await
-        .map_err(|e| format!("reconciled DOKU payment lookup failed: {e}"))?
-        .ok_or_else(|| "reconciled DOKU payment was not found".to_string())
+        .map_err(ServiceError::failed(
+            "reconciled DOKU payment lookup failed",
+        ))?
+        .ok_or_else(|| "reconciled DOKU payment was not found".into())
 }
 
 fn validate_doku_callback_contract(
@@ -559,7 +570,7 @@ fn validate_doku_callback_contract(
     expected_provider: Option<&str>,
     expected_request_id: &str,
     webhook: &DokuWebhook,
-) -> Result<(), String> {
+) -> Result<(), ServiceError> {
     let amount = webhook
         .order
         .amount
@@ -617,7 +628,7 @@ async fn calculate_payment(
     unit_amount: i64,
     _currency: &str,
     student_count: i64,
-) -> Result<PaymentCalculation, String> {
+) -> Result<PaymentCalculation, ServiceError> {
     let gross_amount = unit_amount.saturating_mul(student_count).max(0);
     // Every promotion that applies to this charge right now, the Lead's
     // verified discount code included. Eligibility is evaluated here, when
@@ -625,7 +636,7 @@ async fn calculate_payment(
     // amounts it was created with.
     let candidates = promotion_repository::find_candidates_for_lead(graph, lead_id, payment_type)
         .await
-        .map_err(|e| format!("promotion lookup failed: {e}"))?;
+        .map_err(ServiceError::failed("promotion lookup failed"))?;
     let rule = select_promotion(gross_amount, candidates);
     let discount_amount = rule
         .as_ref()
@@ -651,8 +662,8 @@ async fn calculate_payment(
             });
         }
     }
-    let line_items_json =
-        serde_json::to_string(&line_items).map_err(|e| format!("line item encode failed: {e}"))?;
+    let line_items_json = serde_json::to_string(&line_items)
+        .map_err(ServiceError::failed("line item encode failed"))?;
     let promotion_snapshot_json = rule.as_ref().map(|rule| {
         serde_json::json!({
             "promotionCode": rule.promotion_code,
@@ -740,10 +751,10 @@ pub async fn create_invoice(
     ctx: PaymentContext<'_>,
     admission_id: &str,
     payment_type: &str,
-) -> Result<CreateInvoiceOutcome, String> {
+) -> Result<CreateInvoiceOutcome, ServiceError> {
     let settings = get_payment_settings(&ctx.graph, &ctx.settings_seed).await?;
     if !settings.xendit_enabled {
-        return Err("xendit payment method is disabled".to_string());
+        return Err("xendit payment method is disabled".into());
     }
 
     // 1) Look up the Lead (parent contact info + school selection).
@@ -758,7 +769,7 @@ pub async fn create_invoice(
         &lead.target_school_preference,
     )
     .await
-    .map_err(|e| format!("school lookup failed: {e}"))?
+    .map_err(ServiceError::failed("school lookup failed"))?
     .ok_or_else(|| {
         format!(
             "school not found for code {}",
@@ -770,7 +781,7 @@ pub async fn create_invoice(
     let fs =
         fee_structure_repository::find_active(&ctx.graph, ctx.tenant_id, &school_id, payment_type)
             .await
-            .map_err(|e| format!("fee structure lookup failed: {e}"))?
+            .map_err(ServiceError::failed("fee structure lookup failed"))?
             .ok_or_else(|| {
                 format!(
                     "no active FeeStructure for {} / {}",
@@ -794,7 +805,7 @@ pub async fn create_invoice(
     if student_count == 0 {
         return Err(
             "no students registered for this application — add at least one student before paying"
-                .to_string(),
+                .into(),
         );
     }
     let calculation = calculate_payment(
@@ -831,7 +842,7 @@ pub async fn create_invoice(
         },
     )
     .await
-    .map_err(|e| format!("fee obligation upsert failed: {e}"))?;
+    .map_err(ServiceError::failed("fee obligation upsert failed"))?;
 
     let payment_id = format!("PAY-{}", Uuid::new_v4());
 
@@ -880,7 +891,7 @@ pub async fn create_invoice(
         &calculation.line_items_json,
     )
     .await
-    .map_err(|e| format!("payment persist failed: {e}"))?;
+    .map_err(ServiceError::failed("payment persist failed"))?;
 
     // 7) Advance the Application lifecycle `submitted → payment_pending`
     //    (best-effort — the Application node is owned by admission-service
@@ -922,10 +933,10 @@ pub async fn create_manual_payment(
     admission_id: &str,
     payment_type: &str,
     manual_bank_account_id: Option<&str>,
-) -> Result<ManualPaymentOutcome, String> {
+) -> Result<ManualPaymentOutcome, ServiceError> {
     let settings = get_payment_settings(&ctx.graph, &ctx.settings_seed).await?;
     if !settings.manual_transfer_enabled && !settings.qris_enabled {
-        return Err("proof-based payment methods are disabled".to_string());
+        return Err("proof-based payment methods are disabled".into());
     }
 
     let lead = fetch_lead(&ctx.graph, admission_id, ctx.tenant_id)
@@ -939,7 +950,7 @@ pub async fn create_manual_payment(
         payment_type,
     )
     .await
-    .map_err(|e| format!("manual payment lookup failed: {e}"))?
+    .map_err(ServiceError::failed("manual payment lookup failed"))?
     {
         if let Some(selected_id) = manual_bank_account_id {
             if can_update_manual_destination(&existing) {
@@ -951,11 +962,11 @@ pub async fn create_manual_payment(
                         &bank,
                     )
                     .await
-                    .map_err(|e| format!("manual payment bank update failed: {e}"))?;
+                    .map_err(ServiceError::failed("manual payment bank update failed"))?;
 
                     let updated = payment_repository::find_by_id(&ctx.graph, &existing.payment_id)
                         .await
-                        .map_err(|e| format!("manual payment fetch failed: {e}"))?
+                        .map_err(ServiceError::failed("manual payment fetch failed"))?
                         .ok_or_else(|| "manual payment updated but not found".to_string())?;
 
                     return Ok(ManualPaymentOutcome {
@@ -978,7 +989,7 @@ pub async fn create_manual_payment(
         &lead.target_school_preference,
     )
     .await
-    .map_err(|e| format!("school lookup failed: {e}"))?
+    .map_err(ServiceError::failed("school lookup failed"))?
     .ok_or_else(|| {
         format!(
             "school not found for code {}",
@@ -989,7 +1000,7 @@ pub async fn create_manual_payment(
     let fs =
         fee_structure_repository::find_active(&ctx.graph, ctx.tenant_id, &school_id, payment_type)
             .await
-            .map_err(|e| format!("fee structure lookup failed: {e}"))?
+            .map_err(ServiceError::failed("fee structure lookup failed"))?
             .ok_or_else(|| {
                 format!(
                     "no active FeeStructure for {} / {}",
@@ -1006,7 +1017,7 @@ pub async fn create_manual_payment(
     if student_count == 0 {
         return Err(
             "no students registered for this application — add at least one student before paying"
-                .to_string(),
+                .into(),
         );
     }
     let calculation = calculate_payment(
@@ -1042,7 +1053,7 @@ pub async fn create_manual_payment(
         },
     )
     .await
-    .map_err(|e| format!("fee obligation upsert failed: {e}"))?;
+    .map_err(ServiceError::failed("fee obligation upsert failed"))?;
 
     let payment_id = format!("PAY-{}", Uuid::new_v4());
     let manual_reference = format!("TWSI-{}", &payment_id.trim_start_matches("PAY-")[..8]);
@@ -1068,14 +1079,14 @@ pub async fn create_manual_payment(
         &calculation.line_items_json,
     )
     .await
-    .map_err(|e| format!("manual payment persist failed: {e}"))?;
+    .map_err(ServiceError::failed("manual payment persist failed"))?;
 
     set_application_status_for_lead(&ctx.graph, &lead.lead_id, "submitted", "payment_pending")
         .await;
 
     let payment = payment_repository::find_by_id(&ctx.graph, &payment_id)
         .await
-        .map_err(|e| format!("manual payment fetch failed: {e}"))?
+        .map_err(ServiceError::failed("manual payment fetch failed"))?
         .ok_or_else(|| "manual payment created but not found".to_string())?;
 
     Ok(ManualPaymentOutcome { payment, settings })
@@ -1089,7 +1100,7 @@ pub async fn preview_invoice(
     tenant_id: &str,
     admission_id: &str,
     payment_type: &str,
-) -> Result<InvoicePreview, String> {
+) -> Result<InvoicePreview, ServiceError> {
     let lead = fetch_lead(graph, admission_id, tenant_id)
         .await?
         .ok_or_else(|| "Lead not found".to_string())?;
@@ -1100,7 +1111,7 @@ pub async fn preview_invoice(
         &lead.target_school_preference,
     )
     .await
-    .map_err(|e| format!("school lookup failed: {e}"))?
+    .map_err(ServiceError::failed("school lookup failed"))?
     .ok_or_else(|| {
         format!(
             "school not found for code {}",
@@ -1110,7 +1121,7 @@ pub async fn preview_invoice(
 
     let fs = fee_structure_repository::find_active(graph, tenant_id, &school_id, payment_type)
         .await
-        .map_err(|e| format!("fee structure lookup failed: {e}"))?
+        .map_err(ServiceError::failed("fee structure lookup failed"))?
         .ok_or_else(|| {
             format!(
                 "no active FeeStructure for {} / {}",
@@ -1156,10 +1167,10 @@ pub async fn preview_invoice(
 pub async fn get_payment_settings(
     graph: &Graph,
     seed: &PaymentSettingsSeed,
-) -> Result<PaymentSettings, String> {
+) -> Result<PaymentSettings, ServiceError> {
     payment_settings_repository::get_or_seed(graph, seed)
         .await
-        .map_err(|e| format!("payment settings fetch failed: {e}"))
+        .map_err(ServiceError::failed("payment settings fetch failed"))
 }
 
 pub async fn update_payment_settings(
@@ -1167,7 +1178,7 @@ pub async fn update_payment_settings(
     seed: &PaymentSettingsSeed,
     payload: UpdatePaymentSettings,
     actor: &str,
-) -> Result<PaymentSettings, String> {
+) -> Result<PaymentSettings, ServiceError> {
     let current = get_payment_settings(graph, seed).await?;
     let merged = UpdatePaymentSettings {
         xendit_enabled: false,
@@ -1202,13 +1213,13 @@ pub async fn update_payment_settings(
 
     payment_settings_repository::update(graph, &seed.tenant_id, merged, actor)
         .await
-        .map_err(|e| format!("payment settings update failed: {e}"))
+        .map_err(ServiceError::failed("payment settings update failed"))
 }
 
 fn resolve_manual_bank_details(
     settings: &PaymentSettings,
     selected_id: Option<&str>,
-) -> Result<ManualBankDetails, String> {
+) -> Result<ManualBankDetails, ServiceError> {
     let selected_id = selected_id.map(str::trim).filter(|id| !id.is_empty());
     if selected_id == Some(STATIC_QRIS_ACCOUNT_ID) {
         return resolve_qris_details(settings);
@@ -1237,7 +1248,7 @@ fn resolve_manual_bank_details(
             && settings.bank_account_name.trim().is_empty()
             && settings.bank_account_number.trim().is_empty()
         {
-            return Err("manual transfer destination bank account is not configured".to_string());
+            return Err("manual transfer destination bank account is not configured".into());
         }
         return Ok(ManualBankDetails {
             bank_account_id: String::new(),
@@ -1249,7 +1260,7 @@ fn resolve_manual_bank_details(
     } else if settings.qris_enabled {
         return resolve_qris_details(settings);
     } else {
-        return Err("proof-based payment destination is not configured".to_string());
+        return Err("proof-based payment destination is not configured".into());
     };
 
     Ok(ManualBankDetails {
@@ -1265,9 +1276,9 @@ fn resolve_manual_bank_details(
     })
 }
 
-fn resolve_qris_details(settings: &PaymentSettings) -> Result<ManualBankDetails, String> {
+fn resolve_qris_details(settings: &PaymentSettings) -> Result<ManualBankDetails, ServiceError> {
     if !settings.qris_enabled || settings.qris_image_url.trim().is_empty() {
-        return Err("QRIS payment method is not configured".to_string());
+        return Err("QRIS payment method is not configured".into());
     }
 
     Ok(ManualBankDetails {
@@ -1319,12 +1330,12 @@ fn should_update_manual_destination(payment: &Payment, bank: &ManualBankDetails)
 pub async fn record_manual_proof(
     graph: &Graph,
     input: CreateProofInput<'_>,
-) -> Result<PaymentProof, String> {
+) -> Result<PaymentProof, ServiceError> {
     let proof = payment_repository::create_payment_proof(graph, input)
         .await
-        .map_err(|e| format!("payment proof persist failed: {e}"))?;
+        .map_err(ServiceError::failed("payment proof persist failed"))?;
     if proof.payment_proof_id.is_empty() {
-        return Err("payment no longer accepts transfer proof".to_string());
+        return Err("payment no longer accepts transfer proof".into());
     }
     Ok(proof)
 }
@@ -1335,13 +1346,13 @@ pub async fn list_manual_review_rows(
     filters: PaymentReviewFilters<'_>,
     limit: i64,
     offset: i64,
-) -> Result<PaymentReviewList, String> {
+) -> Result<PaymentReviewList, ServiceError> {
     let rows = payment_repository::list_review_rows(graph, tenant_id, filters, limit, offset)
         .await
-        .map_err(|e| format!("payment review queue failed: {e}"))?;
+        .map_err(ServiceError::failed("payment review queue failed"))?;
     let total = payment_repository::count_review_rows(graph, tenant_id, filters)
         .await
-        .map_err(|e| format!("payment review count failed: {e}"))?;
+        .map_err(ServiceError::failed("payment review count failed"))?;
     Ok(PaymentReviewList {
         rows,
         total,
@@ -1354,10 +1365,10 @@ pub async fn get_manual_review_detail(
     graph: &Graph,
     tenant_id: &str,
     payment_id: &str,
-) -> Result<Option<PaymentReviewDetail>, String> {
+) -> Result<Option<PaymentReviewDetail>, ServiceError> {
     payment_repository::find_review_detail(graph, tenant_id, payment_id)
         .await
-        .map_err(|e| format!("payment review detail failed: {e}"))
+        .map_err(ServiceError::failed("payment review detail failed"))
 }
 
 /// Returned when the reviewer uploaded the evidence they are reviewing.
@@ -1370,27 +1381,27 @@ pub async fn review_manual_payment(
     payment_id: &str,
     payload: ReviewManualPaymentRequest,
     actor: &str,
-) -> Result<Payment, String> {
+) -> Result<Payment, ServiceError> {
     let payment = payment_repository::find_by_id(graph, payment_id)
         .await
-        .map_err(|e| format!("payment fetch failed: {e}"))?
+        .map_err(ServiceError::failed("payment fetch failed"))?
         .ok_or_else(|| "Payment not found".to_string())?;
 
     if payment.tenant_id != tenant_id {
-        return Err("Payment not found".to_string());
+        return Err("Payment not found".into());
     }
 
     if payment.payment_method.as_deref() != Some("manual_transfer") {
-        return Err("payment is not a manual transfer".to_string());
+        return Err("payment is not a manual transfer".into());
     }
     if !payment_repository::manual_review_allowed(&payment.status) {
-        return Err("payment is not waiting for finance review".to_string());
+        return Err("payment is not waiting for finance review".into());
     }
     if payment_repository::actor_uploaded_live_proof(graph, payment_id, actor)
         .await
-        .map_err(|e| format!("proof lookup failed: {e}"))?
+        .map_err(ServiceError::failed("proof lookup failed"))?
     {
-        return Err(SEGREGATION_OF_DUTIES.to_string());
+        return Err(SEGREGATION_OF_DUTIES.into());
     }
 
     let due = payment.amount.max(0);
@@ -1407,9 +1418,7 @@ pub async fn review_manual_payment(
                     .unwrap_or(submitted)
                     .max(current_verified);
                 if verified < due {
-                    return Err(
-                        "verified amount is lower than amount due; use underpaid".to_string()
-                    );
+                    return Err("verified amount is lower than amount due; use underpaid".into());
                 }
                 (
                     "paid",
@@ -1426,10 +1435,10 @@ pub async fn review_manual_payment(
                     .verified_amount
                     .ok_or_else(|| "verifiedAmount is required for underpaid review".to_string())?;
                 if verified <= 0 {
-                    return Err("verifiedAmount must be greater than zero".to_string());
+                    return Err("verifiedAmount must be greater than zero".into());
                 }
                 if verified >= due {
-                    return Err("verifiedAmount covers the full amount; use approve".to_string());
+                    return Err("verifiedAmount covers the full amount; use approve".into());
                 }
                 (
                     "underpaid",
@@ -1443,7 +1452,7 @@ pub async fn review_manual_payment(
             }
             "reject" => {
                 if note.trim().is_empty() {
-                    return Err("review note is required when rejecting proof".to_string());
+                    return Err("review note is required when rejecting proof".into());
                 }
                 let short = (due - current_verified).max(0);
                 let status = if current_verified > 0 {
@@ -1461,7 +1470,7 @@ pub async fn review_manual_payment(
                     None,
                 )
             }
-            _ => return Err("decision must be approve, underpaid, or reject".to_string()),
+            _ => return Err("decision must be approve, underpaid, or reject".into()),
         };
 
     let applied = payment_repository::review_manual_payment(
@@ -1489,14 +1498,14 @@ pub async fn review_manual_payment(
         },
     )
     .await
-    .map_err(|e| format!("payment review persist failed: {e}"))?;
+    .map_err(ServiceError::failed("payment review persist failed"))?;
     if !applied {
-        return Err("payment review conflicted with another terminal transition".to_string());
+        return Err("payment review conflicted with another terminal transition".into());
     }
 
     let reviewed = payment_repository::find_by_id(graph, payment_id)
         .await
-        .map_err(|e| format!("payment fetch after review failed: {e}"))?
+        .map_err(ServiceError::failed("payment fetch after review failed"))?
         .ok_or_else(|| "Payment not found after review".to_string())?;
 
     if reviewed.status == "paid" {
@@ -1640,7 +1649,7 @@ async fn cascade_students_to_test_pending(graph: &Graph, lead_id: &str) {
     }
 }
 
-async fn count_students_for_lead(graph: &Graph, admission_id: &str) -> Result<i64, String> {
+async fn count_students_for_lead(graph: &Graph, admission_id: &str) -> Result<i64, ServiceError> {
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$id})-[:HAS_STUDENT]->(s:Student) RETURN count(s) AS n".to_string(),
     )
@@ -1648,11 +1657,11 @@ async fn count_students_for_lead(graph: &Graph, admission_id: &str) -> Result<i6
     let mut result = graph
         .execute(q)
         .await
-        .map_err(|e| format!("student count: {e}"))?;
+        .map_err(ServiceError::failed("student count"))?;
     if let Some(row) = result
         .next()
         .await
-        .map_err(|e| format!("student count row: {e}"))?
+        .map_err(ServiceError::failed("student count row"))?
     {
         Ok(row.get::<i64>("n").unwrap_or(0))
     } else {
@@ -1660,16 +1669,19 @@ async fn count_students_for_lead(graph: &Graph, admission_id: &str) -> Result<i6
     }
 }
 
-pub async fn fetch_payment(graph: &Graph, payment_id: &str) -> Result<Option<Payment>, String> {
+pub async fn fetch_payment(
+    graph: &Graph,
+    payment_id: &str,
+) -> Result<Option<Payment>, ServiceError> {
     payment_repository::find_by_id(graph, payment_id)
         .await
-        .map_err(|e| format!("payment fetch failed: {e}"))
+        .map_err(ServiceError::failed("payment fetch failed"))
 }
 
 pub async fn payment_notification_context(
     graph: &Graph,
     payment: &Payment,
-) -> Result<Option<PaymentNotificationContext>, String> {
+) -> Result<Option<PaymentNotificationContext>, ServiceError> {
     let Some(lead_id) = payment.lead_id.as_deref() else {
         return Ok(None);
     };
@@ -1688,7 +1700,7 @@ pub async fn resolve_notification_channels(
     graph: &Graph,
     school_code: &str,
     event: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ServiceError> {
     let key = school_code
         .trim()
         .trim_start_matches("SCH-")
@@ -1710,11 +1722,11 @@ pub async fn resolve_notification_channels(
     let mut result = graph
         .execute(q)
         .await
-        .map_err(|e| format!("notification channels fetch: {e}"))?;
+        .map_err(ServiceError::failed("notification channels fetch"))?;
     if let Some(row) = result
         .next()
         .await
-        .map_err(|e| format!("notification channels row: {e}"))?
+        .map_err(ServiceError::failed("notification channels row"))?
     {
         let channels_json = row.get::<String>("channelsJson").unwrap_or_default();
         let preferences = parse_notification_channels(&channels_json);
@@ -1728,7 +1740,7 @@ pub async fn mark_payment_notification_queued(
     payment_id: &str,
     event: &str,
     channel: &str,
-) -> Result<bool, String> {
+) -> Result<bool, ServiceError> {
     let property = match (event, channel) {
         ("payment_approved", "email") => "payment_approved_email_queued_at",
         ("payment_approved", "whatsapp") => "payment_approved_whatsapp_queued_at",
@@ -1739,7 +1751,8 @@ pub async fn mark_payment_notification_queued(
         _ => {
             return Err(format!(
                 "unsupported payment notification event/channel: {event}/{channel}"
-            ))
+            )
+            .into())
         }
     };
     let now = Utc::now().to_rfc3339();
@@ -1755,11 +1768,11 @@ pub async fn mark_payment_notification_queued(
     let mut result = graph
         .execute(q)
         .await
-        .map_err(|e| format!("mark payment notification: {e}"))?;
+        .map_err(ServiceError::failed("mark payment notification"))?;
     Ok(result
         .next()
         .await
-        .map_err(|e| format!("mark payment notification row: {e}"))?
+        .map_err(ServiceError::failed("mark payment notification row"))?
         .is_some())
 }
 
@@ -1810,7 +1823,7 @@ pub async fn fetch_payment_refreshed(
     graph: &Graph,
     xendit: &XenditClient,
     payment_id: &str,
-) -> Result<Option<Payment>, String> {
+) -> Result<Option<Payment>, ServiceError> {
     let Some(current) = fetch_payment(graph, payment_id).await? else {
         return Ok(None);
     };
@@ -1924,19 +1937,19 @@ pub async fn handle_webhook(
     gateway_status: &str,
     payment_method: Option<&str>,
     receipt_ref: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), ServiceError> {
     // Xendit statuses: PAID / EXPIRED / PENDING / SETTLED
     let normalized = gateway_status.to_uppercase();
     let payment = payment_repository::find_by_id(graph, payment_id)
         .await
-        .map_err(|e| format!("find failed: {e}"))?
+        .map_err(ServiceError::failed("find failed"))?
         .ok_or_else(|| format!("payment {payment_id} not found"))?;
 
     match normalized.as_str() {
         "PAID" | "SETTLED" => {
             payment_repository::mark_paid(graph, payment_id, payment_method, receipt_ref)
                 .await
-                .map_err(|e| format!("mark_paid failed: {e}"))?;
+                .map_err(ServiceError::failed("mark_paid failed"))?;
             // Also settle any FeeObligation linked via SETTLED_BY relationship
             settle_obligation_for_payment(graph, payment_id).await?;
             // And advance the Application lifecycle + per-child
@@ -1972,7 +1985,7 @@ pub async fn handle_webhook(
         "EXPIRED" => {
             payment_repository::mark_status(graph, payment_id, "expired")
                 .await
-                .map_err(|e| format!("mark_status failed: {e}"))?;
+                .map_err(ServiceError::failed("mark_status failed"))?;
         }
         "PENDING" => {
             // no-op; already pending
@@ -1985,7 +1998,7 @@ pub async fn handle_webhook(
     Ok(())
 }
 
-async fn apply_paid_side_effects(graph: &Graph, payment: &Payment) -> Result<(), String> {
+async fn apply_paid_side_effects(graph: &Graph, payment: &Payment) -> Result<(), ServiceError> {
     settle_obligation_for_payment(graph, &payment.payment_id).await?;
     if let Some(lead_id) = payment.lead_id.as_deref() {
         match payment.payment_type.as_str() {
@@ -2030,7 +2043,7 @@ async fn apply_paid_side_effects(graph: &Graph, payment: &Payment) -> Result<(),
                 graph
                     .run(q)
                     .await
-                    .map_err(|e| format!("offer payment gate update failed: {e}"))?;
+                    .map_err(ServiceError::failed("offer payment gate update failed"))?;
             }
             _ => {}
         }
@@ -2038,7 +2051,10 @@ async fn apply_paid_side_effects(graph: &Graph, payment: &Payment) -> Result<(),
     Ok(())
 }
 
-async fn settle_obligation_for_payment(graph: &Graph, payment_id: &str) -> Result<(), String> {
+async fn settle_obligation_for_payment(
+    graph: &Graph,
+    payment_id: &str,
+) -> Result<(), ServiceError> {
     let q = Query::new(
         "MATCH (f:FeeObligation)-[:SETTLED_BY]->(p:Payment {payment_id:$pid}) \
          SET f.status = 'paid', f.paid_at = datetime() \
@@ -2049,7 +2065,7 @@ async fn settle_obligation_for_payment(graph: &Graph, payment_id: &str) -> Resul
     let mut res = graph
         .execute(q)
         .await
-        .map_err(|e| format!("settle failed: {e}"))?;
+        .map_err(ServiceError::failed("settle failed"))?;
     let _ = res.next().await;
     Ok(())
 }
@@ -2394,7 +2410,7 @@ async fn fetch_lead(
     graph: &Graph,
     admission_id: &str,
     tenant_id: &str,
-) -> Result<Option<LeadSnapshot>, String> {
+) -> Result<Option<LeadSnapshot>, ServiceError> {
     // Try it as a Lead id first — the common case for application_fee.
     let q = Query::new(
         "MATCH (l:Lead {lead_id:$id, tenant_id:$tenant_id}) \
@@ -2409,11 +2425,11 @@ async fn fetch_lead(
     let mut result = graph
         .execute(q)
         .await
-        .map_err(|e| format!("lead fetch: {e}"))?;
+        .map_err(ServiceError::failed("lead fetch"))?;
     if let Some(row) = result
         .next()
         .await
-        .map_err(|e| format!("lead fetch row: {e}"))?
+        .map_err(ServiceError::failed("lead fetch row"))?
     {
         return Ok(Some(LeadSnapshot {
             lead_id: row.get("lead_id").unwrap_or_default(),
@@ -2440,11 +2456,11 @@ async fn fetch_lead(
     let mut result = graph
         .execute(q)
         .await
-        .map_err(|e| format!("lead fetch by student: {e}"))?;
+        .map_err(ServiceError::failed("lead fetch by student"))?;
     if let Some(row) = result
         .next()
         .await
-        .map_err(|e| format!("lead fetch by student row: {e}"))?
+        .map_err(ServiceError::failed("lead fetch by student row"))?
     {
         Ok(Some(LeadSnapshot {
             lead_id: row.get("lead_id").unwrap_or_default(),

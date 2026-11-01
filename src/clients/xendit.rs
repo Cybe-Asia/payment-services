@@ -1,3 +1,4 @@
+use crate::utils::error::ServiceError;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -34,7 +35,7 @@ impl XenditClient {
     pub async fn create_invoice(
         &self,
         req: &CreateInvoiceRequest<'_>,
-    ) -> Result<CreateInvoiceResponse, String> {
+    ) -> Result<CreateInvoiceResponse, ServiceError> {
         if self.api_key.is_empty() {
             return Err("XENDIT_API_KEY not configured".into());
         }
@@ -61,13 +62,13 @@ impl XenditClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("xendit request failed: {e}"))?;
+            .map_err(ServiceError::failed("xendit request failed"))?;
 
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
             warn!(%status, "xendit invoice error body={}", text);
-            return Err(format!("xendit invoice error {status}: {text}"));
+            return Err(format!("xendit invoice error {status}: {text}").into());
         }
         let parsed: CreateInvoiceResponse = serde_json::from_str(&text)
             .map_err(|e| format!("xendit parse error: {e} / body={text}"))?;
@@ -79,7 +80,7 @@ impl XenditClient {
     /// Used for status polling when we haven't received a webhook
     /// (the webhook URL isn't publicly reachable in dev/test/staging).
     /// Docs: https://api.xendit.co/v2/invoices/{id}
-    pub async fn get_invoice(&self, invoice_id: &str) -> Result<GetInvoiceResponse, String> {
+    pub async fn get_invoice(&self, invoice_id: &str) -> Result<GetInvoiceResponse, ServiceError> {
         if self.api_key.is_empty() {
             return Err("XENDIT_API_KEY not configured".into());
         }
@@ -90,13 +91,13 @@ impl XenditClient {
             .header("Authorization", auth)
             .send()
             .await
-            .map_err(|e| format!("xendit get_invoice failed: {e}"))?;
+            .map_err(ServiceError::failed("xendit get_invoice failed"))?;
 
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
             warn!(%status, "xendit get_invoice error body={}", text);
-            return Err(format!("xendit get_invoice error {status}: {text}"));
+            return Err(format!("xendit get_invoice error {status}: {text}").into());
         }
         let parsed: GetInvoiceResponse = serde_json::from_str(&text)
             .map_err(|e| format!("xendit get_invoice parse error: {e} / body={text}"))?;

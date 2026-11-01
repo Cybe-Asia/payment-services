@@ -148,5 +148,3 @@ pub async fn update_fee_handler(
         }
     }
 }
-
-

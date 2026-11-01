@@ -1,3 +1,4 @@
+use crate::utils::error::ServiceError;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::primitives::ByteStream;
@@ -40,7 +41,12 @@ impl MinioClient {
         }
     }
 
-    async fn put_object(&self, key: &str, content_type: &str, body: Bytes) -> Result<(), String> {
+    async fn put_object(
+        &self,
+        key: &str,
+        content_type: &str,
+        body: Bytes,
+    ) -> Result<(), ServiceError> {
         self.s3
             .put_object()
             .bucket(&self.bucket)
@@ -50,17 +56,17 @@ impl MinioClient {
             .body(ByteStream::from(body))
             .send()
             .await
-            .map_err(|e| format!("minio put: {e}"))?;
+            .map_err(ServiceError::failed("minio put"))?;
         Ok(())
     }
 
-    pub async fn put_encrypted_document(&self, key: &str, body: Bytes) -> Result<(), String> {
+    pub async fn put_encrypted_document(&self, key: &str, body: Bytes) -> Result<(), ServiceError> {
         let encrypted = self.document_cipher.encrypt(key, &body)?;
         self.put_object(key, "application/octet-stream", encrypted)
             .await
     }
 
-    pub async fn get_decrypted_document(&self, key: &str) -> Result<Bytes, String> {
+    pub async fn get_decrypted_document(&self, key: &str) -> Result<Bytes, ServiceError> {
         let response = self
             .s3
             .get_object()
@@ -76,24 +82,24 @@ impl MinioClient {
             .body
             .collect()
             .await
-            .map_err(|error| format!("minio stream: {error}"))?
+            .map_err(ServiceError::failed("minio stream"))?
             .into_bytes();
         self.document_cipher.decrypt(key, &stored)
     }
 
-    pub async fn delete_object(&self, key: &str) -> Result<(), String> {
+    pub async fn delete_object(&self, key: &str) -> Result<(), ServiceError> {
         self.s3
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
             .await
-            .map_err(|error| format!("minio delete: {error}"))?;
+            .map_err(ServiceError::failed("minio delete"))?;
         Ok(())
     }
 
     /// Audit only this service's namespace; migration never enables plaintext HTTP reads.
-    pub async fn audit_documents(&self, migrate: bool) -> Result<(usize, usize), String> {
+    pub async fn audit_documents(&self, migrate: bool) -> Result<(usize, usize), ServiceError> {
         if migrate {
             let versioning = self
                 .s3
@@ -299,6 +305,7 @@ mod migration_tests {
                 .audit_documents(true)
                 .await
                 .unwrap_err()
+                .to_string()
                 .contains("versioned bucket"));
         }
         client

@@ -1,3 +1,4 @@
+use crate::utils::error::ServiceError;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::Deserialize;
 
@@ -14,7 +15,7 @@ pub struct Claims {
     pub scope: Option<String>,
 }
 
-pub fn decode_session_claims(token: &str, secret: &str) -> Result<Claims, String> {
+pub fn decode_session_claims(token: &str, secret: &str) -> Result<Claims, ServiceError> {
     let data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_ref()),
@@ -23,7 +24,7 @@ pub fn decode_session_claims(token: &str, secret: &str) -> Result<Claims, String
     .map_err(|e| e.to_string())?;
 
     if data.claims.scope.is_some() {
-        return Err("token scope mismatch".to_string());
+        return Err("token scope mismatch".into());
     }
 
     Ok(data.claims)
@@ -45,7 +46,7 @@ pub fn decode_staff_api_claims(
     token: &str,
     secret: &str,
     issuer: &str,
-) -> Result<StaffApiClaims, String> {
+) -> Result<StaffApiClaims, ServiceError> {
     let header = jsonwebtoken::decode_header(token).map_err(|_| "Invalid staff token")?;
     if header.typ.as_deref() != Some("staff-api+jwt")
         || secret.len() < 32

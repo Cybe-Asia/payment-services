@@ -104,7 +104,10 @@ async fn health_check() -> axum::response::Json<serde_json::Value> {
 async fn main() {
     load_env();
     fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().expect("static log directive")))
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive("info".parse().expect("static log directive")),
+        )
         .init();
 
     // Read-only connection diagnosis takes precedence over every other run mode.

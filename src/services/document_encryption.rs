@@ -1,3 +1,4 @@
+use crate::utils::error::ServiceError;
 use std::collections::HashMap;
 
 use bytes::Bytes;
@@ -23,7 +24,7 @@ impl DocumentCipher {
         primary_key_id: &str,
         keyring: &str,
         allow_legacy_plaintext_reads: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ServiceError> {
         validate_key_id(primary_key_id)?;
         let mut keys = HashMap::new();
         for entry in keyring
@@ -38,7 +39,7 @@ impl DocumentCipher {
             let key_bytes = hex::decode(encoded_key)
                 .map_err(|_| "document encryption key must be hexadecimal".to_string())?;
             if key_bytes.len() != 32 {
-                return Err("document encryption key must be 32 bytes".to_string());
+                return Err("document encryption key must be 32 bytes".into());
             }
             let key = UnboundKey::new(&aead::AES_256_GCM, &key_bytes)
                 .map_err(|_| "document encryption key is invalid".to_string())?;
@@ -46,11 +47,11 @@ impl DocumentCipher {
                 .insert(key_id.to_string(), LessSafeKey::new(key))
                 .is_some()
             {
-                return Err("document encryption key id is duplicated".to_string());
+                return Err("document encryption key id is duplicated".into());
             }
         }
         if !keys.contains_key(primary_key_id) {
-            return Err("document encryption primary key is missing from keyring".to_string());
+            return Err("document encryption primary key is missing from keyring".into());
         }
         Ok(Self {
             primary_key_id: primary_key_id.to_string(),
@@ -60,7 +61,7 @@ impl DocumentCipher {
         })
     }
 
-    pub fn encrypt(&self, object_key: &str, plaintext: &[u8]) -> Result<Bytes, String> {
+    pub fn encrypt(&self, object_key: &str, plaintext: &[u8]) -> Result<Bytes, ServiceError> {
         let key = self
             .keys
             .get(&self.primary_key_id)
@@ -83,12 +84,12 @@ impl DocumentCipher {
         Ok(Bytes::from(envelope))
     }
 
-    pub fn decrypt(&self, object_key: &str, stored: &[u8]) -> Result<Bytes, String> {
+    pub fn decrypt(&self, object_key: &str, stored: &[u8]) -> Result<Bytes, ServiceError> {
         if !stored.starts_with(MAGIC) {
             return if self.allow_legacy_plaintext_reads {
                 Ok(Bytes::copy_from_slice(stored))
             } else {
-                Err("legacy unencrypted document read is disabled".to_string())
+                Err("legacy unencrypted document read is disabled".into())
             };
         }
         let parsed = parse_header(stored)?;
@@ -119,19 +120,19 @@ struct ParsedHeader<'a> {
     header_len: usize,
 }
 
-fn validate_key_id(key_id: &str) -> Result<(), String> {
+fn validate_key_id(key_id: &str) -> Result<(), ServiceError> {
     if key_id.is_empty()
         || key_id.len() > MAX_KEY_ID_LEN
         || !key_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        return Err("document encryption key id is invalid".to_string());
+        return Err("document encryption key id is invalid".into());
     }
     Ok(())
 }
 
-fn header(key_id: &str, nonce: [u8; NONCE_LEN]) -> Result<Vec<u8>, String> {
+fn header(key_id: &str, nonce: [u8; NONCE_LEN]) -> Result<Vec<u8>, ServiceError> {
     validate_key_id(key_id)?;
     let mut header = Vec::with_capacity(MAGIC.len() + 2 + key_id.len() + NONCE_LEN);
     header.extend_from_slice(MAGIC);
@@ -142,22 +143,22 @@ fn header(key_id: &str, nonce: [u8; NONCE_LEN]) -> Result<Vec<u8>, String> {
     Ok(header)
 }
 
-fn parse_header(stored: &[u8]) -> Result<ParsedHeader<'_>, String> {
+fn parse_header(stored: &[u8]) -> Result<ParsedHeader<'_>, ServiceError> {
     if stored.len() < MAGIC.len() + 2 + NONCE_LEN || !stored.starts_with(MAGIC) {
-        return Err("document encryption envelope is invalid".to_string());
+        return Err("document encryption envelope is invalid".into());
     }
     if stored[MAGIC.len()] != VERSION {
-        return Err("document encryption envelope version is unsupported".to_string());
+        return Err("document encryption envelope version is unsupported".into());
     }
     let key_id_len = stored[MAGIC.len() + 1] as usize;
     if key_id_len == 0 || key_id_len > MAX_KEY_ID_LEN {
-        return Err("document encryption envelope key id is invalid".to_string());
+        return Err("document encryption envelope key id is invalid".into());
     }
     let key_id_start = MAGIC.len() + 2;
     let nonce_start = key_id_start + key_id_len;
     let header_len = nonce_start + NONCE_LEN;
     if stored.len() < header_len + aead::AES_256_GCM.tag_len() {
-        return Err("document encryption envelope is truncated".to_string());
+        return Err("document encryption envelope is truncated".into());
     }
     let key_id = std::str::from_utf8(&stored[key_id_start..nonce_start])
         .map_err(|_| "document encryption envelope key id is invalid".to_string())?;

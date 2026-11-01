@@ -1,6 +1,7 @@
 //! "Online Payment" for school invoices through DOKU Checkout (ADR 0014 §7).
 //! The parent never sees the provider name; this module is the only place
 //! that ties a `SchoolInvoice` to a DOKU order.
+use crate::utils::error::ServiceError;
 use crate::{
     clients::doku::{CreateCheckoutRequest, DokuWebhook},
     school_invoice::{
@@ -69,7 +70,9 @@ pub async fn start(
             ))
         }
     }
-    let Some(return_url) = return_url(state.school_billing_return_url.as_deref(), id).filter(|_| state.doku.configured()) else {
+    let Some(return_url) = return_url(state.school_billing_return_url.as_deref(), id)
+        .filter(|_| state.doku.configured())
+    else {
         return Err(super::coded(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "NOT_CONFIGURED",
@@ -201,7 +204,7 @@ fn amount(webhook: &DokuWebhook) -> Option<i64> {
 
 /// Applies a signed DOKU callback (or status read) to a school invoice.
 /// Settles at most once; replays and late callbacks are no-ops.
-pub async fn apply(graph: &Graph, webhook: &DokuWebhook) -> Result<bool, String> {
+pub async fn apply(graph: &Graph, webhook: &DokuWebhook) -> Result<bool, ServiceError> {
     let number = webhook.order.invoice_number.as_str();
     let mut rows = graph
         .execute(
@@ -265,7 +268,7 @@ pub async fn apply(graph: &Graph, webhook: &DokuWebhook) -> Result<bool, String>
 /// Money DOKU took that cannot settle the bill: it was already paid (a second
 /// order or a manual transfer) or a transfer proof is under review. Finance
 /// reconciles or refunds; a replay of the same callback changes nothing.
-async fn record_unsettled(graph: &Graph, number: &str) -> Result<(), String> {
+async fn record_unsettled(graph: &Graph, number: &str) -> Result<(), ServiceError> {
     graph
         .run(
             query("MATCH (c:SchoolInvoiceCheckout {invoice_number:$number}) MATCH (i:SchoolInvoice {id:c.invoice_id}) WHERE NOT c.status IN ['paid','paid_duplicate','paid_needs_reconciliation'] SET c.status=CASE WHEN i.status='paid' THEN 'paid_duplicate' ELSE 'paid_needs_reconciliation' END,c.paid_at=datetime() CREATE (:SchoolInvoiceAudit {id:$audit,invoice_id:i.id,actor_id:'system:online-payment',action:'online_payment_unsettled',version:i.version,note:c.status,checkout:c.invoice_number,created_at:datetime()})")
@@ -273,7 +276,7 @@ async fn record_unsettled(graph: &Graph, number: &str) -> Result<(), String> {
                 .param("audit", uuid::Uuid::new_v4().to_string()),
         )
         .await
-        .map_err(|_| "school checkout reconciliation record failed".to_string())
+        .map_err(|_| "school checkout reconciliation record failed".into())
 }
 
 /// Reads the provider's own status for the newest checkout of an invoice
@@ -340,7 +343,10 @@ mod tests {
                 "https://p.test/parent?paidInvoice=SINV-1",
             ),
         ] {
-            assert_eq!(super::return_url(Some(base), "SINV-1").as_deref(), Some(want));
+            assert_eq!(
+                super::return_url(Some(base), "SINV-1").as_deref(),
+                Some(want)
+            );
         }
         assert!(super::return_url(Some("http://evil.test/"), "SINV-1").is_none());
         assert!(super::return_url(None, "SINV-1").is_none());

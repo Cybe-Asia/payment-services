@@ -1,7 +1,8 @@
 use super::model::Invoice;
 use crate::services::payment_document::{render_payment_document, PaymentDocumentKind};
+use crate::utils::error::ServiceError;
 
-pub fn render(inv: &Invoice, receipt: bool) -> Result<Vec<u8>, String> {
+pub fn render(inv: &Invoice, receipt: bool) -> Result<Vec<u8>, ServiceError> {
     let s = &inv.snapshot;
     if receipt && inv.status != "paid" {
         return Err("Receipt is unavailable".into());

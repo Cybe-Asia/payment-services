@@ -4,8 +4,6 @@
 //! Records outside the guard stay queued and untouched for an explicit later decision.
 use chrono::{DateTime, Utc};
 
-pub const ACTIVATED_AT_ENV: &str = "NOTIFICATION_ACTIVATED_AT";
-pub const RECIPIENTS_ENV: &str = "NOTIFICATION_RECIPIENT_ALLOWLIST";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActivationGuard {
@@ -16,13 +14,6 @@ pub struct ActivationGuard {
 }
 
 impl ActivationGuard {
-    pub fn from_env() -> Result<Self, &'static str> {
-        Self::parse(
-            std::env::var(ACTIVATED_AT_ENV).ok().as_deref(),
-            std::env::var(RECIPIENTS_ENV).ok().as_deref(),
-        )
-    }
-
     /// Fails closed: both values are required and must be well formed.
     pub fn parse(activated_at: Option<&str>, recipients: Option<&str>) -> Result<Self, &'static str> {
         let activated_at = activated_at

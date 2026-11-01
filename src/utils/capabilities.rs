@@ -18,7 +18,6 @@ pub const UPLOAD_ON_BEHALF: &str = "admissions.document.upload_on_behalf";
 
 /// SIS origin (scheme and host, no path). Empty or unset turns the capability
 /// path off, so every gate answers exactly by role.
-const ORIGIN_ENV: &str = "SIS_ACCESS_ORIGIN";
 const HELD_PATH: &str = "/api/v1/sis-service/authorization/held";
 const TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_BODY: usize = 64 * 1024;
@@ -180,7 +179,7 @@ fn identifier(v: &str) -> bool {
 }
 
 fn origin() -> Option<String> {
-    let raw = std::env::var(ORIGIN_ENV).ok()?;
+    let raw = crate::config::config::sis_access_origin()?;
     let origin = raw.trim().trim_end_matches('/');
     if origin.starts_with("https://") || origin.starts_with("http://") {
         Some(origin.to_string())
@@ -196,7 +195,7 @@ pub fn enabled() -> bool {
 
 /// The tenant this Payment deployment serves (same setting as `Config::tenant_id`).
 pub fn tenant() -> String {
-    std::env::var("TENANT_ID").unwrap_or_else(|_| "TENANT-001".to_string())
+    crate::config::config::tenant_id()
 }
 
 fn client() -> &'static reqwest::Client {

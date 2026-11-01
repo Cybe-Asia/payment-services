@@ -83,6 +83,8 @@ async fn actual_owner_http_proof_receipt_and_scope_denials() {
         notification_internal_token: None,
         frontend_url: "http://127.0.0.1".into(),
         minio: Some(minio.clone()),
+        invoice_email_enabled: false,
+        school_billing_return_url: None,
         payment_settings_seed:
             crate::repositories::payment_settings_repository::PaymentSettingsSeed {
                 tenant_id: tenant.clone(),

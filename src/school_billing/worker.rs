@@ -5,10 +5,6 @@ use super::{model::today, repository as repo, service};
 use crate::school_invoice::repository::Error;
 use std::{collections::BTreeSet, time::Duration};
 
-pub fn enabled() -> bool {
-    std::env::var("SCHOOL_BILLING_WORKER_ENABLED").as_deref() == Ok("true")
-}
-
 pub fn start(graph: std::sync::Arc<neo4rs::Graph>) {
     tokio::spawn(async move {
         loop {

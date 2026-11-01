@@ -561,7 +561,7 @@ fn bearer_from(headers: &HeaderMap) -> Option<String> {
 }
 
 fn is_admin_email(email: &str) -> bool {
-    let allowed = std::env::var("ADMIN_EMAILS").unwrap_or_default();
+    let allowed = crate::config::config::admin_emails();
     let requester = email.to_lowercase();
     allowed
         .split(',')

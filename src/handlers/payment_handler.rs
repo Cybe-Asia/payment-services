@@ -1856,7 +1856,7 @@ async fn queue_payment_status_notification(
         if event == "payment_approved"
             && payment.payment_type == "application_fee"
             && channel == payment_service::NOTIFICATION_CHANNEL_EMAIL
-            && std::env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true")
+            && state.invoice_email_enabled
         {
             continue;
         }

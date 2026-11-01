@@ -49,6 +49,8 @@ pub struct AppState {
     pub notification_internal_token: Option<String>,
     pub frontend_url: String,
     pub minio: Option<MinioClient>,
+    pub invoice_email_enabled: bool,
+    pub school_billing_return_url: Option<String>,
     pub payment_settings_seed: PaymentSettingsSeed,
 }
 
@@ -278,13 +280,18 @@ async fn main() {
         notification_internal_token: cfg.notification_internal_token.clone(),
         frontend_url: cfg.frontend_url.clone(),
         minio,
+        invoice_email_enabled: cfg.invoice_email_enabled,
+        school_billing_return_url: cfg.school_billing_return_url.clone(),
         payment_settings_seed,
     };
 
-    if std::env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true") {
+    if cfg.invoice_email_enabled {
         // Fail closed: without an explicit activation instant and recipient scope,
         // queued backlog would be sent on first enable, so no worker starts.
-        match services::notification_guard::ActivationGuard::from_env() {
+        match services::notification_guard::ActivationGuard::parse(
+            cfg.notification_activated_at.as_deref(),
+            cfg.notification_recipient_allowlist.as_deref(),
+        ) {
             Ok(guard) => {
                 info!(
                     activated_at = %guard.activated_at,
@@ -292,7 +299,7 @@ async fn main() {
                     allowlisted = guard.recipient_list().len(),
                     "payment notification workers enabled"
                 );
-                if std::env::var("ADMISSIONS_AUTOMATION_ENABLED").as_deref() == Ok("true") {
+                if cfg.admissions_automation_enabled {
                     services::automatic_offer_invoice::start_worker(state.clone(), guard.clone());
                 }
                 services::invoice_notification::start_worker(state.clone(), guard.clone());
@@ -302,7 +309,7 @@ async fn main() {
         }
     }
 
-    if school_billing::worker::enabled() {
+    if cfg.school_billing_worker_enabled {
         match state.graph.clone() {
             Some(graph) => {
                 info!("school billing worker enabled");

@@ -39,6 +39,12 @@ pub struct Config {
     /// Sent as `X-Internal-Token` on calls to notification-service when set.
     pub notification_internal_token: Option<String>,
     pub frontend_url: String,
+    pub invoice_email_enabled: bool,
+    pub admissions_automation_enabled: bool,
+    pub school_billing_worker_enabled: bool,
+    pub school_billing_return_url: Option<String>,
+    pub notification_activated_at: Option<String>,
+    pub notification_recipient_allowlist: Option<String>,
 }
 
 pub fn load() -> Config {
@@ -53,7 +59,7 @@ pub fn load() -> Config {
     if jwt_secret.len() < 32 {
         tracing::warn!("JWT_SECRET is shorter than 32 bytes; rotate it to a longer secret");
     }
-    let tenant_id = env::var("TENANT_ID").unwrap_or_else(|_| "TENANT-001".to_string());
+    let tenant_id = tenant_id();
     let xendit_api_url =
         env::var("XENDIT_API_URL").unwrap_or_else(|_| "https://api.xendit.co".to_string());
     let xendit_api_key = env::var("XENDIT_API_KEY").expect("XENDIT_API_KEY must be set");
@@ -161,7 +167,38 @@ pub fn load() -> Config {
         notification_service_url,
         notification_internal_token,
         frontend_url,
+        invoice_email_enabled: env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true"),
+        admissions_automation_enabled: env::var("ADMISSIONS_AUTOMATION_ENABLED").as_deref()
+            == Ok("true"),
+        school_billing_worker_enabled: env::var("SCHOOL_BILLING_WORKER_ENABLED").as_deref()
+            == Ok("true"),
+        school_billing_return_url: env::var("SCHOOL_BILLING_RETURN_URL").ok(),
+        notification_activated_at: env::var("NOTIFICATION_ACTIVATED_AT").ok(),
+        notification_recipient_allowlist: env::var("NOTIFICATION_RECIPIENT_ALLOWLIST").ok(),
     }
+}
+
+/// The tenant this Payment deployment serves.
+pub fn tenant_id() -> String {
+    env::var("TENANT_ID").unwrap_or_else(|_| "TENANT-001".to_string())
+}
+
+// shortcut: the auth helpers below read per call because they have no AppState and
+// tests switch these values at runtime; pass them through state once auth takes it.
+
+/// Comma-separated legacy admin email allowlist (`ADMIN_EMAILS`), empty when unset.
+pub fn admin_emails() -> String {
+    env::var("ADMIN_EMAILS").unwrap_or_default()
+}
+
+/// SIS capability origin (`SIS_ACCESS_ORIGIN`), unvalidated.
+pub fn sis_access_origin() -> Option<String> {
+    env::var("SIS_ACCESS_ORIGIN").ok()
+}
+
+/// A graph setting for the read-only connection check, which runs before `load()`.
+pub fn graph_setting(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 /// Staff credentials use a key distinct from legacy parent sessions. Missing

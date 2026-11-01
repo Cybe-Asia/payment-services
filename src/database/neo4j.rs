@@ -40,10 +40,7 @@ fn safe_failure(stage: &'static str, error: neo4rs::Error) -> GraphCheckFailure 
 }
 
 fn configured_value(name: &str) -> Result<String, GraphCheckFailure> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or(GraphCheckFailure {
+    crate::config::config::graph_setting(name).ok_or(GraphCheckFailure {
             stage: "config",
             category: "config",
             io_kind: None,

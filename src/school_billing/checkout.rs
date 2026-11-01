@@ -23,8 +23,8 @@ pub struct Checkout {
     pub expires_at: String,
 }
 
-fn return_url(invoice: &str) -> Option<String> {
-    let base = std::env::var("SCHOOL_BILLING_RETURN_URL").ok()?;
+fn return_url(base: Option<&str>, invoice: &str) -> Option<String> {
+    let base = base?;
     if !base.starts_with("https://") && !base.starts_with("http://localhost") {
         return None;
     }
@@ -69,7 +69,7 @@ pub async fn start(
             ))
         }
     }
-    let Some(return_url) = return_url(id).filter(|_| state.doku.configured()) else {
+    let Some(return_url) = return_url(state.school_billing_return_url.as_deref(), id).filter(|_| state.doku.configured()) else {
         return Err(super::coded(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "NOT_CONFIGURED",
@@ -340,11 +340,9 @@ mod tests {
                 "https://p.test/parent?paidInvoice=SINV-1",
             ),
         ] {
-            std::env::set_var("SCHOOL_BILLING_RETURN_URL", base);
-            assert_eq!(super::return_url("SINV-1").as_deref(), Some(want));
+            assert_eq!(super::return_url(Some(base), "SINV-1").as_deref(), Some(want));
         }
-        std::env::set_var("SCHOOL_BILLING_RETURN_URL", "http://evil.test/");
-        assert!(super::return_url("SINV-1").is_none());
-        std::env::remove_var("SCHOOL_BILLING_RETURN_URL");
+        assert!(super::return_url(Some("http://evil.test/"), "SINV-1").is_none());
+        assert!(super::return_url(None, "SINV-1").is_none());
     }
 }

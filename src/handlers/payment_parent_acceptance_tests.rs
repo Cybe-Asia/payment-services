@@ -63,6 +63,8 @@ async fn parent_manual_payment_http_saved_retry_and_revocation() {
         notification_internal_token: None,
         frontend_url: "http://127.0.0.1".into(),
         minio: None,
+        invoice_email_enabled: false,
+        school_billing_return_url: None,
         payment_settings_seed:
             crate::repositories::payment_settings_repository::PaymentSettingsSeed {
                 tenant_id: tenant.clone(),

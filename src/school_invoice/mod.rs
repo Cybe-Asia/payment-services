@@ -3,7 +3,7 @@
 pub(crate) mod auth;
 mod documents;
 #[cfg(test)]
-mod http_acceptance;
+mod http_acceptance_tests;
 pub mod model;
 mod parent_authority;
 pub(crate) mod payee;

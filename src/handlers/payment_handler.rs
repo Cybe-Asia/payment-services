@@ -2129,5 +2129,5 @@ fn school_label(school: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "payment_parent_acceptance.rs"]
+#[path = "payment_parent_acceptance_tests.rs"]
 mod parent_acceptance;

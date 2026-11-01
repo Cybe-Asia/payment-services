@@ -51,7 +51,7 @@ pub fn load() -> Config {
     let server_port = env::var("SERVER_PORT")
         .unwrap_or_else(|_| "8085".to_string())
         .parse()
-        .unwrap();
+        .expect("SERVER_PORT must be a port number");
     let neo4j_uri = env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://neo4j:7687".to_string());
     let neo4j_user = env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
     let neo4j_password = env::var("NEO4J_PASSWORD").expect("NEO4J_PASSWORD must be set");

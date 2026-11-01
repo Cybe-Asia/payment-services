@@ -24,7 +24,7 @@ use crate::services::payment_document::{
 };
 use crate::services::payment_service::{self, PaymentContext, ReviewManualPaymentRequest};
 use crate::utils::auth;
-use crate::utils::response::ApiResponse;
+use crate::utils::response::{fail, ok};
 use crate::AppState;
 
 #[derive(Serialize, ToSchema)]
@@ -98,10 +98,7 @@ pub async fn create_doku_checkout_handler(
     )
     .await
     {
-        Ok(outcome) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(outcome)).unwrap()),
-        ),
+        Ok(outcome) => ok(outcome),
         Err(message) => {
             let status = if message.contains("not found") {
                 StatusCode::NOT_FOUND
@@ -141,10 +138,7 @@ pub async fn get_offer_payment_methods_handler(
     )
     .await
     {
-        Ok(settings) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
-        ),
+        Ok(settings) => ok(settings),
         Err(message) if message.contains("not found") => fail(StatusCode::NOT_FOUND, &message),
         Err(message) => fail(StatusCode::CONFLICT, &message),
     }
@@ -171,10 +165,7 @@ pub async fn get_offer_manual_payment_methods_handler(
     )
     .await
     {
-        Ok(settings) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
-        ),
+        Ok(settings) => ok(settings),
         Err(message) => {
             let status = if message.contains("not found") {
                 StatusCode::NOT_FOUND
@@ -217,10 +208,7 @@ pub async fn create_offer_manual_payment_handler(
                 payment: outcome.payment,
                 settings: outcome.settings,
             };
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(ApiResponse::success(data)).unwrap()),
-            )
+            ok(data)
         }
         Err(message) => {
             let status = if message.contains("not found") {
@@ -331,10 +319,7 @@ pub async fn reconcile_doku_payment_handler(
     )
     .await
     {
-        Ok(payment) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(payment)).unwrap()),
-        ),
+        Ok(payment) => ok(payment),
         Err(message) if message.contains("not found") => fail(StatusCode::NOT_FOUND, &message),
         Err(message) if message.contains("mismatch") || message.contains("missing") => {
             fail(StatusCode::CONFLICT, &message)
@@ -397,10 +382,7 @@ pub async fn create_invoice_handler(
                 currency: outcome.currency,
                 expires_at: outcome.expires_at,
             };
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(ApiResponse::success(data)).unwrap()),
-            )
+            ok(data)
         }
         Err(e) => {
             error!("create_invoice failed: {e}");
@@ -475,10 +457,7 @@ pub async fn create_manual_payment_handler(
                 payment: outcome.payment,
                 settings: outcome.settings,
             };
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(ApiResponse::success(data)).unwrap()),
-            )
+            ok(data)
         }
         Err(e) => {
             error!("create_manual_payment failed: {e}");
@@ -706,10 +685,7 @@ async fn process_manual_proof_upload(
     };
 
     match payment_service::record_manual_proof(graph, input).await {
-        Ok(proof) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(proof)).unwrap()),
-        ),
+        Ok(proof) => ok(proof),
         Err(e) => {
             let _ = minio.delete_object(&object_key).await;
             error!("record_manual_proof failed: {e}");
@@ -783,10 +759,7 @@ pub async fn admin_payable_offers_handler(
         Err((status, msg)) => return fail(status, &msg),
     }
     match payment_service::list_payable_offers(&graph, &state.tenant_id, &lead_id).await {
-        Ok(offers) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(offers)).unwrap()),
-        ),
+        Ok(offers) => ok(offers),
         Err(e) => {
             error!("admin_payable_offers failed: {e}");
             fail(
@@ -858,10 +831,7 @@ pub async fn admin_assist_offer_manual_payment_handler(
                 payment: outcome.payment,
                 settings: outcome.settings,
             };
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(ApiResponse::success(data)).unwrap()),
-            )
+            ok(data)
         }
         Err(message) => fail(offer_payment_error_status(&message), &message),
     }
@@ -922,10 +892,7 @@ pub async fn admin_assist_manual_payment_handler(
                 payment: outcome.payment,
                 settings: outcome.settings,
             };
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(ApiResponse::success(data)).unwrap()),
-            )
+            ok(data)
         }
         Err(e) => {
             error!("assisted create_manual_payment failed: {e}");
@@ -1098,10 +1065,7 @@ pub async fn preview_invoice_handler(
     )
     .await
     {
-        Ok(preview) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(preview)).unwrap()),
-        ),
+        Ok(preview) => ok(preview),
         Err(e) => {
             error!("preview_invoice failed: {e}");
             let status = if e.contains("not found") {
@@ -1144,10 +1108,7 @@ pub async fn get_payment_handler(
             if p.status == "paid" {
                 queue_payment_status_notification(&state, &graph, &p, "payment_approved").await;
             }
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(ApiResponse::success(p)).unwrap()),
-            )
+            ok(p)
         }
         Ok(_) => fail(StatusCode::NOT_FOUND, "Payment not found"),
         Err(_) => fail(StatusCode::SERVICE_UNAVAILABLE, "Payment unavailable"),
@@ -1266,10 +1227,7 @@ pub async fn get_payment_settings_handler(
                 settings.qris_image_url.clear();
                 settings.manual_bank_accounts.clear();
             }
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
-            )
+            ok(settings)
         }
         Err(e) => {
             error!("get_payment_settings failed: {e}");
@@ -1289,10 +1247,7 @@ pub async fn admin_get_payment_settings_handler(
         return fail(status, &msg);
     }
     match payment_service::get_payment_settings(&graph, &state.payment_settings_seed).await {
-        Ok(settings) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
-        ),
+        Ok(settings) => ok(settings),
         Err(e) => {
             error!("admin_get_payment_settings failed: {e}");
             fail(StatusCode::INTERNAL_SERVER_ERROR, &e)
@@ -1328,10 +1283,7 @@ pub async fn admin_update_payment_settings_handler(
                 "payment_settings",
                 "default".to_string(),
             );
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(ApiResponse::success(settings)).unwrap()),
-            )
+            ok(settings)
         }
         Err(e) => {
             error!("admin_update_payment_settings failed: {e}");
@@ -1424,10 +1376,7 @@ pub async fn admin_payment_reviews_handler(
     match payment_service::list_manual_review_rows(&graph, &state.tenant_id, filters, limit, offset)
         .await
     {
-        Ok(payload) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(payload)).unwrap()),
-        ),
+        Ok(payload) => ok(payload),
         Err(e) => {
             error!("admin_payment_reviews failed: {e}");
             fail(StatusCode::INTERNAL_SERVER_ERROR, &e)
@@ -1459,10 +1408,7 @@ pub async fn admin_payment_review_detail_handler(
         return fail(status, &msg);
     }
     match payment_service::get_manual_review_detail(&graph, &state.tenant_id, &payment_id).await {
-        Ok(Some(detail)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(ApiResponse::success(detail)).unwrap()),
-        ),
+        Ok(Some(detail)) => ok(detail),
         Ok(None) => fail(StatusCode::NOT_FOUND, "Payment not found"),
         Err(e) => {
             error!("admin_payment_review_detail failed: {e}");
@@ -1511,10 +1457,7 @@ pub async fn admin_review_manual_payment_handler(
             );
             queue_payment_review_notification(&state, &graph, &payment, &decision).await;
             queue_staff_review_notification(&state, &graph, &payment, &decision).await;
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(ApiResponse::success(payment)).unwrap()),
-            )
+            ok(payment)
         }
         Err(e) => {
             error!("admin_review_manual_payment failed: {e}");
@@ -1699,12 +1642,6 @@ pub async fn xendit_webhook_handler(
     }
 }
 
-fn fail(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
-    let body: ApiResponse<serde_json::Value> = ApiResponse::<serde_json::Value>::error(msg);
-    let mut value = serde_json::to_value(body).unwrap();
-    value["responseCode"] = serde_json::json!(status.as_u16());
-    (status, Json(value))
-}
 
 async fn queue_payment_review_notification(
     state: &AppState,

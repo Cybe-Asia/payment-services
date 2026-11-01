@@ -1,4 +1,6 @@
+use axum::{http::StatusCode, Json};
 use serde::Serialize;
+use serde_json::{json, Value};
 use utoipa::ToSchema;
 
 #[derive(Serialize, ToSchema)]
@@ -22,12 +24,25 @@ impl<T: Serialize> ApiResponse<T> {
             data: Some(data),
         }
     }
-    pub fn error<E: AsRef<str>>(err: E) -> ApiResponse<serde_json::Value> {
-        ApiResponse {
-            response_code: 0,
-            response_message: "failed".to_string(),
-            response_error: Some(err.as_ref().to_string()),
-            data: None,
+}
+
+/// 200 with `data` in the standard envelope; a value that cannot be encoded is a 500.
+pub fn ok<T: Serialize>(data: T) -> (StatusCode, Json<Value>) {
+    match serde_json::to_value(ApiResponse::success(data)) {
+        Ok(value) => (StatusCode::OK, Json(value)),
+        Err(error) => {
+            tracing::error!("response encoding failed: {error}");
+            fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
         }
     }
+}
+
+/// The standard failure envelope with `responseCode` set to the HTTP status.
+pub fn fail(status: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
+    let body = json!({
+        "responseCode": status.as_u16(),
+        "responseMessage": "failed",
+        "responseError": msg,
+    });
+    (status, Json(body))
 }

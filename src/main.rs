@@ -104,7 +104,7 @@ async fn health_check() -> axum::response::Json<serde_json::Value> {
 async fn main() {
     load_env();
     fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().expect("static log directive")))
         .init();
 
     // Read-only connection diagnosis takes precedence over every other run mode.
@@ -330,8 +330,12 @@ async fn main() {
     let server_host = std::env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let addr = format!("{}:{}", server_host, cfg.server_port);
     info!("starting payment-service on {}", addr);
-    let listener = TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = TcpListener::bind(addr)
+        .await
+        .expect("payment-service could not bind its listen address");
+    axum::serve(listener, app)
+        .await
+        .expect("payment-service server stopped");
 }
 
 #[cfg(test)]

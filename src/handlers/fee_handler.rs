@@ -11,7 +11,7 @@ use crate::dto::update_fee_request::UpdateFeeRequest;
 use crate::repositories::school_repository::SchoolLookupError;
 use crate::repositories::{fee_structure_repository, school_repository};
 use crate::utils::auth;
-use crate::utils::response::ApiResponse;
+use crate::utils::response::{fail, ok};
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -149,16 +149,4 @@ pub async fn update_fee_handler(
     }
 }
 
-fn ok<T: serde::Serialize>(data: T) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(ApiResponse::success(data)).unwrap()),
-    )
-}
 
-fn fail(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
-    let body: ApiResponse<serde_json::Value> = ApiResponse::<serde_json::Value>::error(msg);
-    let mut value = serde_json::to_value(body).unwrap();
-    value["responseCode"] = serde_json::json!(status.as_u16());
-    (status, Json(value))
-}

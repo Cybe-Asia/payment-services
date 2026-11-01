@@ -1,13 +1,13 @@
 {
   "files": {
-    "src/main.rs": "d550b87385398897077d62d559f83615992c2218837fdaba95b1c2e9aca638da",
+    "src/main.rs": "b1169cd5b179440acab397cc44b293e37bf2d1931a3a3239846464c54d42baf6",
     "src/dto/webhook.rs": "fd0ecc055cc9ae238377a61b68dad79b21fda7ce0e5cf48360d741334822ed34",
     "src/dto/update_fee_request.rs": "1259cccea40f2dfd65b36984b9f799f456caeffe041144ede8766c0dd4709304",
     "src/dto/mod.rs": "87db35353025e58794a8a9bd53425cefc7efca351e6f943a578610ebc1e03192",
     "src/dto/create_invoice_request.rs": "39fd1da38ac49dbcbb98d811df3051c275588ca8a5615e6c033d99262f4ad393",
-    "src/clients/doku.rs": "05a6f1d0b2bd13bf9ca5efdd2bdfd56d95b7ea3394f4e1bd4ec51c533bc5e6cf",
-    "src/clients/xendit.rs": "510fa51e02a0492cb504559690804537c62f6b7dab80cb4e709cdce6ac23d5d5",
-    "src/clients/mod.rs": "e6a1c9567c6d1eea47b3f75bb901200ca9d9af2917108c266712db5803c4b7d4",
+    "src/clients/doku.rs": "843fc2662c487d0eb83fb339648a45f9ed66b0331b5394fcb8859d1f62efcf60",
+    "src/clients/xendit.rs": "375fce04aea660eb4af2091994f37f66be997995fff9d95307f0e3e782fa049a",
+    "src/clients/mod.rs": "97f76dac61aadc7c60e07c4c63e4255f3fe6d922a4d84aa1ebda747d42ecd6a6",
     "src/clients/minio.rs": "e6bb1db2508438d2978accdea4cb64764206e3701646cb0ce1c049724ddb9114",
     "src/database/neo4j.rs": "f2240a3ac84286df2734dc6c7a34acbbf083b08b1e1084508fe162dd52c97ae3",
     "src/database/mod.rs": "182b9f59c6a176bcf3ccafa42aa28cbc84535b0aac5c66e746ad892a18c337e2",

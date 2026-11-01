@@ -74,7 +74,7 @@ impl DokuClient {
         payment_method_types: Vec<String>,
     ) -> Self {
         Self {
-            http: super::provider_http_client(),
+            http: super::outbound_http_client(),
             api_url: api_url.trim_end_matches('/').to_string(),
             client_id: client_id.to_string(),
             secret_key: secret_key.to_string(),

@@ -21,7 +21,7 @@ impl XenditClient {
         failure_redirect_url: &str,
     ) -> Self {
         Self {
-            http: super::provider_http_client(),
+            http: super::outbound_http_client(),
             api_url: api_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             success_redirect_url: success_redirect_url.to_string(),

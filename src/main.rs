@@ -268,7 +268,7 @@ async fn main() {
         doku_client_id: cfg.doku_client_id.clone(),
         doku_secret_key: cfg.doku_secret_key.clone(),
         legacy_parent_payments_enabled: cfg.legacy_parent_payments_enabled,
-        http_client: reqwest::Client::new(),
+        http_client: clients::outbound_http_client(),
         tenant_id: cfg.tenant_id.clone(),
         xendit_webhook_token: cfg.xendit_webhook_token.clone(),
         default_currency: cfg.default_fee_currency.clone(),

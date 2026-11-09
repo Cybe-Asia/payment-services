@@ -1634,14 +1634,20 @@ async fn cascade_students_on_enrolment_paid(graph: &Graph, lead_id: &str) {
     }
 }
 
-async fn cascade_students_to_test_pending(graph: &Graph, lead_id: &str) {
+/// Unlocks the entrance test only for the children the paid invoice priced:
+/// the fee counts the Lead's children when the Payment is created, so a
+/// child added later is not covered by it.
+async fn cascade_students_to_test_pending(graph: &Graph, lead_id: &str, payment_id: &str) {
     let q = Query::new(
-        "MATCH (:Lead {lead_id:$lead_id})-[:HAS_STUDENT]->(s:Student) \
+        "MATCH (p:Payment {payment_id:$payment_id}) \
+         MATCH (:Lead {lead_id:$lead_id})-[:HAS_STUDENT]->(s:Student) \
          WHERE coalesce(s.applicantStatus, 'submitted') = 'submitted' \
+           AND coalesce(s.createdAt, p.created_at) <= p.created_at \
          SET s.applicantStatus = 'test_pending', s.updatedAt = datetime()"
             .to_string(),
     )
-    .param("lead_id", lead_id.to_string());
+    .param("lead_id", lead_id.to_string())
+    .param("payment_id", payment_id.to_string());
     if let Err(e) = graph.run(q).await {
         warn!(lead_id=%lead_id, error=%e, "failed to cascade students to test_pending");
     } else {
@@ -1886,7 +1892,8 @@ pub async fn fetch_payment_refreshed(
                                         "application_fee_paid",
                                     )
                                     .await;
-                                    cascade_students_to_test_pending(graph, lead_id).await;
+                                    cascade_students_to_test_pending(graph, lead_id, payment_id)
+                                        .await;
                                 }
                                 "enrolment_fee" => {
                                     set_application_status_for_lead(
@@ -1971,7 +1978,7 @@ pub async fn handle_webhook(
                             "application_fee_paid",
                         )
                         .await;
-                        cascade_students_to_test_pending(graph, lead_id).await;
+                        cascade_students_to_test_pending(graph, lead_id, payment_id).await;
                     }
                     "enrolment_fee" => {
                         set_application_status_for_lead(graph, lead_id, "offer_stage", "completed")
@@ -2017,7 +2024,7 @@ async fn apply_paid_side_effects(graph: &Graph, payment: &Payment) -> Result<(),
                     "application_fee_paid",
                 )
                 .await;
-                cascade_students_to_test_pending(graph, lead_id).await;
+                cascade_students_to_test_pending(graph, lead_id, &payment.payment_id).await;
             }
             "enrolment_fee" => {
                 set_application_status_for_lead(graph, lead_id, "offer_stage", "completed").await;
@@ -2388,6 +2395,61 @@ mod tests {
         assert!(
             select_promotion(0, vec![from("discount_code", "HEMAT10", "percent", 10)]).is_none()
         );
+    }
+
+    // P2-16: a paid application fee unlocks only the children it priced.
+    #[tokio::test]
+    #[ignore = "requires disposable ADMISSIONS_TEST_NEO4J_URI"]
+    async fn application_fee_unlocks_only_the_children_it_priced() {
+        let graph = neo4rs::Graph::new(
+            std::env::var("ADMISSIONS_TEST_NEO4J_URI").unwrap().as_str(),
+            "neo4j",
+            "test",
+        )
+        .await
+        .unwrap();
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let lead = format!("LEAD-fee-{run}");
+        let pay = format!("PAY-fee-{run}");
+        graph
+            .run(
+                neo4rs::query(
+                    "CREATE (l:Lead {lead_id:$lead}) \
+                     CREATE (l)-[:HAS_STUDENT]->(:Student {studentId:$a, applicantStatus:'submitted', createdAt:datetime() - duration('PT1H')}) \
+                     CREATE (:Payment {payment_id:$pay, created_at:datetime() - duration('PT30M')}) \
+                     CREATE (l)-[:HAS_STUDENT]->(:Student {studentId:$b, applicantStatus:'submitted', createdAt:datetime()})",
+                )
+                .param("lead", lead.clone())
+                .param("pay", pay.clone())
+                .param("a", format!("STU-a-{run}"))
+                .param("b", format!("STU-b-{run}")),
+            )
+            .await
+            .unwrap();
+        super::cascade_students_to_test_pending(&graph, &lead, &pay).await;
+        let mut rows = graph
+            .execute(
+                neo4rs::query(
+                    "MATCH (:Lead {lead_id:$lead})-[:HAS_STUDENT]->(s) RETURN s.studentId AS id, s.applicantStatus AS st ORDER BY id",
+                )
+                .param("lead", lead.clone()),
+            )
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        while let Some(r) = rows.next().await.unwrap() {
+            got.push(r.get::<String>("st").unwrap());
+        }
+        assert_eq!(got, ["test_pending", "submitted"]);
+        graph
+            .run(
+                neo4rs::query("MATCH (n) WHERE n.lead_id = $lead OR n.payment_id = $pay OR n.studentId ENDS WITH $run DETACH DELETE n")
+                    .param("lead", lead)
+                    .param("pay", pay)
+                    .param("run", run),
+            )
+            .await
+            .unwrap();
     }
 }
 

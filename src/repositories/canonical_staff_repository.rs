@@ -58,16 +58,13 @@ pub async fn sole_member(graph: &Graph, user_id: &str) -> Result<Option<String>,
 }
 
 pub async fn resolve_staff(graph: &Graph, user_id: &str) -> Result<CanonicalStaff, ServiceError> {
-    let lookup = if user_id.starts_with("LEAD-") {
-        LOOKUP.replace(
-            "MATCH (u:User {id:$userId})",
-            "MATCH (u:User)-[:HAS_APPLICATION]->(:Lead {lead_id:$userId}) MATCH (u)",
-        )
-    } else {
-        LOOKUP.to_string()
-    };
+    // A lead session is an applicant, never a staff identity, even when the
+    // lead is linked to a staff member's User.
+    if user_id.starts_with("LEAD-") {
+        return Ok(CanonicalStaff::NotLinked);
+    }
     let mut rows = graph
-        .execute(query(&lookup).param("userId", user_id.to_string()))
+        .execute(query(LOOKUP).param("userId", user_id.to_string()))
         .await
         .map_err(|_| "Staff authorization unavailable".to_string())?;
     let Some(row) = rows
@@ -290,7 +287,7 @@ mod tests {
         graph.run(query("MATCH (u:User {id:$id}) CREATE (u)-[:HAS_APPLICATION]->(:Lead {lead_id:$lead})").param("id",user.clone()).param("lead",lead.clone())).await.unwrap();
         assert_eq!(
             resolve_admin(&graph, &lead).await.unwrap(),
-            CanonicalAdmin::Owner(user.clone())
+            CanonicalAdmin::NotLinked
         );
         for (status, roles, tenants, schools) in [
             ("SUSPENDED", vec!["owner"], vec![], vec![]),
@@ -310,7 +307,7 @@ mod tests {
             );
             assert_eq!(
                 resolve_admin(&graph, &lead).await.unwrap(),
-                CanonicalAdmin::Denied
+                CanonicalAdmin::NotLinked
             );
         }
         graph.run(query("MATCH (u:User {id:$id}) CREATE (u)-[:STAFF_MEMBER]->(:StaffMember {id:$id,membershipStatus:'ACTIVE',roles:['owner']})").param("id",user.clone())).await.unwrap();

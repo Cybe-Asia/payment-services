@@ -519,7 +519,13 @@ fn staff_claims_from_bearer(
     let header = jsonwebtoken::decode_header(&token)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid bearer".into()))?;
     if header.typ.as_deref() != Some("staff-api+jwt") {
-        return claims_from_bearer(headers, parent_secret);
+        let claims = claims_from_bearer(headers, parent_secret)?;
+        // A lead session is an applicant: its Lead.email is typed and
+        // unproven, so it never reaches the email allowlist or staff roles.
+        if claims.sub.starts_with("LEAD-") {
+            return Err((StatusCode::FORBIDDEN, "Staff access required".into()));
+        }
+        return Ok(claims);
     }
     let (key, issuer) = crate::config::config::staff_downstream_settings(parent_secret)
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.into_public()))?;
@@ -577,7 +583,7 @@ async fn resolve_owned_leads(
     if claims.sub.starts_with("LEAD-") {
         let q = Query::new(
             "MATCH (seed:Lead {lead_id: $seed}) \
-             OPTIONAL MATCH (u:User) WHERE toLower(u.email) = toLower(seed.email) \
+             OPTIONAL MATCH (u:User)-[:HAS_APPLICATION]->(seed) \
              OPTIONAL MATCH (u)-[:HAS_APPLICATION]->(l:Lead) \
              WITH seed, collect(DISTINCT l.lead_id) AS linked \
              RETURN seed.email AS email, \

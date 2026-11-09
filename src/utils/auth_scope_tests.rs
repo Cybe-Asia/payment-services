@@ -281,3 +281,82 @@ async fn legacy_gates_open_by_tenant_capability_only_after_roles_deny() {
         .await
         .unwrap();
 }
+
+fn lead_bearer(lead_id: &str) -> HeaderMap {
+    // Shape of admission's resume/verification token: sub only, no email, no scope.
+    let token = encode(
+        &Header::default(),
+        &serde_json::json!({"sub": lead_id, "exp": chrono::Utc::now().timestamp() + 300}),
+        &EncodingKey::from_secret(KEY.as_bytes()),
+    )
+    .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    headers
+}
+
+#[tokio::test]
+#[ignore = "requires disposable ADMISSIONS_TEST_NEO4J_URI"]
+async fn lead_sessions_own_their_lead_only_and_are_never_staff() {
+    use super::auth::{require_admin, require_finance, require_parent_auth};
+    let graph = Graph::new(
+        std::env::var("ADMISSIONS_TEST_NEO4J_URI").unwrap().as_str(),
+        "neo4j",
+        "test",
+    )
+    .await
+    .unwrap();
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let victim = format!("victim-{run}@example.test");
+    let staff = format!("staff-{run}@example.test");
+    graph
+        .run(
+            query(
+                "CREATE (:User {id:'u-'+$run, email:$victim})-[:HAS_APPLICATION]->(:Lead {lead_id:'LEAD-V-'+$run, email:$victim}) \
+                 CREATE (:Lead {lead_id:'LEAD-S-'+$run, email:toUpper($victim), status:'new'}) \
+                 CREATE (:User {id:'f-'+$run, email:$staff, marketingRoles:['finance_approver', 'owner']}) \
+                 CREATE (:Lead {lead_id:'LEAD-F-'+$run, email:$staff, status:'new'}) \
+                 CREATE (o:User {id:'o-'+$run, email:'o-'+$run+'@example.test'})-[:STAFF_MEMBER]->(:StaffMember {id:'o-'+$run, membershipStatus:'ACTIVE', roles:['owner'], tenantIds:[], schoolIds:[], teamIds:[]}) \
+                 CREATE (o)-[:HAS_APPLICATION]->(:Lead {lead_id:'LEAD-O-'+$run, email:'o-'+$run+'@example.test'})",
+            )
+            .param("run", run.clone())
+            .param("victim", victim)
+            .param("staff", staff),
+        )
+        .await
+        .unwrap();
+
+    // P1-3: a lead that only shares the email owns itself, not the family.
+    let parent = require_parent_auth(&graph, &lead_bearer(&format!("LEAD-S-{run}")), KEY)
+        .await
+        .unwrap();
+    assert_eq!(parent.lead_ids, vec![format!("LEAD-S-{run}")]);
+
+    // P1-8: a lead session never reaches a staff gate, whatever Lead.email
+    // names or whichever User the lead is linked to.
+    for lead in [format!("LEAD-F-{run}"), format!("LEAD-O-{run}")] {
+        let h = lead_bearer(&lead);
+        assert_eq!(
+            require_admin(&graph, &h, KEY).await.unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            require_staff(&graph, &h, KEY).await.unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        for approve in [false, true] {
+            assert_eq!(
+                require_finance(&graph, &h, KEY, approve)
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
+    graph
+        .run(query("MATCH (n) WHERE (n:Lead AND n.lead_id ENDS WITH $run) OR ((n:User OR n:StaffMember) AND n.id ENDS WITH $run) DETACH DELETE n").param("run", run))
+        .await
+        .unwrap();
+}

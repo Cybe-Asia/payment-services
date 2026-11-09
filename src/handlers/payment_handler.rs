@@ -2060,7 +2060,7 @@ fn display_or_parent(value: &str) -> String {
     }
 }
 
-fn format_idr(value: i64) -> String {
+pub(crate) fn format_idr(value: i64) -> String {
     let mut digits = value.abs().to_string();
     let mut groups = Vec::new();
     while digits.len() > 3 {

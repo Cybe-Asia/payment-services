@@ -128,6 +128,26 @@ impl Review {
             && matches!(self.decision.as_str(), "approve" | "reject")
             && text(&self.note, 512)
     }
+    /// The note the Parent inbox shows for this decision (ADR 0004 row 6):
+    /// title and body, in the inbox's language (English).
+    pub fn parent_message(&self, s: &Snapshot, receipt: &str) -> (String, String) {
+        let amount = crate::handlers::payment_handler::format_idr(s.amount);
+        let what = format!("{} for {}", s.description, s.student_name);
+        if self.decision == "approve" {
+            return (
+                "Payment received".into(),
+                format!("Finance confirmed {amount} for {what}. Receipt {receipt}."),
+            );
+        }
+        let note = match self.note.trim() {
+            "" => String::new(),
+            n => format!(" Finance's note: \"{n}\"."),
+        };
+        (
+            "Payment proof not accepted".into(),
+            format!("Finance could not accept the transfer proof of {amount} for {what}.{note} Please upload a new proof from the Payment tab."),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -192,6 +212,35 @@ mod tests {
         i.due_date = "2026-10-10".into();
         i.period.clear();
         assert!(!i.valid());
+    }
+    #[test]
+    fn parent_message_names_the_bill_child_amount_and_decision() {
+        let raw = serde_json::json!({"contractVersion":1,"id":"SINV-a","tenantId":"t","schoolId":"s","schoolCode":"IISS","payeeName":"School","studentId":"c","enrolledStudentId":"e","studentName":"Aisha","payerUserId":"u","payerName":"Parent","period":"Top Up","description":"Student Credit — Top Up","amount":500000,"currency":"IDR","dueDate":"2026-11-09","bank":{"id":"b","bankName":"Bank","accountName":"School","accountNumber":"0000"},"payeeVersion":1,"issuedAt":"2026-11-09T00:00:00Z"});
+        let snapshot: Snapshot = serde_json::from_value(raw).unwrap();
+        let review = |decision: &str, note: &str| Review {
+            version: 1,
+            proof_id: "p".into(),
+            decision: decision.into(),
+            note: note.into(),
+        };
+        let (title, body) = review("approve", "").parent_message(&snapshot, "SRCPT-1");
+        assert_eq!(title, "Payment received");
+        assert_eq!(
+            body,
+            "Finance confirmed Rp 500.000 for Student Credit — Top Up for Aisha. Receipt SRCPT-1."
+        );
+        let (title, body) =
+            review("reject", " Amount differs ").parent_message(&snapshot, "SRCPT-1");
+        assert_eq!(title, "Payment proof not accepted");
+        assert!(
+            body.contains("Rp 500.000")
+                && body.contains("Finance's note: \"Amount differs\".")
+                && body.ends_with("from the Payment tab.")
+        );
+        assert!(!review("reject", "")
+            .parent_message(&snapshot, "x")
+            .1
+            .contains("note"));
     }
     #[test]
     fn unknown_scope_and_roles_rejected() {

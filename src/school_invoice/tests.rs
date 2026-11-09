@@ -442,6 +442,19 @@ async fn current_family_scope_issuance_cas_and_separate_settlement() {
         repo::review(&g, &finance, &inv.snapshot.id, &decision)
     );
     assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    // Each committed decision leaves exactly one Parent inbox note; refused
+    // and racing reviews leave none.
+    let mut notes = g
+        .execute(query("MATCH(:Lead {lead_id:$lead})-[:HAS_MESSAGE]->(m:Message) RETURN m.title AS title,m.category AS category,m.is_read AS read ORDER BY m.created_at").param("lead", format!("LEAD-{mark}")))
+        .await
+        .unwrap();
+    let mut titles = Vec::new();
+    while let Some(row) = notes.next().await.unwrap() {
+        assert_eq!(row.get::<String>("category").as_deref(), Some("school"));
+        assert_eq!(row.get::<bool>("read"), Some(false));
+        titles.push(row.get::<String>("title").unwrap());
+    }
+    assert_eq!(titles, ["Payment proof not accepted", "Payment received"]);
     assert_eq!(
         repo::parent(&g, &parent, &inv.snapshot.id)
             .await
@@ -478,7 +491,7 @@ async fn current_family_scope_issuance_cas_and_separate_settlement() {
         Err(repo::Error::Denied)
     ));
     // Clean only this test's newly created nodes, not any retained acceptance graph.
-    g.run(query("MATCH(n) WHERE n.billing_test=$mark OR (n:SchoolInvoice AND n.tenant_id=$tenant) OR (n:SchoolBillingPayee AND n.tenant_id=$tenant) OR ((n:SchoolInvoiceAudit OR n:SchoolInvoiceProof OR n:SchoolInvoiceSettlement) AND (n.invoice_id=$invoice OR n.tenant_id=$tenant)) DETACH DELETE n").param("mark",mark).param("tenant",tenant).param("invoice",inv.snapshot.id.clone())).await.unwrap();
+    g.run(query("MATCH(n) WHERE n.billing_test=$mark OR (n:SchoolInvoice AND n.tenant_id=$tenant) OR ((n:SchoolBillingPayee OR n:Message) AND n.tenant_id=$tenant) OR ((n:SchoolInvoiceAudit OR n:SchoolInvoiceProof OR n:SchoolInvoiceSettlement) AND (n.invoice_id=$invoice OR n.tenant_id=$tenant)) DETACH DELETE n").param("mark",mark).param("tenant",tenant).param("invoice",inv.snapshot.id.clone())).await.unwrap();
 }
 
 #[tokio::test]

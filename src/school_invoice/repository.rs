@@ -544,7 +544,7 @@ pub async fn review(graph: &Graph, a: &auth::Staff, id: &str, input: &Review) ->
     } else {
         "rejected"
     };
-    let body=format!("MATCH(i:SchoolInvoice {{id:$id}}) SET i._lock=coalesce(i._lock,0)+1 WITH i MATCH(i)-[:HAS_PROOF]->(p:SchoolInvoiceProof {{id:$proof}}) SET p._lock=coalesce(p._lock,0)+1 WITH i,p {} WITH actor,i,p WHERE {} AND i.version=$version AND i.status='pending_verification' AND p.status='submitted' SET p.status=$status,p.reviewed_by=actor.id,p.review_note=$note,p.reviewed_at=datetime(),i.status=$status,i.version=i.version+1 FOREACH(_ IN CASE WHEN $status='paid' THEN [1] ELSE [] END | CREATE(:SchoolInvoiceSettlement {{invoice_id:i.id,id:$settlement,proof_id:p.id,amount:$amount,currency:'IDR',verified_by:actor.id,created_at:datetime()}}) SET i.paid_at=toString(datetime()),i.receipt_ref=$receipt) CREATE(:SchoolInvoiceAudit {{id:$audit,invoice_id:i.id,actor_id:actor.id,action:$action,proof_id:p.id,version:i.version,note:$note,created_at:datetime()}}) {RETURN}",auth::fresh("i,p"),auth::scope("i.school_id","i.tenant_id"));
+    let body=format!("MATCH(i:SchoolInvoice {{id:$id}}) SET i._lock=coalesce(i._lock,0)+1 WITH i MATCH(i)-[:HAS_PROOF]->(p:SchoolInvoiceProof {{id:$proof}}) SET p._lock=coalesce(p._lock,0)+1 WITH i,p {} WITH actor,i,p WHERE {} AND i.version=$version AND i.status='pending_verification' AND p.status='submitted' SET p.status=$status,p.reviewed_by=actor.id,p.review_note=$note,p.reviewed_at=datetime(),i.status=$status,i.version=i.version+1 FOREACH(_ IN CASE WHEN $status='paid' THEN [1] ELSE [] END | CREATE(:SchoolInvoiceSettlement {{invoice_id:i.id,id:$settlement,proof_id:p.id,amount:$amount,currency:'IDR',verified_by:actor.id,created_at:datetime()}}) SET i.paid_at=toString(datetime()),i.receipt_ref=$receipt) CREATE(:SchoolInvoiceAudit {{id:$audit,invoice_id:i.id,actor_id:actor.id,action:$action,proof_id:p.id,version:i.version,note:$note,created_at:datetime()}}) WITH i OPTIONAL MATCH(:User {{id:i.payer_user_id}})-[:HAS_APPLICATION]->(l:Lead) WITH i,head(collect(l)) AS lead FOREACH(_ IN CASE WHEN lead IS NULL THEN [] ELSE [1] END | CREATE(lead)-[:HAS_MESSAGE]->(:Message {{message_id:$message,tenant_id:i.tenant_id,title:$message_title,body:$message_body,category:'school',is_read:false,created_at:datetime(),read_at:null}})) {RETURN}",auth::fresh("i,p"),auth::scope("i.school_id","i.tenant_id"));
     let inv = finance(graph, a, id).await?;
     // Only full-value proofs settle this first contract. Partial/overpayment needs
     // an explicit reconciliation model; neither can silently pay the invoice.
@@ -556,15 +556,23 @@ pub async fn review(graph: &Graph, a: &auth::Staff, id: &str, input: &Review) ->
     if input.decision == "approve" && p.amount_submitted != inv.snapshot.amount {
         return Err(Error::Conflict);
     }
+    // The Parent inbox (admission-services `(:Lead)-[:HAS_MESSAGE]->(:Message)`)
+    // is the one Parent notice store; the note commits with the decision. A
+    // payer without a Lead has no inbox, so no note is written.
+    let receipt = format!("SRCPT-{}", uuid::Uuid::new_v4());
+    let (message_title, message_body) = input.parent_message(&inv.snapshot, &receipt);
     let q = staff_query(query(&body), a, true)
         .param("id", id.to_string())
         .param("version", input.version)
+        .param("message", format!("MSG-{}", uuid::Uuid::new_v4()))
+        .param("message_title", message_title)
+        .param("message_body", message_body)
         .param("proof", input.proof_id.clone())
         .param("status", status)
         .param("note", input.note.clone())
         .param("amount", inv.snapshot.amount)
         .param("settlement", format!("SSET-{}", uuid::Uuid::new_v4()))
-        .param("receipt", format!("SRCPT-{}", uuid::Uuid::new_v4()))
+        .param("receipt", receipt)
         .param("audit", uuid::Uuid::new_v4().to_string())
         .param(
             "action",

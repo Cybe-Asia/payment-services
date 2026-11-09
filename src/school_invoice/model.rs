@@ -126,26 +126,28 @@ impl Review {
         self.version >= 1
             && identifier(&self.proof_id)
             && matches!(self.decision.as_str(), "approve" | "reject")
-            && text(&self.note, 512)
+            // A rejection tells the Parent why; an approval needs no note.
+            && (text(&self.note, 512)
+                || (self.decision == "approve" && self.note.trim().is_empty()))
     }
     /// The note the Parent inbox shows for this decision (ADR 0004 row 6):
-    /// title and body, in the inbox's language (English).
+    /// title and body in Indonesian, the Parent portal's language.
     pub fn parent_message(&self, s: &Snapshot, receipt: &str) -> (String, String) {
         let amount = crate::handlers::payment_handler::format_idr(s.amount);
-        let what = format!("{} for {}", s.description, s.student_name);
+        let what = format!("{} ({})", s.description, s.student_name);
         if self.decision == "approve" {
             return (
-                "Payment received".into(),
-                format!("Finance confirmed {amount} for {what}. Receipt {receipt}."),
+                "Pembayaran diterima".into(),
+                format!("Pembayaran {amount} untuk {what} sudah dikonfirmasi sekolah. Kwitansi {receipt}."),
             );
         }
         let note = match self.note.trim() {
             "" => String::new(),
-            n => format!(" Finance's note: \"{n}\"."),
+            n => format!(" Catatan sekolah: \"{n}\"."),
         };
         (
-            "Payment proof not accepted".into(),
-            format!("Finance could not accept the transfer proof of {amount} for {what}.{note} Please upload a new proof from the Payment tab."),
+            "Bukti pembayaran ditolak".into(),
+            format!("Bukti transfer {amount} untuk {what} belum dapat diterima.{note} Silakan unggah bukti baru di menu Pembayaran."),
         )
     }
 }
@@ -224,23 +226,27 @@ mod tests {
             note: note.into(),
         };
         let (title, body) = review("approve", "").parent_message(&snapshot, "SRCPT-1");
-        assert_eq!(title, "Payment received");
+        assert_eq!(title, "Pembayaran diterima");
         assert_eq!(
             body,
-            "Finance confirmed Rp 500.000 for Student Credit — Top Up for Aisha. Receipt SRCPT-1."
+            "Pembayaran Rp 500.000 untuk Student Credit — Top Up (Aisha) sudah dikonfirmasi sekolah. Kwitansi SRCPT-1."
         );
         let (title, body) =
             review("reject", " Amount differs ").parent_message(&snapshot, "SRCPT-1");
-        assert_eq!(title, "Payment proof not accepted");
+        assert_eq!(title, "Bukti pembayaran ditolak");
         assert!(
             body.contains("Rp 500.000")
-                && body.contains("Finance's note: \"Amount differs\".")
-                && body.ends_with("from the Payment tab.")
+                && body.contains("Catatan sekolah: \"Amount differs\".")
+                && body.ends_with("di menu Pembayaran.")
         );
         assert!(!review("reject", "")
             .parent_message(&snapshot, "x")
             .1
-            .contains("note"));
+            .contains("Catatan"));
+        // An approval may carry no note; a rejection must say why.
+        assert!(review("approve", "").valid() && review("approve", " ").valid());
+        assert!(!review("reject", "").valid() && !review("reject", "  ").valid());
+        assert!(review("reject", "Amount differs").valid());
     }
     #[test]
     fn unknown_scope_and_roles_rejected() {

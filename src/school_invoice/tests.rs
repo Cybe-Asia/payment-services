@@ -454,7 +454,7 @@ async fn current_family_scope_issuance_cas_and_separate_settlement() {
         assert_eq!(row.get::<bool>("read"), Some(false));
         titles.push(row.get::<String>("title").unwrap());
     }
-    assert_eq!(titles, ["Payment proof not accepted", "Payment received"]);
+    assert_eq!(titles, ["Bukti pembayaran ditolak", "Pembayaran diterima"]);
     assert_eq!(
         repo::parent(&g, &parent, &inv.snapshot.id)
             .await

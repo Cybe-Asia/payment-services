@@ -61,6 +61,7 @@ async fn parent_manual_payment_http_saved_retry_and_revocation() {
         jwt_secret: secret,
         notification_service_url: "http://127.0.0.1:1".into(),
         notification_internal_token: None,
+        shop_internal_token: None,
         frontend_url: "http://127.0.0.1".into(),
         minio: None,
         invoice_email_enabled: false,

@@ -39,6 +39,9 @@ pub struct Config {
     pub notification_service_url: String,
     /// Sent as `X-Internal-Token` on calls to notification-service when set.
     pub notification_internal_token: Option<String>,
+    /// Shared secret shop-services sends as `X-Internal-Token`; unset or under 32 characters
+    /// keeps the Shop ledger routes closed.
+    pub shop_internal_token: Option<String>,
     pub frontend_url: String,
     pub invoice_email_enabled: bool,
     pub admissions_automation_enabled: bool,
@@ -128,6 +131,10 @@ pub fn load() -> Config {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let shop_internal_token = env::var("SHOP_INTERNAL_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| value.len() >= 32);
     let frontend_url =
         env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
 
@@ -167,6 +174,7 @@ pub fn load() -> Config {
         manual_transfer_instructions,
         notification_service_url,
         notification_internal_token,
+        shop_internal_token,
         frontend_url,
         invoice_email_enabled: env::var("INVOICE_EMAIL_ENABLED").as_deref() == Ok("true"),
         admissions_automation_enabled: env::var("ADMISSIONS_AUTOMATION_ENABLED").as_deref()

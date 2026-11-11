@@ -20,6 +20,7 @@ mod routes;
 mod school_billing;
 mod school_invoice;
 mod services;
+mod shop;
 mod utils;
 
 use clients::doku::DokuClient;
@@ -47,6 +48,7 @@ pub struct AppState {
     pub jwt_secret: String,
     pub notification_service_url: String,
     pub notification_internal_token: Option<String>,
+    pub shop_internal_token: Option<String>,
     pub frontend_url: String,
     pub minio: Option<MinioClient>,
     pub invoice_email_enabled: bool,
@@ -173,6 +175,9 @@ async fn main() {
         school_billing::repository::init(&graph)
             .await
             .expect("school billing schema migration failed");
+        shop::init(&graph)
+            .await
+            .expect("shop schema migration failed");
         info!("school invoice schema migration complete");
         return;
     }
@@ -281,6 +286,7 @@ async fn main() {
         jwt_secret: cfg.jwt_secret.clone(),
         notification_service_url: cfg.notification_service_url.clone(),
         notification_internal_token: cfg.notification_internal_token.clone(),
+        shop_internal_token: cfg.shop_internal_token.clone(),
         frontend_url: cfg.frontend_url.clone(),
         minio,
         invoice_email_enabled: cfg.invoice_email_enabled,
@@ -327,6 +333,7 @@ async fn main() {
         .merge(routes::payment_routes::routes())
         .merge(school_invoice::router())
         .merge(school_billing::router())
+        .merge(shop::router())
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 

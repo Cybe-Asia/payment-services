@@ -1,6 +1,6 @@
 {
   "files": {
-    "src/main.rs": "c311bab4418bdc4980d8da23894534ec49d74e1771cea24928be79a9a9a69995",
+    "src/main.rs": "61229718cefb6962efa17e7112f624fc3b32d0a6acb935140f354887e843523d",
     "src/dto/webhook.rs": "fd0ecc055cc9ae238377a61b68dad79b21fda7ce0e5cf48360d741334822ed34",
     "src/dto/update_fee_request.rs": "1259cccea40f2dfd65b36984b9f799f456caeffe041144ede8766c0dd4709304",
     "src/dto/mod.rs": "87db35353025e58794a8a9bd53425cefc7efca351e6f943a578610ebc1e03192",
@@ -11,7 +11,7 @@
     "src/clients/minio.rs": "683fe4ed901ff33c90bff0b4809cbc07d1100dc98b48c4835b605e4e187963d6",
     "src/database/neo4j.rs": "7965c4acb92c51e84397dee0d4b13001cdc0cd7a423d8dd425685b5fdceb9a3e",
     "src/database/mod.rs": "182b9f59c6a176bcf3ccafa42aa28cbc84535b0aac5c66e746ad892a18c337e2",
-    "src/config/config.rs": "3d951399617e1ebb3a22461a9f144d83a85290f154f8ac180ae3528717e7555a",
+    "src/config/config.rs": "c137f9fd0c50e1abad22f557385d27271e08df187003c015476d7db5994e356c",
     "src/config/mod.rs": "0dfdf3576e5863e271920d685e5521538a6354de939a5449f2b3cf2a5d4d14ea",
     "src/utils/response.rs": "d79803a9f7ddab5108d7b6d394afab831b57e7aae68585edab2cebe1215e9db7",
     "src/utils/error.rs": "0021c81004fae52ce820ac507fe8ba22c9e00f3eb5776da15b2312712c46267a",
@@ -37,7 +37,7 @@
     "src/school_invoice/parent_authority.rs": "88ac63a01a07aaa1fb29457a7fcc0c796e2297ef533350ad8a19e5b07a66fc1c",
     "src/school_invoice/auth.rs": "0eb1e68ca7cc39bf095711d5b2270f1279db1cccce4febf704105d1e3d1449a2",
     "src/school_invoice/mod.rs": "0948254d49d4f01707b52b28026c52cea9486430c5e797182a2ac387a829046a",
-    "src/school_invoice/http_acceptance_tests.rs": "a979568d0690489a98d313513ec39a1465ca15cb99b31b4612fb623abeff9b50",
+    "src/school_invoice/http_acceptance_tests.rs": "e9d1589bdf286e5ef68cafc905124a7f7214d9bd045294186838e7ec0ea3c3af",
     "src/school_invoice/repository.rs": "00b14631816e158bb06b83482c9e46ba76af4e95591ef55a37e154c32a3a7c8a",
     "src/school_invoice/tests.rs": "45511802943ccc8bae4fbe0a7dd8640a2fe9f4b759dd7a00d94183fc6f8dbedd",
     "src/school_invoice/payee.rs": "6e7230c055983af3b3b9f5f97becba6c3bc88f3bb2336be85a03c783404729d9",
@@ -50,7 +50,7 @@
     "src/handlers/payment_handler.rs": "499fa26e3ec86f17044dd6e09820c8c3c7f0595257e6fe42c2007c8e86c877b4",
     "src/handlers/mod.rs": "e5c6c8d5720e301d1f812036812518230ad0573e8a051b4191e535f32da5b625",
     "src/handlers/fee_handler.rs": "c2e00e01178890f29c7a0e153a433ddbf68f4bf625a9044592bb0f2e81b97892",
-    "src/handlers/payment_parent_acceptance_tests.rs": "e2ab53e81f35663ecc852eed8f95cb1724f50064504c412f17ffb33f60b7f4ac",
+    "src/handlers/payment_parent_acceptance_tests.rs": "33d5d625cc9e5fe230e0d4fcd0ded9c32467ae9b44eafeabadb90fcedf174b9b",
     "src/services/payment_service.rs": "0cf0fc0374628bddb5916e0a44e71f7bf710dec48c53e0eaccfaf2ef805627c8",
     "src/services/invoice_notification.rs": "ae1a128e53c7e5a2c831f6ae375b1e94056794ea104d7e7143e2dd0f5c187a1b",
     "src/services/automatic_offer_invoice.rs": "3ede4de63130f421d525ca249fd15f4302d53ae29a14cf18379a42e7297fa3b9",
@@ -74,10 +74,12 @@
     "src/school_billing/mod.rs": "d6c6f390474b33e42effddeef0d33e73aa8cad9d65e1f455f696ec8691b7d81f",
     "src/school_billing/model.rs": "5c44fb6e6c7b1abe7d7ba760f626312ce7f9ed881d9e3733c1ba90ffca502834",
     "src/school_billing/repository.rs": "00e4abb6e7fc2af1aac1383918ce9fd82d9c879e4d64209ba01216081cf77d6a",
-    "src/school_billing/service.rs": "f413aa7d272a02cd1f26b57f487c790f59a322d494dc2d8e9062728fd298d045",
+    "src/school_billing/service.rs": "f7c0aca1271e0cb23b2712be426a41c2507503e4e5d31e796a9a36b8b565426b",
     "src/school_billing/tests.rs": "77f3e1b8e748f9f5cb2f9f9a8becfb2c367c0d0d8a3dc00b0fb221713bf29692",
     "src/school_billing/worker.rs": "debad88d8fabe0b2a00841fc1bef7ebfd09ffd645234906926e771242c423ac4",
-    "src/utils/capabilities.rs": "3b8b246f365e7421302b0a5f6150be31cbf36c7024fae879e3c1e0a115a73f85"
+    "src/utils/capabilities.rs": "3b8b246f365e7421302b0a5f6150be31cbf36c7024fae879e3c1e0a115a73f85",
+    "src/shop/mod.rs": "d0bf66e4be43443bcb40260b05a1b1d087faeb9de31afe87887861ae96903f74",
+    "src/shop/tests.rs": "cd5a73caa2135d7b97ed58add1fd4cf9aa519de3fabfb613b033889666c9e850"
   },
   "scope": "approved current web integration; school-staging; no automatic GitOps or production promotion"
 }

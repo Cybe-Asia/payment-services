@@ -58,8 +58,11 @@ pub struct ProgramView {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreditView {
+    /// The child's wallet: paid top-ups of every payer plus the Shop ledger.
     pub balance: i64,
     pub bills: Vec<Bill>,
+    /// Shop purchases and refunds, newest first.
+    pub entries: Vec<crate::shop::Entry>,
 }
 /// One academic year of a child's Capital Levy: the year of entry paid in the
 /// admissions offer, or a year billed through the Payment tab.
@@ -204,13 +207,11 @@ pub async fn summary(graph: &Graph, c: Child) -> Result<ChildView> {
         .filter(|b| b.category == "student_credit")
         .cloned()
         .collect();
+    let (balance, entries) = crate::shop::wallet(graph, &c.enrolled_student_id).await?;
     Ok(ChildView {
         credit: CreditView {
-            balance: credit_bills
-                .iter()
-                .filter(|b| b.paid())
-                .map(|b| b.amount)
-                .sum(),
+            balance,
+            entries,
             bills: credit_bills,
         },
         child: c,
